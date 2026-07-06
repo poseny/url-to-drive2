@@ -124,15 +124,6 @@ jobs:
           
           # כתיבה ל-Job Summary לראות בממשק GitHub
           cat >> $GITHUB_STEP_SUMMARY <<EOF
-### 📋 Model Resolution Details
-| Property | Value |
-|----------|-------|
-| **Repo ID** | \`$REPO_ID\` |
-| **GGUF File** | \`$FILENAME\` |
-| **Expected Size** | $((TOTAL_FILE_SIZE / 1024 / 1024)) MB |
-| **Direct Download URL** | [$DIRECT_URL]($DIRECT_URL) |
-| **Output ZIP Name** | \`$ZIP_NAME\` |
-EOF
 
       # --------------------------------------------------------------
       # 4️⃣ מחיקת ZIP קיים ב-Drive (אופציונלי)
@@ -218,11 +209,4 @@ EOF
           # עדכון Summary
           cat >> $GITHUB_STEP_SUMMARY <<EOF
 ### ✅ Upload Complete
-| Property | Value |
-|----------|-------|
-| **Source Model** | \`${{ steps.resolve.outputs.repo_id }}\` |
-| **File Verified** | ✅ Size match ($((ACTUAL_SIZE / 1024 / 1024)) MB) |
-| **ZIP Uploaded** | \`${ZIP_NAME}\` |
-| **ZIP Size** | $((ZIP_SIZE / 1024 / 1024)) MB |
-| **Destination** | \`${{ github.event.inputs.folder }}\` |
-EOF
+
