@@ -1,0 +1,124 @@
+name: Fetch Official SHA256 → Google Drive (TXT)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: "כתובת דף המודל ב-Hugging Face"
+        required: true
+        default: "https://huggingface.co/Dhanjo/Ornith-1.0-9B-Q4_K_M-GGUF"
+      folder:
+        description: "תיקיית יעד ב-Google Drive"
+        required: true
+        default: "MyModels"
+
+jobs:
+  fetch-sha:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # 1️⃣ התקנת כלים מינימליים
+      - name: Install deps
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          sudo apt-get update && sudo apt-get install -y jq python3 python3-pip
+          pip3 install huggingface_hub --quiet
+
+      # 2️⃣ קונפיג rclone (משתמש באותו סוד)
+      - name: Write rclone config
+        env:
+          RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [gdrive]
+          type = drive
+          scope = drive.file
+          token = $RCLONE_GDRIVE_TOKEN
+          EOF
+
+      # 3️⃣ חילוץ Repo ID + Filename מה-HTML (כמו בקוד הקודם)
+      - name: Resolve Model Info from HTML
+        id: resolve
+        env:
+          MODEL_PAGE_URL: ${{ github.event.inputs.model_url }}
+        run: |
+          set -e
+          HTML_FILE=$(mktemp)
+          curl -L -s -o "$HTML_FILE" "$MODEL_PAGE_URL"
+          PROPS_ESCAPED=$(grep -o 'data-target="ModelHeader"[^>]*data-props="[^"]*"' "$HTML_FILE" | head -1 | sed -n 's/.*data-props="\([^"]*\)".*/\1/p')
+          PROPS_JSON=$(python3 -c "import html, sys; print(html.unescape(sys.argv[1]))" "$PROPS_ESCAPED")
+          REPO_ID=$(echo "$PROPS_JSON" | jq -r '.model.id')
+          FILENAME=$(echo "$PROPS_JSON" | jq -r '.model.ggufFilePaths[0]')
+          echo "repo_id=$REPO_ID" >> $GITHUB_OUTPUT
+          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+          echo "🔎 Repo: $REPO_ID | File: $FILENAME"
+
+      # 4️⃣ שליפת SHA256 רשמי מה-API
+      - name: Fetch Official SHA256 from HF API
+        id: fetch_sha
+        env:
+          REPO_ID: ${{ steps.resolve.outputs.repo_id }}
+          FILENAME: ${{ steps.resolve.outputs.filename }}
+        run: |
+          set -e
+          echo "🔐 Querying HF API..."
+          python3 << 'PYEOF'
+          import os, sys
+          from huggingface_hub import HfApi
+          repo_id = os.getenv("REPO_ID")
+          filename = os.getenv("FILENAME")
+          api = HfApi()
+          info = api.model_info(repo_id, files_metadata=True)
+          official_sha = None
+          for sib in info.siblings:
+              if sib.rfilename == filename and sib.lfs and sib.lfs.sha256:
+                  official_sha = sib.lfs.sha256
+                  break
+          if not official_sha:
+              print("❌ SHA256 not found in API")
+              sys.exit(1)
+          print(f"✅ OFFICIAL_SHA256={official_sha}")
+          with open(os.getenv("GITHUB_OUTPUT"), "a") as f:
+              f.write(f"sha256={official_sha}\n")
+          # Summary
+          with open(os.getenv("GITHUB_STEP_SUMMARY"), "a") as f:
+              f.write(f"### 🔐 Official SHA256\n")
+              f.write(f"| File | SHA256 |\n")
+              f.write(f"|------|--------|\n")
+              f.write(f"| `{filename}` | `{official_sha}` |\n")
+          PYEOF
+
+      # 5️⃣ יצירת קובץ TXT והעלאה ל-Drive
+      - name: Create & Upload SHA256.txt
+        env:
+          SHA256: ${{ steps.fetch_sha.outputs.sha256 }}
+          FILENAME: ${{ steps.resolve.outputs.filename }}
+          FOLDER: ${{ github.event.inputs.folder }}
+        run: |
+          set -e
+          TXT_FILE="SHA256_${FILENAME}.txt"
+          echo "$SHA256" > "$TXT_FILE"
+          echo "📄 Created $TXT_FILE:"
+          cat "$TXT_FILE"
+          
+          REMOTE_PATH="gdrive:${FOLDER}/$TXT_FILE"
+          echo "🚀 Uploading to $REMOTE_PATH"
+          rclone copy "$TXT_FILE" "$REMOTE_PATH" --progress -v
+          echo "✅ Uploaded."
+
+      # 6️⃣ הדפסה סופית ללוגים (שתוכל להעתיק מכאן מייד)
+      - name: Print for Manual Compare
+        env:
+          SHA256: ${{ steps.fetch_sha.outputs.sha256 }}
+          YOUR_LOCAL_HASH: "D3F855A6977B229D9B150F6BA8F8B7001BB001CA06C318E1C25D092272A0275A"
+        run: |
+          echo "===================="
+          echo "🔐 OFFICIAL SHA256 : $SHA256"
+          echo "💻 YOUR LOCAL HASH : $YOUR_LOCAL_HASH"
+          echo "===================="
+          if [[ "$SHA256" == "$YOUR_LOCAL_HASH" ]]; then
+            echo "✅ MATCH!"
+          else
+            echo "❌ MISMATCH!"
+          fi
