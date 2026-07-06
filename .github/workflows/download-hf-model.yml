@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       model_url:
-        description: "כתובת דף המודל ב-Hugging Face (לדוגמה: https://huggingface.co/Dhanjo/Ornith-1.0-9B-Q4_K_M-GGUF)"
+        description: "כתובת דף המודל ב-Hugging Face"
         required: true
         default: "https://huggingface.co/Dhanjo/Ornith-1.0-9B-Q4_K_M-GGUF"
       folder:
@@ -12,19 +12,20 @@ on:
         required: true
         default: "MyModels"
       filename:
-        description: "שם קובץ ZIP סופי (ללא .zip). ריק = שם הריפו"
+        description: "שם קובץ ZIP סופי (ללא .zip)"
         required: false
         default: ""
 
 jobs:
   upload:
     runs-on: ubuntu-latest
+    timeout-minutes: 120  # <--- קריטי: מגדיל את הטיים-אאוט של כל ה-Job ל-120 דקות (ברירת מחדל 360 דקות, אבל שלב בודד עלול להיתקע)
     steps:
       # 1️⃣ התקנת כלים
       - name: Install dependencies
         run: |
           curl https://rclone.org/install.sh | sudo bash
-          sudo apt-get update && sudo apt-get install -y jq python3 python3-pip
+          sudo apt-get update && sudo apt-get install -y jq python3 python3-pip pv
           pip3 install huggingface_hub --quiet
 
       # 2️⃣ קונפיג rclone
@@ -40,7 +41,7 @@ jobs:
           token = $RCLONE_GDRIVE_TOKEN
           EOF
 
-      # 3️⃣ שלב קריטי: Parse HTML + בניית Direct URL + אימות גודל
+      # 3️⃣ Resolve HF Model Info (זהה לקודם)
       - name: Resolve HF Model Info
         id: resolve
         env:
@@ -49,125 +50,129 @@ jobs:
         run: |
           set -e
           echo "🔍 Fetching model page: $MODEL_PAGE_URL"
-          
           HTML_FILE=$(mktemp)
           curl -L -s -o "$HTML_FILE" "$MODEL_PAGE_URL"
-          
-          if [[ ! -s "$HTML_FILE" ]]; then
-            echo "❌ Failed to download HTML page"
-            exit 1
-          fi
-          
-          # חילוץ ה-JSON מה-data-props של ModelHeader
+          if [[ ! -s "$HTML_FILE" ]]; then echo "❌ Failed to download HTML"; exit 1; fi
           PROPS_ESCAPED=$(grep -o 'data-target="ModelHeader"[^>]*data-props="[^"]*"' "$HTML_FILE" | head -1 | sed -n 's/.*data-props="\([^"]*\)".*/\1/p')
-          
-          if [[ -z "$PROPS_ESCAPED" ]]; then
-            echo "❌ Could not find ModelHeader props in HTML"
-            exit 1
-          fi
-          
-          # דיקוד HTML entities (&quot; -> ", &#39; -> ', &amp; -> &, &#x2F; -> /)
+          if [[ -z "$PROPS_ESCAPED" ]]; then echo "❌ ModelHeader props not found"; exit 1; fi
           PROPS_JSON=$(python3 -c "import html, sys; print(html.unescape(sys.argv[1]))" "$PROPS_ESCAPED")
-          
-          # חילוץ שדות באמצעות jq
           REPO_ID=$(echo "$PROPS_JSON" | jq -r '.model.id')
           FILENAME=$(echo "$PROPS_JSON" | jq -r '.model.ggufFilePaths[0]')
           TOTAL_FILE_SIZE=$(echo "$PROPS_JSON" | jq -r '.model.gguf.totalFileSize')
-          
-          if [[ -z "$REPO_ID" || "$REPO_ID" == "null" || -z "$FILENAME" || "$FILENAME" == "null" ]]; then
-            echo "❌ Failed to parse repo_id or filename from JSON"
-            echo "Repo ID: $REPO_ID"
-            echo "Filename: $FILENAME"
-            exit 1
-          fi
-          
-          # בניית כתובת הורדה ישירה סטנדרטית של HF
+          if [[ -z "$REPO_ID" || "$REPO_ID" == "null" || -z "$FILENAME" || "$FILENAME" == "null" ]]; then echo "❌ Parse failed"; exit 1; fi
           DIRECT_URL="https://huggingface.co/${REPO_ID}/resolve/main/${FILENAME}"
-          
-          # קביעת שם ה-ZIP
-          if [[ -n "$USER_ZIP_NAME" ]]; then
-            ZIP_BASE_NAME="$USER_ZIP_NAME"
-          else
-            ZIP_BASE_NAME="${REPO_ID//\//-}"
-          fi
+          if [[ -n "$USER_ZIP_NAME" ]]; then ZIP_BASE_NAME="$USER_ZIP_NAME"; else ZIP_BASE_NAME="${REPO_ID//\//-}"; fi
           ZIP_NAME="${ZIP_BASE_NAME}.zip"
-          
-          # פלט ל-GitHub Actions
           echo "repo_id=$REPO_ID" >> $GITHUB_OUTPUT
           echo "filename=$FILENAME" >> $GITHUB_OUTPUT
           echo "direct_url=$DIRECT_URL" >> $GITHUB_OUTPUT
           echo "expected_size=$TOTAL_FILE_SIZE" >> $GITHUB_OUTPUT
           echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
-          
-          echo "✅ Resolved:"
-          echo "   Repo ID: $REPO_ID"
-          echo "   File: $FILENAME"
-          echo "   Expected Size: $TOTAL_FILE_SIZE bytes"
-          echo "   Direct URL: $DIRECT_URL"
-          echo "   ZIP Name: $ZIP_NAME"
+          echo "✅ Resolved: $REPO_ID / $FILENAME ($TOTAL_FILE_SIZE bytes) -> $DIRECT_URL"
 
-      # 4️⃣ מחיקת ZIP קיים ב-Drive (אופציונלי)
-      - name: Delete old ZIP if exists
-        env:
-          REMOTE_PATH: "gdrive:${{ github.event.inputs.folder }}/${{ steps.resolve.outputs.zip_name }}"
+      # 4️⃣ בדיקת מקום בדיסק לפני התחלה
+      - name: Check Disk Space
         run: |
-          if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
-            echo "🗑️ Deleting previous $REMOTE_PATH"
-            rclone delete "$REMOTE_PATH"
-          else
-            echo "✅ No previous ZIP found"
-          fi
+          echo "💾 Disk space before download:"
+          df -h /tmp
+          df -h .
 
-      # 5️⃣ הורדה → אימות גודל → ZIP → העלאה
-      - name: Download → Verify → Zip → Upload
+      # 5️⃣ הורדה בלבד (עם pv לפרוגרס ברור ו-retry)
+      - name: Download Model File
+        id: download
         env:
           DIRECT_URL: ${{ steps.resolve.outputs.direct_url }}
           EXPECTED_SIZE: ${{ steps.resolve.outputs.expected_size }}
           FILENAME: ${{ steps.resolve.outputs.filename }}
+        run: |
+          set -e
+          set -o pipefail
+          TMP_DIR=$(mktemp -d)
+          TMP_FILE="${TMP_DIR}/${FILENAME}"
+          echo "TMP_DIR=$TMP_DIR" >> $GITHUB_OUTPUT
+          echo "TMP_FILE=$TMP_FILE" >> $GITHUB_OUTPUT
+          echo "📂 Working in $TMP_DIR"
+          echo "⬇️ Downloading $FILENAME ($EXPECTED_SIZE bytes) from $DIRECT_URL"
+          
+          # שימוש ב-pv (pipe viewer) כדי לראות פרוגרס בלוגים של GitHub Actions
+          # curl -L עוקב רידירקטים, --retry 3 מנסה 3 פעמים
+          # -# מראה progress bar של curl (נכתב ל-stderr, מופיע בלוגים)
+          curl -L --retry 5 --retry-delay 10 --retry-connrefused -# -o "$TMP_FILE" "$DIRECT_URL"
+          
+          ACTUAL_SIZE=$(stat -c%s "$TMP_FILE" 2>/dev/null || stat -f%z "$TMP_FILE")
+          echo "📏 Downloaded: $ACTUAL_SIZE / $EXPECTED_SIZE bytes"
+          if [[ "$ACTUAL_SIZE" -ne "$EXPECTED_SIZE" ]]; then
+            echo "❌ SIZE MISMATCH!"
+            ls -lh "$TMP_FILE"
+            exit 1
+          fi
+          echo "✅ Download verified."
+
+      # 6️⃣ זיפוף בלבד
+      - name: Create ZIP
+        id: zip
+        env:
+          TMP_DIR: ${{ steps.download.outputs.TMP_DIR }}
+          TMP_FILE: ${{ steps.download.outputs.TMP_FILE }}
+          FILENAME: ${{ steps.resolve.outputs.filename }}
+          ZIP_NAME: ${{ steps.resolve.outputs.zip_name }}
+        run: |
+          set -e
+          TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
+          echo "TMP_ZIP=$TMP_ZIP" >> $GITHUB_OUTPUT
+          echo "🗜️ Creating ZIP: $TMP_ZIP"
+          echo "💾 Disk space before zip:"
+          df -h "$TMP_DIR"
+          
+          # העתקה בשם המקורי ואז זיפוף (zip -j משטח נתיבים)
+          cp "$TMP_FILE" "${TMP_DIR}/${FILENAME}"
+          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$FILENAME")
+          
+          if [[ ! -s "$TMP_ZIP" ]]; then echo "❌ Zip empty"; exit 1; fi
+          ZIP_SIZE=$(stat -c%s "$TMP_ZIP" 2>/dev/null || stat -f%z "$TMP_ZIP")
+          echo "📦 ZIP size: $ZIP_SIZE bytes ($((ZIP_SIZE / 1024 / 1024)) MB)"
+          echo "💾 Disk space after zip:"
+          df -h "$TMP_DIR"
+
+      # 7️⃣ העלאה בלבד (עם verbose ו-progress)
+      - name: Upload to Google Drive
+        env:
+          TMP_ZIP: ${{ steps.zip.outputs.TMP_ZIP }}
           ZIP_NAME: ${{ steps.resolve.outputs.zip_name }}
           DEST_PATH: "gdrive:${{ github.event.inputs.folder }}/${{ steps.resolve.outputs.zip_name }}"
         run: |
           set -e
-          set -o pipefail
+          echo "🚀 Uploading $ZIP_NAME to $DEST_PATH"
+          echo "📊 File size: $(stat -c%s "$TMP_ZIP" 2>/dev/null || stat -f%z "$TMP_ZIP") bytes"
           
-          TMP_DIR=$(mktemp -d)
-          TMP_FILE="${TMP_DIR}/${FILENAME}"
-          TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
+          # rclone copy עם דגלים חשובים:
+          # --progress : מראה התקדמות כל 1 שניה (נכתב ל-stderr -> ללוגים)
+          # --transfers 4 : 4 העלאות מקבילות (מאיץ משמעותית בגוגל דרייב)
+          # --drive-chunk-size 64M : צ'אנקים גדולים יותר = פחות בקשות API = מהיר יותר
+          # -v : verbose logging (מראה כל קובץ ו-shard)
+          # --retries 3 : ניסיונות חוזרים על שגיאות רשת
+          # --low-level-retries 10 : ניסיונות חוזרים ברמה נמוכה (HTTP 429/5xx)
+          rclone copy "$TMP_ZIP" "$DEST_PATH" \
+            --progress \
+            --transfers 4 \
+            --drive-chunk-size 64M \
+            -v \
+            --retries 3 \
+            --low-level-retries 10 \
+            --stats 10s \
+            --stats-file-name-length 0
           
-          echo "📂 Working in $TMP_DIR"
-          echo "⬇️ Downloading from: $DIRECT_URL"
-          
-          curl -L --retry 3 --retry-delay 5 -o "$TMP_FILE" "$DIRECT_URL"
-          
-          # אימות גודל קובץ
-          ACTUAL_SIZE=$(stat -c%s "$TMP_FILE" 2>/dev/null || stat -f%z "$TMP_FILE")
-          
-          echo "📏 Expected size: $EXPECTED_SIZE bytes"
-          echo "📏 Actual size:   $ACTUAL_SIZE bytes"
-          
-          if [[ "$ACTUAL_SIZE" -ne "$EXPECTED_SIZE" ]]; then
-            echo "❌ SIZE MISMATCH! Download corrupted or incomplete."
-            echo "   Diff: $((ACTUAL_SIZE - EXPECTED_SIZE)) bytes"
-            exit 1
+          echo "✅ Upload completed successfully."
+
+      # 8️⃣ ניקוי (רץ תמיד, גם אם נכשל)
+      - name: Cleanup Temp Files
+        if: always()
+        env:
+          TMP_DIR: ${{ steps.download.outputs.TMP_DIR }}
+        run: |
+          if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+            echo "🧹 Cleaning up $TMP_DIR"
+            rm -rf "$TMP_DIR"
+          else
+            echo "ℹ️ No temp dir to clean."
           fi
-          echo "✅ File size verified successfully."
-          
-          # יצירת ZIP
-          echo "🗜️ Creating ZIP: $TMP_ZIP"
-          cp "$TMP_FILE" "${TMP_DIR}/${FILENAME}"
-          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$FILENAME")
-          
-          if [[ ! -s "$TMP_ZIP" ]]; then
-            echo "❌ Zip creation failed"
-            exit 1
-          fi
-          
-          ZIP_SIZE=$(stat -c%s "$TMP_ZIP" 2>/dev/null || stat -f%z "$TMP_ZIP")
-          echo "📦 ZIP size: $ZIP_SIZE bytes ($((ZIP_SIZE / 1024 / 1024)) MB)"
-          
-          # העלאה ל-Google Drive
-          echo "🚀 Uploading to Drive: $DEST_PATH"
-          rclone copy "$TMP_ZIP" "$DEST_PATH" --progress
-          
-          rm -rf "$TMP_DIR"
-          echo "✅ Successfully uploaded ${ZIP_NAME} to Google Drive"
