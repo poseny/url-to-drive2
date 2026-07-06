@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       model_url:
-        description: "כתובת דף המודל ב-Hugging Face (לא קישור ישיר)"
+        description: "כתובת דף המודל ב-Hugging Face (לדוגמה: https://huggingface.co/Dhanjo/Ornith-1.0-9B-Q4_K_M-GGUF)"
         required: true
         default: "https://huggingface.co/Dhanjo/Ornith-1.0-9B-Q4_K_M-GGUF"
       folder:
@@ -19,24 +19,15 @@ on:
 jobs:
   upload:
     runs-on: ubuntu-latest
-    # הרשאות לכתיבת סיכום ריצה (Job Summary)
-    permissions:
-      contents: read
-      jobs: write
-    
     steps:
-      # --------------------------------------------------------------
-      # 1️⃣ התקנת כלים: rclone, jq, python3, huggingface_hub
-      # --------------------------------------------------------------
+      # 1️⃣ התקנת כלים
       - name: Install dependencies
         run: |
           curl https://rclone.org/install.sh | sudo bash
           sudo apt-get update && sudo apt-get install -y jq python3 python3-pip
           pip3 install huggingface_hub --quiet
 
-      # --------------------------------------------------------------
       # 2️⃣ קונפיג rclone
-      # --------------------------------------------------------------
       - name: Write rclone config
         env:
           RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
@@ -49,10 +40,8 @@ jobs:
           token = $RCLONE_GDRIVE_TOKEN
           EOF
 
-      # --------------------------------------------------------------
       # 3️⃣ שלב קריטי: Parse HTML + בניית Direct URL + אימות גודל
-      # --------------------------------------------------------------
-      - name: Resolve HF Model Info (Parse HTML & Construct Direct URL)
+      - name: Resolve HF Model Info
         id: resolve
         env:
           MODEL_PAGE_URL: ${{ github.event.inputs.model_url }}
@@ -61,7 +50,6 @@ jobs:
           set -e
           echo "🔍 Fetching model page: $MODEL_PAGE_URL"
           
-          # הורדת ה-HTML
           HTML_FILE=$(mktemp)
           curl -L -s -o "$HTML_FILE" "$MODEL_PAGE_URL"
           
@@ -71,8 +59,6 @@ jobs:
           fi
           
           # חילוץ ה-JSON מה-data-props של ModelHeader
-          # ה-JSON מקודד ב-HTML entities (&quot; וכו'), צריך לדקוד אותו
-          # מחפשים את המחרוזת "ggufFilePaths" בתוך data-props
           PROPS_ESCAPED=$(grep -o 'data-target="ModelHeader"[^>]*data-props="[^"]*"' "$HTML_FILE" | head -1 | sed -n 's/.*data-props="\([^"]*\)".*/\1/p')
           
           if [[ -z "$PROPS_ESCAPED" ]]; then
@@ -81,7 +67,6 @@ jobs:
           fi
           
           # דיקוד HTML entities (&quot; -> ", &#39; -> ', &amp; -> &, &#x2F; -> /)
-          # משתמשים ב-python לדיקוד בטוח
           PROPS_JSON=$(python3 -c "import html, sys; print(html.unescape(sys.argv[1]))" "$PROPS_ESCAPED")
           
           # חילוץ שדות באמצעות jq
@@ -103,7 +88,7 @@ jobs:
           if [[ -n "$USER_ZIP_NAME" ]]; then
             ZIP_BASE_NAME="$USER_ZIP_NAME"
           else
-            ZIP_BASE_NAME="${REPO_ID//\//-}" # החלפת / ב--
+            ZIP_BASE_NAME="${REPO_ID//\//-}"
           fi
           ZIP_NAME="${ZIP_BASE_NAME}.zip"
           
@@ -114,20 +99,14 @@ jobs:
           echo "expected_size=$TOTAL_FILE_SIZE" >> $GITHUB_OUTPUT
           echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
           
-          # הדפסה ללוג
           echo "✅ Resolved:"
           echo "   Repo ID: $REPO_ID"
           echo "   File: $FILENAME"
-          echo "   Expected Size: $TOTAL_FILE_SIZE bytes ($((TOTAL_FILE_SIZE / 1024 / 1024 / 1024)) GB)"
+          echo "   Expected Size: $TOTAL_FILE_SIZE bytes"
           echo "   Direct URL: $DIRECT_URL"
           echo "   ZIP Name: $ZIP_NAME"
-          
-          # כתיבה ל-Job Summary לראות בממשק GitHub
-          cat >> $GITHUB_STEP_SUMMARY <<EOF
 
-      # --------------------------------------------------------------
       # 4️⃣ מחיקת ZIP קיים ב-Drive (אופציונלי)
-      # --------------------------------------------------------------
       - name: Delete old ZIP if exists
         env:
           REMOTE_PATH: "gdrive:${{ github.event.inputs.folder }}/${{ steps.resolve.outputs.zip_name }}"
@@ -139,9 +118,7 @@ jobs:
             echo "✅ No previous ZIP found"
           fi
 
-      # --------------------------------------------------------------
       # 5️⃣ הורדה → אימות גודל → ZIP → העלאה
-      # --------------------------------------------------------------
       - name: Download → Verify → Zip → Upload
         env:
           DIRECT_URL: ${{ steps.resolve.outputs.direct_url }}
@@ -160,14 +137,9 @@ jobs:
           echo "📂 Working in $TMP_DIR"
           echo "⬇️ Downloading from: $DIRECT_URL"
           
-          # הורדה עם curl (תומך בהמשך הורדה -C - אם צריך)
-          # -L עוקב אחרי redirects (HF עושה redirect ל-CDN)
-          # --retry 3 מנסה 3 פעמים
           curl -L --retry 3 --retry-delay 5 -o "$TMP_FILE" "$DIRECT_URL"
           
-          # ----------------------------------------------------------
-          # אימות גודל קובץ (הבדיקה היחידה האפשרית בלי SHA256 מה-HTML)
-          # ----------------------------------------------------------
+          # אימות גודל קובץ
           ACTUAL_SIZE=$(stat -c%s "$TMP_FILE" 2>/dev/null || stat -f%z "$TMP_FILE")
           
           echo "📏 Expected size: $EXPECTED_SIZE bytes"
@@ -180,11 +152,8 @@ jobs:
           fi
           echo "✅ File size verified successfully."
           
-          # ----------------------------------------------------------
           # יצירת ZIP
-          # ----------------------------------------------------------
           echo "🗜️ Creating ZIP: $TMP_ZIP"
-          # מעתיקים עם השם המקורי כדי שבתוך ה-ZIP יהיה השם הנכון
           cp "$TMP_FILE" "${TMP_DIR}/${FILENAME}"
           (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$FILENAME")
           
@@ -196,17 +165,9 @@ jobs:
           ZIP_SIZE=$(stat -c%s "$TMP_ZIP" 2>/dev/null || stat -f%z "$TMP_ZIP")
           echo "📦 ZIP size: $ZIP_SIZE bytes ($((ZIP_SIZE / 1024 / 1024)) MB)"
           
-          # ----------------------------------------------------------
           # העלאה ל-Google Drive
-          # ----------------------------------------------------------
           echo "🚀 Uploading to Drive: $DEST_PATH"
           rclone copy "$TMP_ZIP" "$DEST_PATH" --progress
           
-          # ניקוי
           rm -rf "$TMP_DIR"
           echo "✅ Successfully uploaded ${ZIP_NAME} to Google Drive"
-          
-          # עדכון Summary
-          cat >> $GITHUB_STEP_SUMMARY <<EOF
-### ✅ Upload Complete
-
