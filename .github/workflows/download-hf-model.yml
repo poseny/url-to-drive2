@@ -4,31 +4,35 @@ on:
   workflow_dispatch:
     inputs:
       model_url:
-        description: "כתובת דף המודל ב-Hugging Face"
+        description: "כתובת דף המודל ב-Hugging Face (לדוגמה: https://huggingface.co/Dhanjo/Ornith-1.0-9B-Q4_K_M-GGUF)"
         required: true
         default: "https://huggingface.co/Dhanjo/Ornith-1.0-9B-Q4_K_M-GGUF"
       folder:
-        description: "תיקיית יעד ב-Drive"
+        description: "תיקיית יעד ב-Google Drive"
         required: true
         default: "MyModels"
       filename:
-        description: "שם קובץ ZIP סופי (ללא .zip)"
+        description: "שם קובץ ZIP סופי (ללא .zip). ריק = שם הריפו"
         required: false
         default: ""
 
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # <--- קריטי: מגדיל את הטיים-אאוט של כל ה-Job ל-120 דקות (ברירת מחדל 360 דקות, אבל שלב בודד עלול להיתקע)
+    timeout-minutes: 120
     steps:
+      # --------------------------------------------------------------
       # 1️⃣ התקנת כלים
+      # --------------------------------------------------------------
       - name: Install dependencies
         run: |
           curl https://rclone.org/install.sh | sudo bash
           sudo apt-get update && sudo apt-get install -y jq python3 python3-pip pv
           pip3 install huggingface_hub --quiet
 
+      # --------------------------------------------------------------
       # 2️⃣ קונפיג rclone
+      # --------------------------------------------------------------
       - name: Write rclone config
         env:
           RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
@@ -41,7 +45,9 @@ jobs:
           token = $RCLONE_GDRIVE_TOKEN
           EOF
 
-      # 3️⃣ Resolve HF Model Info (זהה לקודם)
+      # --------------------------------------------------------------
+      # 3️⃣ Resolve HF Model Info (Parse HTML → Direct URL + Size)
+      # --------------------------------------------------------------
       - name: Resolve HF Model Info
         id: resolve
         env:
@@ -53,31 +59,46 @@ jobs:
           HTML_FILE=$(mktemp)
           curl -L -s -o "$HTML_FILE" "$MODEL_PAGE_URL"
           if [[ ! -s "$HTML_FILE" ]]; then echo "❌ Failed to download HTML"; exit 1; fi
+          
           PROPS_ESCAPED=$(grep -o 'data-target="ModelHeader"[^>]*data-props="[^"]*"' "$HTML_FILE" | head -1 | sed -n 's/.*data-props="\([^"]*\)".*/\1/p')
           if [[ -z "$PROPS_ESCAPED" ]]; then echo "❌ ModelHeader props not found"; exit 1; fi
+          
           PROPS_JSON=$(python3 -c "import html, sys; print(html.unescape(sys.argv[1]))" "$PROPS_ESCAPED")
+          
           REPO_ID=$(echo "$PROPS_JSON" | jq -r '.model.id')
           FILENAME=$(echo "$PROPS_JSON" | jq -r '.model.ggufFilePaths[0]')
           TOTAL_FILE_SIZE=$(echo "$PROPS_JSON" | jq -r '.model.gguf.totalFileSize')
-          if [[ -z "$REPO_ID" || "$REPO_ID" == "null" || -z "$FILENAME" || "$FILENAME" == "null" ]]; then echo "❌ Parse failed"; exit 1; fi
+          
+          if [[ -z "$REPO_ID" || "$REPO_ID" == "null" || -z "$FILENAME" || "$FILENAME" == "null" ]]; then
+            echo "❌ Parse failed: Repo='$REPO_ID' File='$FILENAME'"; exit 1; 
+          fi
+          
           DIRECT_URL="https://huggingface.co/${REPO_ID}/resolve/main/${FILENAME}"
+          
           if [[ -n "$USER_ZIP_NAME" ]]; then ZIP_BASE_NAME="$USER_ZIP_NAME"; else ZIP_BASE_NAME="${REPO_ID//\//-}"; fi
           ZIP_NAME="${ZIP_BASE_NAME}.zip"
+          
           echo "repo_id=$REPO_ID" >> $GITHUB_OUTPUT
           echo "filename=$FILENAME" >> $GITHUB_OUTPUT
           echo "direct_url=$DIRECT_URL" >> $GITHUB_OUTPUT
           echo "expected_size=$TOTAL_FILE_SIZE" >> $GITHUB_OUTPUT
           echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
-          echo "✅ Resolved: $REPO_ID / $FILENAME ($TOTAL_FILE_SIZE bytes) -> $DIRECT_URL"
+          
+          echo "✅ Resolved: $REPO_ID / $FILENAME ($TOTAL_FILE_SIZE bytes)"
+          echo "🔗 Direct URL: $DIRECT_URL"
 
-      # 4️⃣ בדיקת מקום בדיסק לפני התחלה
-      - name: Check Disk Space
+      # --------------------------------------------------------------
+      # 4️⃣ בדיקת מקום בדיסק התחלתית
+      # --------------------------------------------------------------
+      - name: Check Initial Disk Space
         run: |
-          echo "💾 Disk space before download:"
+          echo "💾 Initial disk space:"
           df -h /tmp
           df -h .
 
-      # 5️⃣ הורדה בלבד (עם pv לפרוגרס ברור ו-retry)
+      # --------------------------------------------------------------
+      # 5️⃣ הורדה בלבד (עם פרוגרס וריטריי)
+      # --------------------------------------------------------------
       - name: Download Model File
         id: download
         env:
@@ -91,24 +112,30 @@ jobs:
           TMP_FILE="${TMP_DIR}/${FILENAME}"
           echo "TMP_DIR=$TMP_DIR" >> $GITHUB_OUTPUT
           echo "TMP_FILE=$TMP_FILE" >> $GITHUB_OUTPUT
-          echo "📂 Working in $TMP_DIR"
-          echo "⬇️ Downloading $FILENAME ($EXPECTED_SIZE bytes) from $DIRECT_URL"
           
-          # שימוש ב-pv (pipe viewer) כדי לראות פרוגרס בלוגים של GitHub Actions
-          # curl -L עוקב רידירקטים, --retry 3 מנסה 3 פעמים
-          # -# מראה progress bar של curl (נכתב ל-stderr, מופיע בלוגים)
+          echo "📂 Working in $TMP_DIR"
+          echo "⬇️ Downloading $FILENAME ($EXPECTED_SIZE bytes)..."
+          
+          # -# = progress bar to stderr (visible in logs)
+          # --retry 5 = retry on transient network errors
           curl -L --retry 5 --retry-delay 10 --retry-connrefused -# -o "$TMP_FILE" "$DIRECT_URL"
           
           ACTUAL_SIZE=$(stat -c%s "$TMP_FILE" 2>/dev/null || stat -f%z "$TMP_FILE")
           echo "📏 Downloaded: $ACTUAL_SIZE / $EXPECTED_SIZE bytes"
+          
           if [[ "$ACTUAL_SIZE" -ne "$EXPECTED_SIZE" ]]; then
             echo "❌ SIZE MISMATCH!"
             ls -lh "$TMP_FILE"
             exit 1
           fi
           echo "✅ Download verified."
+          
+          echo "💾 Disk space after download:"
+          df -h "$TMP_DIR"
 
-      # 6️⃣ זיפוף בלבד
+      # --------------------------------------------------------------
+      # 6️⃣ זיפוף בלבד (מתוקן: בלי cp, מוחק מקור מיידית)
+      # --------------------------------------------------------------
       - name: Create ZIP
         id: zip
         env:
@@ -120,21 +147,45 @@ jobs:
           set -e
           TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
           echo "TMP_ZIP=$TMP_ZIP" >> $GITHUB_OUTPUT
+          
           echo "🗜️ Creating ZIP: $TMP_ZIP"
-          echo "💾 Disk space before zip:"
+          echo "💾 Disk space BEFORE zip:"
           df -h "$TMP_DIR"
           
-          # העתקה בשם המקורי ואז זיפוף (zip -j משטח נתיבים)
-          cp "$TMP_FILE" "${TMP_DIR}/${FILENAME}"
-          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$FILENAME")
+          # ---- התיקון הקריטי: zip ישירות מהקובץ שהורד ----
+          # zip -j (junk paths) לוקח את שם הקובץ מהנתיב המלא ($TMP_FILE)
+          # ושם אותו ב-ZIP אוטומטית. אין צורך ב-cp.
+          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$TMP_FILE")
           
           if [[ ! -s "$TMP_ZIP" ]]; then echo "❌ Zip empty"; exit 1; fi
+          
           ZIP_SIZE=$(stat -c%s "$TMP_ZIP" 2>/dev/null || stat -f%z "$TMP_ZIP")
           echo "📦 ZIP size: $ZIP_SIZE bytes ($((ZIP_SIZE / 1024 / 1024)) MB)"
-          echo "💾 Disk space after zip:"
+          
+          # ---- מחיקת הקובץ המקורי (5.6 GB) מיידית לפינוי מקום ----
+          echo "🗑️ Deleting original model file to free space..."
+          rm -f "$TMP_FILE"
+          
+          echo "💾 Disk space AFTER zip & cleanup:"
           df -h "$TMP_DIR"
 
-      # 7️⃣ העלאה בלבד (עם verbose ו-progress)
+      # --------------------------------------------------------------
+      # 7️⃣ מחיקת ZIP קיים ב-Drive (אופציונלי, לפני העלאה)
+      # --------------------------------------------------------------
+      - name: Delete old ZIP if exists
+        env:
+          REMOTE_PATH: "gdrive:${{ github.event.inputs.folder }}/${{ steps.resolve.outputs.zip_name }}"
+        run: |
+          if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
+            echo "🗑️ Deleting previous $REMOTE_PATH"
+            rclone delete "$REMOTE_PATH"
+          else
+            echo "✅ No previous ZIP found"
+          fi
+
+      # --------------------------------------------------------------
+      # 8️⃣ העלאה ל-Google Drive (מוטב לביצועים ואמינות)
+      # --------------------------------------------------------------
       - name: Upload to Google Drive
         env:
           TMP_ZIP: ${{ steps.zip.outputs.TMP_ZIP }}
@@ -143,28 +194,33 @@ jobs:
         run: |
           set -e
           echo "🚀 Uploading $ZIP_NAME to $DEST_PATH"
-          echo "📊 File size: $(stat -c%s "$TMP_ZIP" 2>/dev/null || stat -f%z "$TMP_ZIP") bytes"
+          FILE_SIZE=$(stat -c%s "$TMP_ZIP" 2>/dev/null || stat -f%z "$TMP_ZIP")
+          echo "📊 File size: $FILE_SIZE bytes ($((FILE_SIZE / 1024 / 1024)) MB)"
           
-          # rclone copy עם דגלים חשובים:
-          # --progress : מראה התקדמות כל 1 שניה (נכתב ל-stderr -> ללוגים)
-          # --transfers 4 : 4 העלאות מקבילות (מאיץ משמעותית בגוגל דרייב)
-          # --drive-chunk-size 64M : צ'אנקים גדולים יותר = פחות בקשות API = מהיר יותר
-          # -v : verbose logging (מראה כל קובץ ו-shard)
-          # --retries 3 : ניסיונות חוזרים על שגיאות רשת
-          # --low-level-retries 10 : ניסיונות חוזרים ברמה נמוכה (HTTP 429/5xx)
+          # דגלים קריטיים להעלאה גדולה ואמינה:
+          # --transfers 4           : 4 העלאות מקבילות (מנצל רוחב פס)
+          # --drive-chunk-size 64M  : צ'אנקים גדולים = פחות API calls = מהיר יותר
+          # -v                      : Verbose (מראה כל צ'אנק שעולה)
+          # --progress              : פס התקדמות כל 1 שניה (ל-stderr -> לוגים)
+          # --stats 10s             : סטטיסטיקות כל 10 שניות
+          # --retries 3 / --low-level-retries 10 : עמידות לשגיאות רשת/429
+          # --drive-acknowledge-abuse : נדרש לפעמים לקבצים גדולים (>100MB) בדרייב
           rclone copy "$TMP_ZIP" "$DEST_PATH" \
-            --progress \
             --transfers 4 \
             --drive-chunk-size 64M \
             -v \
+            --progress \
+            --stats 10s \
+            --stats-file-name-length 0 \
             --retries 3 \
             --low-level-retries 10 \
-            --stats 10s \
-            --stats-file-name-length 0
+            --drive-acknowledge-abuse
           
           echo "✅ Upload completed successfully."
 
-      # 8️⃣ ניקוי (רץ תמיד, גם אם נכשל)
+      # --------------------------------------------------------------
+      # 9️⃣ ניקוי סופי (רץ תמיד, גם בכישלון)
+      # --------------------------------------------------------------
       - name: Cleanup Temp Files
         if: always()
         env:
@@ -174,5 +230,7 @@ jobs:
             echo "🧹 Cleaning up $TMP_DIR"
             rm -rf "$TMP_DIR"
           else
-            echo "ℹ️ No temp dir to clean."
+            echo "ℹ️ No temp dir to clean (or already cleaned)."
           fi
+          echo "💾 Final disk space:"
+          df -h /tmp
