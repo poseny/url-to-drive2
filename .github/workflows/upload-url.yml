@@ -19,20 +19,34 @@ on:
 jobs:
   upload:
     runs-on: ubuntu-latest
-    # הגדרת נתיב לוג קבוע ומוחלט לכל ה‑job – מונע בלבול בין ${HOME} ל‑${{ env.HOME }}
     env:
       LOG_PATH: /home/runner/download_step.log
 
     steps:
       # --------------------------------------------------------------
-      # 1️⃣  התקנת תלויות
+      # 1️⃣  התקנת תלויות מלאה (Chromium + ספריות + פונטים)
       # --------------------------------------------------------------
       - name: Install dependencies
         run: |
+          # rclone
           curl https://rclone.org/install.sh | sudo bash
-          sudo apt-get update && sudo apt-get install -y chromium-browser
+
+          # Chromium + כל הספריות הנדרשות ל‑headless rendering מלא
+          sudo apt-get update
+          sudo apt-get install -y \
+            chromium \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libasound2 libpango-1.0-0 libcairo2 libatspi2.0-0 \
+            fonts-liberation fonts-noto-color-emoji fonts-dejavu-core \
+            fonts-freefont-ttf \
+            --no-install-recommends
+
+          # אימות גרסאות
           rclone version
-          chromium-browser --version
+          chromium --version
+          # וידוא שהבינארי נמצא ב‑PATH
+          which chromium
 
       # --------------------------------------------------------------
       # 2️⃣  קונפיג rclone
@@ -94,7 +108,7 @@ jobs:
           fi
 
       # --------------------------------------------------------------
-      # 5️⃣  הורדה חכמה + לכידת לוג מלא לקובץ
+      # 5️⃣  הורדה חכמה + לכידת לוג מלא
       # --------------------------------------------------------------
       - name: Download → (maybe MHTML) → zip → upload
         id: download_zip
@@ -107,9 +121,8 @@ jobs:
           set -e
           set -o pipefail
 
-          # שימוש במשתנה הגלובלי LOG_PATH
           echo "📝 Logging to $LOG_PATH"
-          exec > >(tee -a "$LOG_PATH") 2>&1   # מכאן והלאה הכל נכתב גם למסך וגם לקובץ
+          exec > >(tee -a "$LOG_PATH") 2>&1
 
           TMP_DIR=$(mktemp -d)
           TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
@@ -123,19 +136,41 @@ jobs:
           INTERNAL_FILE=""
 
           if [[ "$CONTENT_TYPE" == text/html* ]]; then
-            # ---- 5.2 דף HTML → MHTML ----
+            # ---- 5.2 דף HTML → MHTML עם דגלים מלאים ל‑CI ----
             MHTML_FILE="${TMP_DIR}/${BASE_NAME}.mhtml"
-            echo "🌐 Saving page as MHTML via Chromium..."
-            chromium-browser \
+            USER_DATA_DIR="${TMP_DIR}/chrome-profile"
+            mkdir -p "$USER_DATA_DIR"
+
+            echo "🌐 Saving page as MHTML via Chromium (headless=new)..."
+            # הסבר דגלים:
+            # --headless=new                 : מנוע headless החדש (יציב יותר להדפסה/MHTML)
+            # --disable-gpu                  : חובה ב‑CI
+            # --no-sandbox                   : חובה ב‑GitHub runners
+            # --disable-dev-shm-usage        : מונע קריסות עקב /dev/shm קטן
+            # --disable-extensions           : מאיץ עלייה
+            # --enable-unsafe-swiftshader    : פותר שגיאת WebGL fallback
+            # --user-data-dir                : פרופיל נפרד לכל ריצה
+            # --virtual-time-budget=60000    : 60 שניות זמן וירטואלי ל‑JS/AJAX
+            # --run-all-compositor-stages-before-draw : מבטיח רינדור מלא לפני שמירה
+            # --save-page-as-mhtml           : הפקודה עצמה
+            chromium \
               --headless=new \
               --disable-gpu \
               --no-sandbox \
-              --virtual-time-budget=15000 \
+              --disable-dev-shm-usage \
+              --disable-extensions \
+              --enable-unsafe-swiftshader \
+              --user-data-dir="$USER_DATA_DIR" \
+              --virtual-time-budget=60000 \
+              --run-all-compositor-stages-before-draw \
               --save-page-as-mhtml="$MHTML_FILE" \
-              "$FILE_URL" 2>&1 | tail -30
+              "$FILE_URL" 2>&1 | tail -40
 
+            # בדיקה שהקובץ נוצר וגודלו > 0
             if [[ ! -s "$MHTML_FILE" ]]; then
-              echo "❌ Chromium failed to create MHTML"
+              echo "❌ Chromium failed to create MHTML (file missing or empty)"
+              echo "🔍 Debug: listing $TMP_DIR"
+              ls -la "$TMP_DIR"
               exit 1
             fi
             INTERNAL_FILE="$MHTML_FILE"
@@ -174,7 +209,7 @@ jobs:
           echo "✅ Finished – ZIP uploaded successfully"
 
       # --------------------------------------------------------------
-      # 6️⃣  שליחת אימייל עם הלוג **רק אם השלב נכשל** (מתוקן)
+      # 6️⃣  שליחת אימייל עם הלוג **רק אם השלב נכשל**
       # --------------------------------------------------------------
       - name: Send failure email with log
         if: failure() && steps.download_zip.outcome == 'failure'
@@ -187,6 +222,5 @@ jobs:
           subject: "❌ GitHub Actions FAILED: Upload URL → Drive"
           to: p0556722432@gmail.com
           from: p0556722432@gmail.com
-          # שימוש ב‑${{ env.LOG_PATH }} – הנתיב המוחלט שהוגדר בראש ה‑job
           body: ${{ env.LOG_PATH }}
           attachments: ${{ env.LOG_PATH }}
