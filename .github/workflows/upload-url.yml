@@ -18,7 +18,13 @@ on:
 
 jobs:
   upload:
+    # --------------------------------------------------------------
+    # 🐳 מריצים הכול בתוך קונטיינר Playwright – Chrome עובד "ישר מהקופסה"
+    # --------------------------------------------------------------
     runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.40-noble   # Ubuntu 24.04 + Chrome + כל התלויות
+      options: --user root                               # הרצה כ‑root כדי לכתוב ל‑/home/runner ולהתקין rclone
     env:
       LOG_PATH: /home/runner/download_step.log
 
@@ -33,52 +39,17 @@ jobs:
           echo "=== Workflow started at $(date) ===" >> "$LOG_PATH"
 
       # --------------------------------------------------------------
-      # 1️⃣  התקנת תלויות מערכת **מלאות** ל‑Chrome headless יציב
-      # --------------------------------------------------------------
-      - name: Install system dependencies for Chrome
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            # ספריות בסיסיות ש‑Chrome דורש
-            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
-            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
-            libgbm1 libasound2 libpango-1.0-0 libcairo2 libatspi2.0-0 \
-            # פונטים (כולל עברית/אימוג'י)
-            fonts-liberation fonts-noto-color-emoji fonts-dejavu-core \
-            # D-Bus (להשתקת שגיאות חיבור)
-            dbus libdbus-1-3 \
-            # **קריטי**: דרייבר Vulkan תוכנה (llvmpipe/swrast) כדי ש‑vkCreateInstance לא ייכשל
-            mesa-vulkan-drivers libvulkan1 \
-            # כלי עזר
-            curl unzip \
-            --no-install-recommends
-          
-          # הפעלת D-Bus session bus מדומה (מונע שגיאות "Failed to connect to the bus")
-          # נריץ אותו ברקע ונקבע משתנה סביבה
-          mkdir -p /tmp/dbus-session
-          dbus-daemon --session --address=unix:path=/tmp/dbus-session/bus --nofork --nopidfile --print-address > /tmp/dbus-session/address.txt 2>&1 &
-          sleep 1
-          export DBUS_SESSION_BUS_ADDRESS="unix:path=/tmp/dbus-session/bus"
-          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
-          echo "✅ D-Bus session started at $DBUS_SESSION_BUS_ADDRESS"
-
-      # --------------------------------------------------------------
-      # 2️⃣  התקנת rclone + Chrome דרך action רשמי
+      # 1️⃣  התקנת rclone בלבד (curl, zip, chrome, fonts – כבר בקונטיינר)
       # --------------------------------------------------------------
       - name: Install rclone
         run: |
           curl https://rclone.org/install.sh | sudo bash
           rclone version
-
-      - name: Setup Chrome (headless-ready)
-        uses: browser-actions/setup-chrome@latest
-        id: chrome
-        with:
-          chrome-version: stable
-          cache: true
+          # וידוא ש‑Chrome קיים
+          google-chrome --version || chromium --version
 
       # --------------------------------------------------------------
-      # 3️⃣  קונפיג rclone
+      # 2️⃣  קונפיג rclone
       # --------------------------------------------------------------
       - name: Write rclone config
         env:
@@ -93,7 +64,7 @@ jobs:
           EOF
 
       # --------------------------------------------------------------
-      # 4️⃣  חישוב שמות
+      # 3️⃣  חישוב שמות
       # --------------------------------------------------------------
       - name: Determine file names
         id: names
@@ -123,7 +94,7 @@ jobs:
           echo "remote_path=$remote_path"    >> $GITHUB_OUTPUT
 
       # --------------------------------------------------------------
-      # 5️⃣  מחיקת ZIP קודם אם קיים
+      # 4️⃣  מחיקת ZIP קודם אם קיים
       # --------------------------------------------------------------
       - name: Delete old ZIP if it exists
         env:
@@ -137,7 +108,7 @@ jobs:
           fi
 
       # --------------------------------------------------------------
-      # 6️⃣  הורדה חכמה עם Hard Timeout ו‑Chrome יציב
+      # 5️⃣  הורדה חכמה + MHTML עם Chrome יציב (Hard Timeout 3 דקות)
       # --------------------------------------------------------------
       - name: Download → (maybe MHTML) → zip → upload
         id: download_zip
@@ -146,8 +117,6 @@ jobs:
           BASE_NAME: ${{ steps.names.outputs.base_name }}
           ZIP_NAME: ${{ steps.names.outputs.zip_name }}
           DEST_PATH: ${{ steps.names.outputs.remote_path }}
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
-          DBUS_SESSION_BUS_ADDRESS: ${{ env.DBUS_SESSION_BUS_ADDRESS }}
         run: |
           set -e
           set -o pipefail
@@ -159,7 +128,7 @@ jobs:
           TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
           echo "📂 Working directory = $TMP_DIR"
 
-          # ---- 6.1 בדיקת Content-Type ----
+          # ---- 5.1 בדיקת Content-Type ----
           echo "🔎 Checking Content-Type..."
           CONTENT_TYPE=$(curl -sI -L "$FILE_URL" | grep -i '^content-type:' | head -1 | cut -d' ' -f2- | tr -d '\r\n')
           echo "📋 Content-Type: $CONTENT_TYPE"
@@ -167,35 +136,28 @@ jobs:
           INTERNAL_FILE=""
 
           if [[ "$CONTENT_TYPE" == text/html* ]]; then
-            # ---- 6.2 דף HTML → MHTML עם הגדרות יציבות מלאות ----
+            # ---- 5.2 דף HTML → MHTML ----
             MHTML_FILE="${TMP_DIR}/${BASE_NAME}.mhtml"
             USER_DATA_DIR="${TMP_DIR}/chrome-profile"
             mkdir -p "$USER_DATA_DIR"
 
             echo "🌐 Saving page as MHTML via Chrome (max 3 min wall-clock)..."
             
-            # הרצת Chrome עם timeout של 180 שניות
-            # דגלים קריטיים:
-            # --disable-vulkan              : כיבוי מוחלט של Vulkan (מונע שגיאות vkCreateInstance)
-            # --disable-software-rasterizer : לא להשתמש ברסטרייזר תוכנה ישן (SwiftShader מספיק)
-            # --enable-unsafe-swiftshader   : מאפשר SwiftShader כ־fallback בטוח
-            # --disable-dev-shm-usage       : חובה ב‑CI
-            # --no-zygote --single-process  : יציבות נוספת ב‑Docker/CI
-            # --virtual-time-budget=30000   : 30 שניות זמן וירטואלי
-            # --window-size=1920,1080       : פריסה דסקטופ קבועה
-            # --run-all-compositor-stages-before-draw : רינדור מלא לפני שמירה
-            # DBUS_SESSION_BUS_ADDRESS      : מועבר מהשלב הקודם
-            timeout 180 "$CHROME_PATH" \
+            # בקונטיינר Playwright הבינארי נקרא google-chrome (או chromium)
+            CHROME_BIN=$(command -v google-chrome || command -v chromium)
+            echo "🔧 Using Chrome binary: $CHROME_BIN"
+
+            # דגלים מינימליים – הקונטיינר כבר מטפל ב‑GPU/Sandbox/Fonts
+            # --headless=new           : מנוע headless החדש
+            # --disable-dev-shm-usage  : חובה ב‑CI
+            # --virtual-time-budget=30000 : 30 שניות זמן וירטואלי
+            # --timeout=180000         : 180 שניות timeout פנימי של Chrome (מילישניות)
+            # --run-all-compositor-stages-before-draw : רינדור מלא
+            timeout 180 "$CHROME_BIN" \
               --headless=new \
-              --disable-gpu \
-              --disable-vulkan \
-              --disable-software-rasterizer \
-              --enable-unsafe-swiftshader \
-              --no-sandbox \
               --disable-dev-shm-usage \
-              --disable-extensions \
-              --no-zygote \
-              --single-process \
+              --no-first-run \
+              --no-default-browser-check \
               --user-data-dir="$USER_DATA_DIR" \
               --virtual-time-budget=30000 \
               --window-size=1920,1080 \
@@ -223,7 +185,7 @@ jobs:
               exit 1
             fi
           else
-            # ---- 6.3 קובץ רגיל (binaries) ----
+            # ---- 5.3 קובץ רגיל (binaries) ----
             ORIG_FILE="${TMP_DIR}/downloaded_file"
             echo "⬇️ Downloading binary file with curl..."
             timeout 300 curl -L -s -o "$ORIG_FILE" "$FILE_URL"
@@ -236,7 +198,7 @@ jobs:
             echo "✅ File downloaded: $(du -h "$ORIG_FILE" | cut -f1)"
           fi
 
-          # ---- 6.4 יצירת ZIP ----
+          # ---- 5.4 יצירת ZIP ----
           EXT="${INTERNAL_FILE##*.}"
           ZIP_INTERNAL_NAME="${BASE_NAME}.${EXT}"
           echo "🗜️ Creating ZIP $TMP_ZIP with internal name '$ZIP_INTERNAL_NAME'"
@@ -248,7 +210,7 @@ jobs:
             exit 1
           fi
 
-          # ---- 6.5 העלאה ל‑Drive ----
+          # ---- 5.5 העלאה ל‑Drive ----
           echo "🚀 Uploading ZIP to Drive: $DEST_PATH"
           rclone copy "$TMP_ZIP" "$DEST_PATH" --progress
 
@@ -256,7 +218,7 @@ jobs:
           echo "✅ Finished – ZIP uploaded successfully"
 
       # --------------------------------------------------------------
-      # 7️⃣  שליחת אימייל עם הלוג **בכל כישלון של ה‑job**
+      # 6️⃣  שליחת אימייל עם הלוג **בכל כישלון של ה‑job**
       # --------------------------------------------------------------
       - name: Send failure email with log
         if: failure()
