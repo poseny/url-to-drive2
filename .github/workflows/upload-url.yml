@@ -1,5 +1,5 @@
-      - name: Download → (maybe MHTML) → zip → upload
-        env:
+name: Download → (maybe MHTML) → zip → upload
+env:
           FILE_URL: ${{ github.event.inputs.url }}
           BASE_NAME: ${{ steps.names.outputs.base_name }}
           ZIP_NAME: ${{ steps.names.outputs.zip_name }}
