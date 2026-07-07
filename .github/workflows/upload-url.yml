@@ -19,6 +19,10 @@ on:
 jobs:
   upload:
     runs-on: ubuntu-latest
+    # הגדרת נתיב לוג קבוע ומוחלט לכל ה‑job – מונע בלבול בין ${HOME} ל‑${{ env.HOME }}
+    env:
+      LOG_PATH: /home/runner/download_step.log
+
     steps:
       # --------------------------------------------------------------
       # 1️⃣  התקנת תלויות
@@ -103,10 +107,9 @@ jobs:
           set -e
           set -o pipefail
 
-          # קובץ לוג ייעודי לשלב זה
-          LOG_FILE="${HOME}/download_step.log"
-          echo "📝 Logging to $LOG_FILE"
-          exec > >(tee -a "$LOG_FILE") 2>&1   # מכאן והלאה הכל נכתב גם למסך וגם לקובץ
+          # שימוש במשתנה הגלובלי LOG_PATH
+          echo "📝 Logging to $LOG_PATH"
+          exec > >(tee -a "$LOG_PATH") 2>&1   # מכאן והלאה הכל נכתב גם למסך וגם לקובץ
 
           TMP_DIR=$(mktemp -d)
           TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
@@ -171,7 +174,7 @@ jobs:
           echo "✅ Finished – ZIP uploaded successfully"
 
       # --------------------------------------------------------------
-      # 6️⃣  שליחת אימייל עם הלוג **רק אם השלב נכשל**
+      # 6️⃣  שליחת אימייל עם הלוג **רק אם השלב נכשל** (מתוקן)
       # --------------------------------------------------------------
       - name: Send failure email with log
         if: failure() && steps.download_zip.outcome == 'failure'
@@ -179,10 +182,11 @@ jobs:
         with:
           server_address: smtp.gmail.com
           server_port: 465
-          username: p0556722432@gmail.com          # ← מוקשח
-          password: ${{ secrets.EMAIL_PASSWORD }}  # ← הסוד היחיד שנדרש
+          username: p0556722432@gmail.com
+          password: ${{ secrets.EMAIL_PASSWORD }}
           subject: "❌ GitHub Actions FAILED: Upload URL → Drive"
-          to: p0556722432@gmail.com                # ← מוקשח
-          from: p0556722432@gmail.com              # ← מוקשח
-          body: file://${HOME}/download_step.log
-          attachments: ${{ env.HOME }}/download_step.log
+          to: p0556722432@gmail.com
+          from: p0556722432@gmail.com
+          # שימוש ב‑${{ env.LOG_PATH }} – הנתיב המוחלט שהוגדר בראש ה‑job
+          body: ${{ env.LOG_PATH }}
+          attachments: ${{ env.LOG_PATH }}
