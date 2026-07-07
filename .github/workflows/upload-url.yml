@@ -179,12 +179,10 @@ jobs:
         with:
           server_address: smtp.gmail.com
           server_port: 465
-          username: ${{ secrets.EMAIL_USERNAME }}
-          password: ${{ secrets.EMAIL_PASSWORD }}
+          username: p0556722432@gmail.com          # ← מוקשח
+          password: ${{ secrets.EMAIL_PASSWORD }}  # ← הסוד היחיד שנדרש
           subject: "❌ GitHub Actions FAILED: Upload URL → Drive"
-          to: ${{ secrets.EMAIL_TO || 'p0556722432@gmail.com' }}
-          from: ${{ secrets.EMAIL_USERNAME }}
+          to: p0556722432@gmail.com                # ← מוקשח
+          from: p0556722432@gmail.com              # ← מוקשח
           body: file://${HOME}/download_step.log
           attachments: ${{ env.HOME }}/download_step.log
-          # אופציונלי: גם את הלוג הכללי של הריצה (אם תרצה)
-          # attachments: ${{ env.HOME }}/download_step.log, ${{ runner.temp }}/_github_workflow.log
