@@ -1,5 +1,100 @@
-name: Download → (maybe MHTML) → zip → upload
-env:
+name: Upload URL → Google Drive (Zip via temporary file)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "כתובת URL של הקובץ/דף להורדה"
+        required: true
+        default: "https://huggingface.co/models?search=Ornith-1.0-9B-GGUF"
+      folder:
+        description: "תיקיית יעד ב‑Drive (ללא שם קובץ)"
+        required: true
+        default: "MyUploads"
+      filename:
+        description: "שם קובץ לפני .zip (אם ריק – ייקח משם הקובץ ב‑URL)"
+        required: false
+        default: ""
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      # --------------------------------------------------------------
+      # 1️⃣  התקנת תלויות
+      # --------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          sudo apt-get update && sudo apt-get install -y chromium-browser
+          rclone version
+          chromium-browser --version
+
+      # --------------------------------------------------------------
+      # 2️⃣  קונפיג rclone
+      # --------------------------------------------------------------
+      - name: Write rclone config
+        env:
+          RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [gdrive]
+          type = drive
+          scope = drive.file
+          token = $RCLONE_GDRIVE_TOKEN
+          EOF
+
+      # --------------------------------------------------------------
+      # 3️⃣  חישוב שמות
+      # --------------------------------------------------------------
+      - name: Determine file names
+        id: names
+        env:
+          FILE_URL: ${{ github.event.inputs.url }}
+          USER_NAME: ${{ github.event.inputs.filename }}
+        run: |
+          set -e
+          raw_name=$(basename "$FILE_URL")
+          raw_name=${raw_name%%\?*}
+          decoded_name=$(printf '%b' "$(echo -e "${raw_name//%/\\x}")")
+          echo "🔤 Decoded name from URL = $decoded_name"
+
+          if [[ -n "$USER_NAME" ]]; then
+            base_name="$USER_NAME"
+          else
+            base_name="${decoded_name%.*}"
+            [[ "$base_name" == "$decoded_name" ]] && base_name="page"
+          fi
+
+          zip_name="${base_name}.zip"
+          echo "📦 ZIP name on Drive      = $zip_name"
+          echo "base_name=$base_name"        >> $GITHUB_OUTPUT
+          echo "decoded_name=$decoded_name"  >> $GITHUB_OUTPUT
+          echo "zip_name=$zip_name"          >> $GITHUB_OUTPUT
+          remote_path="gdrive:${{ github.event.inputs.folder }}/$zip_name"
+          echo "remote_path=$remote_path"    >> $GITHUB_OUTPUT
+
+      # --------------------------------------------------------------
+      # 4️⃣  מחיקת ZIP קודם אם קיים
+      # --------------------------------------------------------------
+      - name: Delete old ZIP if it exists
+        env:
+          REMOTE_PATH: ${{ steps.names.outputs.remote_path }}
+        run: |
+          if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
+            echo "🗑️ Deleting previous $REMOTE_PATH"
+            rclone delete "$REMOTE_PATH"
+          else
+            echo "✅ No previous ZIP found"
+          fi
+
+      # --------------------------------------------------------------
+      # 5️⃣  הורדה חכמה + לכידת לוג מלא לקובץ
+      # --------------------------------------------------------------
+      - name: Download → (maybe MHTML) → zip → upload
+        id: download_zip
+        env:
           FILE_URL: ${{ github.event.inputs.url }}
           BASE_NAME: ${{ steps.names.outputs.base_name }}
           ZIP_NAME: ${{ steps.names.outputs.zip_name }}
@@ -8,76 +103,45 @@ env:
           set -e
           set -o pipefail
 
+          # קובץ לוג ייעודי לשלב זה
+          LOG_FILE="${HOME}/download_step.log"
+          echo "📝 Logging to $LOG_FILE"
+          exec > >(tee -a "$LOG_FILE") 2>&1   # מכאן והלאה הכל נכתב גם למסך וגם לקובץ
+
           TMP_DIR=$(mktemp -d)
           TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
           echo "📂 Working directory = $TMP_DIR"
 
-          # ----------------------------------------------------------
-          # 0️⃣  התקנת ספריות ש‑Chromium headless צריך (אם חסרות)
-          # ----------------------------------------------------------
-          sudo apt-get update -qq && sudo apt-get install -y -qq \
-            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
-            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
-            libxrandr2 libgbm1 libasound2 2>/dev/null | tail -5
-
-          # ----------------------------------------------------------
-          # 1️⃣  בדיקת Content-Type (עם fallback אם HEAD לא עובד)
-          # ----------------------------------------------------------
+          # ---- 5.1 בדיקת Content-Type ----
           echo "🔎 Checking Content-Type..."
-          CONTENT_TYPE=$(curl -sI -L --max-time 10 "$FILE_URL" 2>/dev/null | \
-            grep -i '^content-type:' | head -1 | cut -d' ' -f2- | tr -d '\r\n')
-          echo "📋 Content-Type: ${CONTENT_TYPE:-unknown}"
+          CONTENT_TYPE=$(curl -sI -L "$FILE_URL" | grep -i '^content-type:' | head -1 | cut -d' ' -f2- | tr -d '\r\n')
+          echo "📋 Content-Type: $CONTENT_TYPE"
 
           INTERNAL_FILE=""
 
           if [[ "$CONTENT_TYPE" == text/html* ]]; then
-            # ----------------------------------------------------------
-            # 2️⃣  דף HTML → MHTML עם Chromium
-            # ----------------------------------------------------------
+            # ---- 5.2 דף HTML → MHTML ----
             MHTML_FILE="${TMP_DIR}/${BASE_NAME}.mhtml"
             echo "🌐 Saving page as MHTML via Chromium..."
-
-            # נסה לאתר את הבינארי הנכון
-            CHROMIUM_BIN=$(command -v chromium || command -v chromium-browser || command -v google-chrome || command -v chrome)
-            if [[ -z "$CHROMIUM_BIN" ]]; then
-              echo "❌ Chromium/Chrome not found in PATH"
-              exit 1
-            fi
-            echo "🔧 Using browser: $CHROMIUM_BIN"
-
-            # הרצה עם timeout ו־output ללוג
-            timeout 120 "$CHROMIUM_BIN" \
+            chromium-browser \
               --headless=new \
               --disable-gpu \
               --no-sandbox \
-              --disable-dev-shm-usage \
-              --virtual-time-budget=20000 \
-              --run-all-compositor-stages-before-draw \
+              --virtual-time-budget=15000 \
               --save-page-as-mhtml="$MHTML_FILE" \
-              "$FILE_URL" 2>&1 | tee "${TMP_DIR}/chromium.log"
-
-            CHROMIUM_EXIT=${PIPESTATUS[0]}
-            if [[ $CHROMIUM_EXIT -ne 0 ]]; then
-              echo "❌ Chromium exited with code $CHROMIUM_EXIT"
-              echo "--- Last 50 lines of chromium.log ---"
-              tail -50 "${TMP_DIR}/chromium.log"
-              exit 1
-            fi
+              "$FILE_URL" 2>&1 | tail -30
 
             if [[ ! -s "$MHTML_FILE" ]]; then
-              echo "❌ MHTML file not created or empty"
+              echo "❌ Chromium failed to create MHTML"
               exit 1
             fi
             INTERNAL_FILE="$MHTML_FILE"
             echo "✅ MHTML created: $(du -h "$MHTML_FILE" | cut -f1)"
-
           else
-            # ----------------------------------------------------------
-            # 3️⃣  לא HTML → הורדה רגילה
-            # ----------------------------------------------------------
+            # ---- 5.3 קובץ רגיל ----
             ORIG_FILE="${TMP_DIR}/downloaded_file"
             echo "⬇️ Downloading binary file with curl..."
-            curl -L -s --max-time 300 -o "$ORIG_FILE" "$FILE_URL"
+            curl -L -s -o "$ORIG_FILE" "$FILE_URL"
 
             if [[ ! -s "$ORIG_FILE" ]]; then
               echo "❌ Download failed or file is empty"
@@ -87,12 +151,9 @@ env:
             echo "✅ File downloaded: $(du -h "$ORIG_FILE" | cut -f1)"
           fi
 
-          # ----------------------------------------------------------
-          # 4️⃣  יצירת ZIP
-          # ----------------------------------------------------------
+          # ---- 5.4 יצירת ZIP ----
           EXT="${INTERNAL_FILE##*.}"
           ZIP_INTERNAL_NAME="${BASE_NAME}.${EXT}"
-          
           echo "🗜️ Creating ZIP $TMP_ZIP with internal name '$ZIP_INTERNAL_NAME'"
           cp "$INTERNAL_FILE" "${TMP_DIR}/${ZIP_INTERNAL_NAME}"
           (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$ZIP_INTERNAL_NAME")
@@ -102,11 +163,28 @@ env:
             exit 1
           fi
 
-          # ----------------------------------------------------------
-          # 5️⃣  העלאה ל‑Drive
-          # ----------------------------------------------------------
+          # ---- 5.5 העלאה ל‑Drive ----
           echo "🚀 Uploading ZIP to Drive: $DEST_PATH"
           rclone copy "$TMP_ZIP" "$DEST_PATH" --progress
 
           rm -rf "$TMP_DIR"
           echo "✅ Finished – ZIP uploaded successfully"
+
+      # --------------------------------------------------------------
+      # 6️⃣  שליחת אימייל עם הלוג **רק אם השלב נכשל**
+      # --------------------------------------------------------------
+      - name: Send failure email with log
+        if: failure() && steps.download_zip.outcome == 'failure'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "❌ GitHub Actions FAILED: Upload URL → Drive"
+          to: ${{ secrets.EMAIL_TO || 'p0556722432@gmail.com' }}
+          from: ${{ secrets.EMAIL_USERNAME }}
+          body: file://${HOME}/download_step.log
+          attachments: ${{ env.HOME }}/download_step.log
+          # אופציונלי: גם את הלוג הכללי של הריצה (אם תרצה)
+          # attachments: ${{ env.HOME }}/download_step.log, ${{ runner.temp }}/_github_workflow.log
