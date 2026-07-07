@@ -24,29 +24,28 @@ jobs:
 
     steps:
       # --------------------------------------------------------------
-      # 1️⃣  התקנת תלויות מלאה (Chromium + ספריות + פונטים)
+      # 0️⃣  יצירת קובץ לוג ריק **מיד בהתחלה** – יהיה קיים לכל כישלון
       # --------------------------------------------------------------
-      - name: Install dependencies
+      - name: Setup log file
         run: |
-          # rclone
+          touch "$LOG_PATH"
+          echo "📝 Log file created at $LOG_PATH"
+          echo "=== Workflow started at $(date) ===" >> "$LOG_PATH"
+
+      # --------------------------------------------------------------
+      # 1️⃣  התקנת rclone + Chrome/Chromium דרך action רשמי (ללא apt/snap)
+      # --------------------------------------------------------------
+      - name: Install rclone
+        run: |
           curl https://rclone.org/install.sh | sudo bash
-
-          # Chromium + כל הספריות הנדרשות ל‑headless rendering מלא
-          sudo apt-get update
-          sudo apt-get install -y \
-            chromium \
-            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
-            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
-            libgbm1 libasound2 libpango-1.0-0 libcairo2 libatspi2.0-0 \
-            fonts-liberation fonts-noto-color-emoji fonts-dejavu-core \
-            fonts-freefont-ttf \
-            --no-install-recommends
-
-          # אימות גרסאות
           rclone version
-          chromium --version
-          # וידוא שהבינארי נמצא ב‑PATH
-          which chromium
+
+      - name: Setup Chrome (headless-ready)
+        uses: browser-actions/setup-chrome@latest
+        id: chrome
+        with:
+          chrome-version: stable          # או "latest"
+          cache: true                     # שומר cache בין ריצות
 
       # --------------------------------------------------------------
       # 2️⃣  קונפיג rclone
@@ -108,7 +107,7 @@ jobs:
           fi
 
       # --------------------------------------------------------------
-      # 5️⃣  הורדה חכמה + לכידת לוג מלא
+      # 5️⃣  הורדה חכמה + לכידת לוג מלא (כותב לאותו LOG_PATH)
       # --------------------------------------------------------------
       - name: Download → (maybe MHTML) → zip → upload
         id: download_zip
@@ -117,11 +116,12 @@ jobs:
           BASE_NAME: ${{ steps.names.outputs.base_name }}
           ZIP_NAME: ${{ steps.names.outputs.zip_name }}
           DEST_PATH: ${{ steps.names.outputs.remote_path }}
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}  # נתיב הבינארי מה‑action
         run: |
           set -e
           set -o pipefail
 
-          echo "📝 Logging to $LOG_PATH"
+          # מפנה את כל הפלט (stdout+stderr) גם למסך וגם לקובץ הלוג הגלובלי
           exec > >(tee -a "$LOG_PATH") 2>&1
 
           TMP_DIR=$(mktemp -d)
@@ -136,24 +136,14 @@ jobs:
           INTERNAL_FILE=""
 
           if [[ "$CONTENT_TYPE" == text/html* ]]; then
-            # ---- 5.2 דף HTML → MHTML עם דגלים מלאים ל‑CI ----
+            # ---- 5.2 דף HTML → MHTML עם Chrome יציב ----
             MHTML_FILE="${TMP_DIR}/${BASE_NAME}.mhtml"
             USER_DATA_DIR="${TMP_DIR}/chrome-profile"
             mkdir -p "$USER_DATA_DIR"
 
-            echo "🌐 Saving page as MHTML via Chromium (headless=new)..."
-            # הסבר דגלים:
-            # --headless=new                 : מנוע headless החדש (יציב יותר להדפסה/MHTML)
-            # --disable-gpu                  : חובה ב‑CI
-            # --no-sandbox                   : חובה ב‑GitHub runners
-            # --disable-dev-shm-usage        : מונע קריסות עקב /dev/shm קטן
-            # --disable-extensions           : מאיץ עלייה
-            # --enable-unsafe-swiftshader    : פותר שגיאת WebGL fallback
-            # --user-data-dir                : פרופיל נפרד לכל ריצה
-            # --virtual-time-budget=60000    : 60 שניות זמן וירטואלי ל‑JS/AJAX
-            # --run-all-compositor-stages-before-draw : מבטיח רינדור מלא לפני שמירה
-            # --save-page-as-mhtml           : הפקודה עצמה
-            chromium \
+            echo "🌐 Saving page as MHTML via Chrome (headless=new)..."
+            # דגלים מלאים ל‑CI יציב
+            "$CHROME_PATH" \
               --headless=new \
               --disable-gpu \
               --no-sandbox \
@@ -166,9 +156,8 @@ jobs:
               --save-page-as-mhtml="$MHTML_FILE" \
               "$FILE_URL" 2>&1 | tail -40
 
-            # בדיקה שהקובץ נוצר וגודלו > 0
             if [[ ! -s "$MHTML_FILE" ]]; then
-              echo "❌ Chromium failed to create MHTML (file missing or empty)"
+              echo "❌ Chrome failed to create MHTML (file missing or empty)"
               echo "🔍 Debug: listing $TMP_DIR"
               ls -la "$TMP_DIR"
               exit 1
@@ -209,10 +198,10 @@ jobs:
           echo "✅ Finished – ZIP uploaded successfully"
 
       # --------------------------------------------------------------
-      # 6️⃣  שליחת אימייל עם הלוג **רק אם השלב נכשל**
+      # 6️⃣  שליחת אימייל עם הלוג **בכל כישלון של ה‑job**
       # --------------------------------------------------------------
       - name: Send failure email with log
-        if: failure() && steps.download_zip.outcome == 'failure'
+        if: failure()          # רץ אם *כלשהו* מהשלבים נכשל
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
