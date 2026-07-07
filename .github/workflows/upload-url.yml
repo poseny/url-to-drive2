@@ -24,7 +24,7 @@ jobs:
 
     steps:
       # --------------------------------------------------------------
-      # 0️⃣  יצירת קובץ לוג ריק **מיד בהתחלה** – יהיה קיים לכל כישלון
+      # 0️⃣  יצירת קובץ לוג ריק מיד בהתחלה
       # --------------------------------------------------------------
       - name: Setup log file
         run: |
@@ -33,7 +33,7 @@ jobs:
           echo "=== Workflow started at $(date) ===" >> "$LOG_PATH"
 
       # --------------------------------------------------------------
-      # 1️⃣  התקנת rclone + Chrome/Chromium דרך action רשמי (ללא apt/snap)
+      # 1️⃣  התקנת rclone + Chrome דרך action רשמי
       # --------------------------------------------------------------
       - name: Install rclone
         run: |
@@ -44,8 +44,8 @@ jobs:
         uses: browser-actions/setup-chrome@latest
         id: chrome
         with:
-          chrome-version: stable          # או "latest"
-          cache: true                     # שומר cache בין ריצות
+          chrome-version: stable
+          cache: true
 
       # --------------------------------------------------------------
       # 2️⃣  קונפיג rclone
@@ -107,7 +107,7 @@ jobs:
           fi
 
       # --------------------------------------------------------------
-      # 5️⃣  הורדה חכמה + לכידת לוג מלא (כותב לאותו LOG_PATH)
+      # 5️⃣  הורדה חכמה עם **Hard Timeout** ל‑MHTML
       # --------------------------------------------------------------
       - name: Download → (maybe MHTML) → zip → upload
         id: download_zip
@@ -116,12 +116,12 @@ jobs:
           BASE_NAME: ${{ steps.names.outputs.base_name }}
           ZIP_NAME: ${{ steps.names.outputs.zip_name }}
           DEST_PATH: ${{ steps.names.outputs.remote_path }}
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}  # נתיב הבינארי מה‑action
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: |
           set -e
           set -o pipefail
 
-          # מפנה את כל הפלט (stdout+stderr) גם למסך וגם לקובץ הלוג הגלובלי
+          # מפנה פלט לקובץ הלוג הגלובלי
           exec > >(tee -a "$LOG_PATH") 2>&1
 
           TMP_DIR=$(mktemp -d)
@@ -136,14 +136,18 @@ jobs:
           INTERNAL_FILE=""
 
           if [[ "$CONTENT_TYPE" == text/html* ]]; then
-            # ---- 5.2 דף HTML → MHTML עם Chrome יציב ----
+            # ---- 5.2 דף HTML → MHTML עם Timeout קשיח ----
             MHTML_FILE="${TMP_DIR}/${BASE_NAME}.mhtml"
             USER_DATA_DIR="${TMP_DIR}/chrome-profile"
             mkdir -p "$USER_DATA_DIR"
 
-            echo "🌐 Saving page as MHTML via Chrome (headless=new)..."
-            # דגלים מלאים ל‑CI יציב
-            "$CHROME_PATH" \
+            echo "🌐 Saving page as MHTML via Chrome (max 3 min wall-clock)..."
+            
+            # הרצת Chrome עם timeout של 180 שניות (3 דקות) זמן אמת
+            # אם Chrome לא מסתיים לבד – timeout הורג אותו (SIGTERM ואז SIGKILL)
+            # --virtual-time-budget=30000 : 30 שניות זמן וירטואלי (מספיק לטעינה ראשונית)
+            # --window-size : מונע פריסה מוזרה ב‑headless
+            timeout 180 "$CHROME_PATH" \
               --headless=new \
               --disable-gpu \
               --no-sandbox \
@@ -151,24 +155,37 @@ jobs:
               --disable-extensions \
               --enable-unsafe-swiftshader \
               --user-data-dir="$USER_DATA_DIR" \
-              --virtual-time-budget=60000 \
+              --virtual-time-budget=30000 \
+              --window-size=1920,1080 \
               --run-all-compositor-stages-before-draw \
               --save-page-as-mhtml="$MHTML_FILE" \
-              "$FILE_URL" 2>&1 | tail -40
+              "$FILE_URL" 2>&1 | tail -50
 
-            if [[ ! -s "$MHTML_FILE" ]]; then
-              echo "❌ Chrome failed to create MHTML (file missing or empty)"
+            CHROME_EXIT=$?
+            if [[ $CHROME_EXIT -eq 124 ]]; then
+              echo "⏰ Chrome timed out after 180s (SIGTERM sent). Checking if MHTML was created..."
+            elif [[ $CHROME_EXIT -ne 0 ]]; then
+              echo "⚠️ Chrome exited with code $CHROME_EXIT"
+            else
+              echo "✅ Chrome finished normally"
+            fi
+
+            # אם נוצר קובץ לא ריק – נשתמש בו (אפילו אם חלקי)
+            if [[ -s "$MHTML_FILE" ]]; then
+              INTERNAL_FILE="$MHTML_FILE"
+              echo "✅ MHTML created (size: $(du -h "$MHTML_FILE" | cut -f1))"
+            else
+              echo "❌ MHTML file missing or empty after Chrome run"
               echo "🔍 Debug: listing $TMP_DIR"
               ls -la "$TMP_DIR"
               exit 1
             fi
-            INTERNAL_FILE="$MHTML_FILE"
-            echo "✅ MHTML created: $(du -h "$MHTML_FILE" | cut -f1)"
           else
-            # ---- 5.3 קובץ רגיל ----
+            # ---- 5.3 קובץ רגיל (binaries) ----
             ORIG_FILE="${TMP_DIR}/downloaded_file"
             echo "⬇️ Downloading binary file with curl..."
-            curl -L -s -o "$ORIG_FILE" "$FILE_URL"
+            # גם כאן נוסיף timeout לקובצים גדולים
+            timeout 300 curl -L -s -o "$ORIG_FILE" "$FILE_URL"
 
             if [[ ! -s "$ORIG_FILE" ]]; then
               echo "❌ Download failed or file is empty"
@@ -201,7 +218,7 @@ jobs:
       # 6️⃣  שליחת אימייל עם הלוג **בכל כישלון של ה‑job**
       # --------------------------------------------------------------
       - name: Send failure email with log
-        if: failure()          # רץ אם *כלשהו* מהשלבים נכשל
+        if: failure()
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
