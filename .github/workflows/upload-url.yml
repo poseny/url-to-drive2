@@ -24,12 +24,12 @@ jobs:
       contents: read
     steps:
       # --------------------------------------------------------------
-      # 1️⃣  התקנת כלי עבודה + msmtp
+      # 1️⃣  התקנת כלי עבודה + xvfb (שרת תצוגה וירטואלי)
       # --------------------------------------------------------------
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq rclone chromium-browser zip curl msmtp msmtp-mta > /dev/null
+          sudo apt-get install -y -qq rclone chromium-browser zip curl msmtp msmtp-mta xvfb > /dev/null
           echo "✅ Dependencies installed"
 
       # --------------------------------------------------------------
@@ -135,7 +135,6 @@ jobs:
           set -e
           set -o pipefail
 
-          # נתיב לוג קבוע - שימוש במשתנה הסביבה של הראנר
           LOG_FILE="$RUNNER_TEMP/process.log"
           exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -153,32 +152,48 @@ jobs:
             echo "🌐 Capturing web page as MHTML using Chromium headless..."
             echo "⏳ This may take 10-30 seconds..."
 
-            chromium-browser \
-              --headless=new \
-              --disable-gpu \
-              --no-sandbox \
-              --disable-dev-shm-usage \
-              --disable-web-security \
-              --disable-features=VizDisplayCompositor \
-              --run-all-compositor-stages-before-draw \
-              --virtual-time-budget=30000 \
-              --timeout=60000 \
-              --save-page-as-mhtml="$MHTML_FILE" \
-              "$FILE_URL" 2>&1 | tail -20
+            # ספריית משתמש ייחודית (נדרשת כשמכבים web-security)
+            USER_DATA_DIR="${TMP_DIR}/chrome-profile"
+            mkdir -p "$USER_DATA_DIR"
 
-            if [[ ! -s "$MHTML_FILE" ]]; then
-              echo "⚠️ First attempt failed, trying with --head=new..."
+            # הרצה דרך xvfb-run עם דגלים מלאים ל-headless יציב
+            xvfb-run -a --server-args="-screen 0 1920x1080x24" \
               chromium-browser \
-                --head=new \
+                --headless=new \
                 --disable-gpu \
                 --no-sandbox \
                 --disable-dev-shm-usage \
                 --disable-web-security \
+                --disable-features=VizDisplayCompositor,TranslateUI,BlinkGenPropertyTrees \
+                --disable-background-networking \
+                --disable-background-timer-throttling \
+                --disable-backgrounding-occluded-windows \
+                --disable-breakpad \
+                --disable-client-side-phishing-detection \
+                --disable-component-extensions-with-background-pages \
+                --disable-default-apps \
+                --disable-extensions \
+                --disable-features=TranslateUI \
+                --disable-hang-monitor \
+                --disable-ipc-flooding-protection \
+                --disable-popup-blocking \
+                --disable-prompt-on-repost \
+                --disable-renderer-backgrounding \
+                --disable-sync \
+                --disable-translate \
+                --metrics-recording-only \
+                --no-first-run \
+                --no-default-browser-check \
+                --no-pings \
+                --no-zygote \
+                --password-store=basic \
+                --use-mock-keychain \
+                --user-data-dir="$USER_DATA_DIR" \
                 --virtual-time-budget=30000 \
                 --timeout=60000 \
+                --run-all-compositor-stages-before-draw \
                 --save-page-as-mhtml="$MHTML_FILE" \
-                "$FILE_URL" 2>&1 | tail -20
-            fi
+                "$FILE_URL" 2>&1 | tail -30
 
             if [[ ! -s "$MHTML_FILE" ]]; then
               echo "❌ MHTML capture failed – file is empty or not created"
@@ -219,7 +234,7 @@ jobs:
           echo "✅ Finished – ZIP uploaded successfully at $(date)"
 
       # --------------------------------------------------------------
-      # 6️⃣  שליחת אימייל במקרה כישלון (משתמש באותו $RUNNER_TEMP)
+      # 6️⃣  שליחת אימייל במקרה כישלון
       # --------------------------------------------------------------
       - name: Send email on failure
         if: failure()
@@ -234,7 +249,6 @@ jobs:
         run: |
           set -e
 
-          # אותו נתיב בדיוק כמו בשלב הקודם
           LOG_FILE="$RUNNER_TEMP/process.log"
           LOG_CONTENT=$(cat "$LOG_FILE" 2>/dev/null || echo "Log file not found: $LOG_FILE")
 
@@ -244,11 +258,9 @@ jobs:
 
           ERROR_SUMMARY=$(echo "$LOG_CONTENT" | grep -E "(❌|Error|FAILED|exit 1|failed)" -i | head -5 | sed 's/"/\\"/g' || echo "No specific error pattern found")
 
-          # כתיבת קונפיג msmtp עם printf
           printf "defaults\nauth           on\ntls            on\ntls_trust_file /etc/ssl/certs/ca-certificates.crt\nlogfile        ~/.msmtp.log\n\naccount        gmail\nhost           smtp.gmail.com\nport           587\nfrom           p0556722432@gmail.com\nuser           p0556722432@gmail.com\npassword       %s\n\naccount default : gmail\n" "$EMAIL_PASSWORD" > ~/.msmtprc
           chmod 600 ~/.msmtprc
 
-          # בניית האימייל ושליחה
           {
             echo "From: p0556722432@gmail.com"
             echo "To: p0556722432@gmail.com"
