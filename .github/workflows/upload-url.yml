@@ -1,3 +1,4 @@
+# .github/workflows/upload-url-to-drive.yml
 name: Upload URL → Google Drive (Zip via temporary file)
 
 on:
@@ -22,13 +23,18 @@ jobs:
     permissions:
       contents: read
     steps:
+      # --------------------------------------------------------------
+      # 1️⃣  התקנת כלי עבודה + msmtp
+      # --------------------------------------------------------------
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq rclone chromium-browser zip curl mailutils libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 > /dev/null
+          sudo apt-get install -y -qq rclone chromium-browser zip curl msmtp msmtp-mta > /dev/null
           echo "✅ Dependencies installed"
-          chromium-browser --version || echo "Chromium version check failed"
 
+      # --------------------------------------------------------------
+      # 2️⃣  קונפיג rclone
+      # --------------------------------------------------------------
       - name: Write rclone config
         env:
           RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
@@ -42,6 +48,9 @@ jobs:
           EOF
           echo "✅ rclone configured"
 
+      # --------------------------------------------------------------
+      # 3️⃣  חישוב שמות וקביעת סוג התוכן
+      # --------------------------------------------------------------
       - name: Determine file names and type
         id: names
         env:
@@ -55,10 +64,8 @@ jobs:
           decoded_name=$(printf '%b' "$(echo -e "${raw_name//%/\\x}")")
           echo "🔤 Decoded name from URL = $decoded_name"
 
-          # בדיקת Content-Type עם timeout
           is_html=false
-          content_type=$(curl -sI -L --max-time 10 "$FILE_URL" 2>/dev/null | grep -i '^content-type:' | head -1 | cut -d' ' -f2- | tr -d '\r' || echo "")
-          echo "📄 Content-Type: $content_type"
+          content_type=$(curl -sI -L "$FILE_URL" | grep -i '^content-type:' | head -1 | cut -d' ' -f2- | tr -d '\r')
           if [[ "$content_type" =~ text/html ]]; then
             is_html=true
           fi
@@ -92,6 +99,9 @@ jobs:
           echo "📁 Internal file name     = $original_name"
           echo "🌐 Is HTML page          = $is_html"
 
+      # --------------------------------------------------------------
+      # 4️⃣  מחיקת קובץ קיים
+      # --------------------------------------------------------------
       - name: Delete old ZIP if exists
         env:
           REMOTE_PATH: ${{ steps.names.outputs.remote_path }}
@@ -103,6 +113,9 @@ jobs:
             echo "✅ No previous ZIP found"
           fi
 
+      # --------------------------------------------------------------
+      # 5️⃣  הורדה / לכידת דף → ZIP → העלאה
+      # --------------------------------------------------------------
       - name: Download or capture page → zip → upload
         id: process
         env:
@@ -128,22 +141,17 @@ jobs:
           echo "🚀 Starting process at $(date)"
           echo "URL: $FILE_URL"
           echo "Is HTML: $IS_HTML"
-          echo "Original name: $ORIGINAL_NAME"
-          echo "ZIP name: $ZIP_NAME"
 
           TMP_DIR=$(mktemp -d)
           TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
           echo "📂 Working directory = $TMP_DIR"
 
           if [[ "$IS_HTML" == "true" ]]; then
-            # ---- לכידת דף אינטרנט כ-MHTML ----
             MHTML_FILE="${TMP_DIR}/${ORIGINAL_NAME}"
             echo "🌐 Capturing web page as MHTML using Chromium headless..."
             echo "⏳ This may take 10-30 seconds..."
 
-            # נסיון ראשון עם הגדרות מלאות
-            echo "🔧 Trying chromium with full flags..."
-            if timeout 90 chromium-browser \
+            chromium-browser \
               --headless=new \
               --disable-gpu \
               --no-sandbox \
@@ -154,32 +162,24 @@ jobs:
               --virtual-time-budget=30000 \
               --timeout=60000 \
               --save-page-as-mhtml="$MHTML_FILE" \
-              "$FILE_URL" 2>&1; then
-              echo "✅ Chromium succeeded on first try"
-            else
-              EXIT_CODE=$?
-              echo "⚠️ First attempt failed (exit code: $EXIT_CODE), trying simplified flags..."
-              
-              # נסיון שני עם הגדרות מינימליות
-              if timeout 90 chromium-browser \
-                --headless=new \
+              "$FILE_URL" 2>&1 | tail -20
+
+            if [[ ! -s "$MHTML_FILE" ]]; then
+              echo "⚠️ First attempt failed, trying with --head=new..."
+              chromium-browser \
+                --head=new \
+                --disable-gpu \
                 --no-sandbox \
                 --disable-dev-shm-usage \
+                --disable-web-security \
+                --virtual-time-budget=30000 \
+                --timeout=60000 \
                 --save-page-as-mhtml="$MHTML_FILE" \
-                "$FILE_URL" 2>&1; then
-                echo "✅ Chromium succeeded on second try"
-              else
-                EXIT_CODE=$?
-                echo "❌ Chromium failed completely (exit code: $EXIT_CODE)"
-                echo "📁 Temp dir contents:"
-                ls -la "$TMP_DIR/"
-                exit 1
-              fi
+                "$FILE_URL" 2>&1 | tail -20
             fi
 
             if [[ ! -s "$MHTML_FILE" ]]; then
               echo "❌ MHTML capture failed – file is empty or not created"
-              echo "📁 Temp dir contents:"
               ls -la "$TMP_DIR/"
               exit 1
             fi
@@ -187,13 +187,9 @@ jobs:
             echo "✅ MHTML captured successfully ($(du -h "$MHTML_FILE" | cut -f1))"
             INTERNAL_FILE="$MHTML_FILE"
           else
-            # ---- הורדת קובץ רגיל ----
             DOWNLOADED_FILE="${TMP_DIR}/downloaded_file"
             echo "⬇️ Downloading $FILE_URL → $DOWNLOADED_FILE"
-            if ! curl -L -s -o "$DOWNLOADED_FILE" "$FILE_URL" --max-time 300 --retry 3 --retry-delay 5 --fail; then
-              echo "❌ Download failed (curl exit code: $?)"
-              exit 1
-            fi
+            curl -L -s -o "$DOWNLOADED_FILE" "$FILE_URL" --max-time 300 --retry 3 --retry-delay 5
 
             if [[ ! -s "$DOWNLOADED_FILE" ]]; then
               echo "❌ Download failed or file is empty"
@@ -205,8 +201,7 @@ jobs:
             INTERNAL_FILE="${TMP_DIR}/${ORIGINAL_NAME}"
           fi
 
-          # ---- יצירת ZIP ----
-          echo "🗜️ Creating ZIP $TMP_ZIP with internal name '$ORIGINAL_ORIGINAL_NAME'"
+          echo "🗜️ Creating ZIP $TMP_ZIP with internal name '$ORIGINAL_NAME'"
           (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$ORIGINAL_NAME")
 
           if [[ ! -s "$TMP_ZIP" ]]; then
@@ -216,14 +211,16 @@ jobs:
 
           echo "✅ ZIP created ($(du -h "$TMP_ZIP" | cut -f1))"
 
-          # ---- העלאה ל-Google Drive ----
           echo "🚀 Uploading ZIP to Drive: $DEST_PATH"
-          rclone copy "$TMP_ZIP" "$DEST_PATH" --progress --drive-chunk-size 64M --retries 3
+          rclone copy "$TMP_ZIP" "$DEST_PATH" --progress --drive-chunk-size 64M
 
           echo "✅ Finished – ZIP uploaded successfully at $(date)"
 
           echo "log_file=$LOG_FILE" >> $GITHUB_OUTPUT
 
+      # --------------------------------------------------------------
+      # 6️⃣  שליחת אימייל במקרה כישלון (עם msmtp - בלי heredoc בעייתי)
+      # --------------------------------------------------------------
       - name: Send email on failure
         if: failure()
         env:
@@ -238,44 +235,49 @@ jobs:
         run: |
           set -e
 
-          LOG_CONTENT=$(cat "$LOG_FILE" 2>/dev/null || echo "Log file not found")
+          LOG_CONTENT=$(cat "$LOG_FILE" 2>/dev/null || echo "Log file not found: $LOG_FILE")
 
-          ERROR_SUMMARY=$(echo "$LOG_CONTENT" | grep -E "(❌|Error|FAILED|exit 1|failed|timeout)" | head -5 | sed 's/"/\\"/g' || echo "No specific error pattern found")
+          echo "📧 Preparing failure email..."
+          echo "Log file: $LOG_FILE"
+          echo "Log size: $(wc -c < "$LOG_FILE" 2>/dev/null || echo 0) bytes"
 
-          SUBJECT="❌ GitHub Actions Failed: $WORKFLOW"
-          
+          ERROR_SUMMARY=$(echo "$LOG_CONTENT" | grep -E "(❌|Error|FAILED|exit 1|failed)" -i | head -5 | sed 's/"/\\"/g' || echo "No specific error pattern found")
+
+          # כתיבת קונפיג msmtp בלי heredoc - באמצעות printf
+          printf "defaults\nauth           on\ntls            on\ntls_trust_file /etc/ssl/certs/ca-certificates.crt\nlogfile        ~/.msmtp.log\n\naccount        gmail\nhost           smtp.gmail.com\nport           587\nfrom           p0556722432@gmail.com\nuser           p0556722432@gmail.com\npassword       %s\n\naccount default : gmail\n" "$EMAIL_PASSWORD" > ~/.msmtprc
+          chmod 600 ~/.msmtprc
+
+          # בניית האימייל ושליחה
           {
+            echo "From: p0556722432@gmail.com"
+            echo "To: p0556722432@gmail.com"
+            echo "Subject: ❌ GitHub Actions Failed: $WORKFLOW"
+            echo "Content-Type: text/plain; charset=UTF-8"
+            echo ""
             echo "שלום,"
             echo ""
             echo "הריצה של ה-workflow **$WORKFLOW** נכשלה."
             echo ""
-            echo "📋 **פרטי הריצה:**"
+            echo "📋 פרטי הריצה:"
             echo "- ריפו: $REPO"
             echo "- מריץ: $ACTOR"
             echo "- קישור לריצה: $RUN_URL"
             echo "- זמן: $(date '+%Y-%m-%d %H:%M:%S UTC')"
             echo ""
-            echo "🔗 **URL שעובד:**"
+            echo "🔗 URL שעובד:"
             echo "$INPUT_URL"
             echo ""
-            echo "📂 **תיקיית יעד:**"
+            echo "📂 תיקיית יעד:"
             echo "$INPUT_FOLDER"
             echo ""
-            echo "⚠️ **תקציר שגיאה:**"
+            echo "⚠️ תקציר שגיאה:"
             echo "$ERROR_SUMMARY"
             echo ""
-            echo "📄 **לוג מלא (50 שורות אחרונות):**"
-            echo "$LOG_CONTENT" | tail -50
+            echo "📄 לוג מלא (100 שורות אחרונות):"
+            echo "$LOG_CONTENT" | tail -100
             echo ""
             echo "---"
             echo "נשלח אוטומטית מ-GitHub Actions"
-          } | mail -s "$SUBJECT" \
-            -r "p0556722432@gmail.com" \
-            -S smtp="smtp.gmail.com:587" \
-            -S smtp-auth=login \
-            -S smtp-auth-user="p0556722432@gmail.com" \
-            -S smtp-auth-password="$EMAIL_PASSWORD" \
-            -S tls=on \
-            "p0556722432@gmail.com" 2>&1 || echo "⚠️ Email sending failed, but continuing..."
+          } | msmtp --debug -a gmail p0556722432@gmail.com 2>&1
 
-          echo "📧 Failure email process completed"
+          echo "📧 Failure email sent successfully"
