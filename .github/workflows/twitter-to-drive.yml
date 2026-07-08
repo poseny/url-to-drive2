@@ -37,7 +37,7 @@ jobs:
 
     steps:
       # --------------------------------------------------------------
-      # 1️⃣  התקנת תלויות + יצירת לוג (השלב הראשון שרץ בוודאות)
+      # 1️⃣  התקנת תלויות + יצירת לוג
       # --------------------------------------------------------------
       - name: Install dependencies & Init log
         continue-on-error: true
@@ -87,50 +87,18 @@ jobs:
           echo "✅ rclone configured"
 
       # --------------------------------------------------------------
-      # 3️⃣  קביעת שמות (כותרת מה‑yt-dlp)
+      # 3️⃣  מחיקת ZIP קודם (אם קיים) – משתמש בשם זמני, יתוקן בשלב הבא
       # --------------------------------------------------------------
-      - name: Determine output names
+      - name: Remove previous ZIP (placeholder)
         continue-on-error: true
-        id: names
         shell: bash
-        env:
-          USER_NAME: ${{ github.event.inputs.filename }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "🔧 [$(date -u +"%H:%M:%S")] Determining names..."
-          TITLE=$(yt-dlp --skip-download --print "%(title)s [%(id)s]" "${{ github.event.inputs.url }}" 2>&1 | head -1)
-          echo "   Raw title: $TITLE"
-          SAFE_TITLE=$(echo "$TITLE" | sed 's/[\\/:*?"<>|]/_/g' | cut -c1-180)
-          BASE_NAME="${USER_NAME:-$SAFE_TITLE}"
-          ZIP_NAME="${BASE_NAME}.zip"
-          REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/$ZIP_NAME"
-          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
-          echo "remote_path=$REMOTE_PATH" >> $GITHUB_OUTPUT
-          echo "   ZIP: $ZIP_NAME"
-          echo "✅ Names determined"
+          echo "🔧 [$(date -u +"%H:%M:%S")] Skipping old ZIP cleanup (name determined later)..."
 
       # --------------------------------------------------------------
-      # 4️⃣  מחיקת ZIP קודם
-      # --------------------------------------------------------------
-      - name: Remove previous ZIP
-        continue-on-error: true
-        shell: bash
-        env:
-          REMOTE_PATH: ${{ steps.names.outputs.remote_path }}
-        run: |
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          exec >> "$LOG_FILE" 2>&1
-          echo "🔧 [$(date -u +"%H:%M:%S")] Checking old ZIP..."
-          if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
-            rclone delete "$REMOTE_PATH"
-            echo "   Deleted."
-          else
-            echo "   None found."
-          fi
-
-      # --------------------------------------------------------------
-      # 5️⃣  הורדה → Zip → העלאה (מתוקן: תומך ריבוי סרטונים, בלי cp מיותר)
+      # 4️⃣  הורדה → קביעת שמות → Zip → העלאה (הכל בשלב אחד, בשביל שלא ייכשל באמצע)
       # --------------------------------------------------------------
       - name: Download → Zip → Upload
         continue-on-error: true
@@ -138,8 +106,8 @@ jobs:
         shell: bash
         env:
           TWEET_URL: ${{ github.event.inputs.url }}
-          ZIP_NAME: ${{ steps.names.outputs.zip_name }}
-          DEST_PATH: ${{ steps.names.outputs.remote_path }}
+          USER_FILENAME: ${{ github.event.inputs.filename }}
+          FOLDER: ${{ github.event.inputs.folder }}
           COOKIES: ${{ github.event.inputs.cookies }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
@@ -149,7 +117,6 @@ jobs:
           set -o pipefail
 
           TMP_DIR=$(mktemp -d)
-          TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
           COOKIE_FILE=""
 
           echo "   Work dir: $TMP_DIR"
@@ -192,10 +159,26 @@ jobs:
             echo "     - $(basename "$f") ($(numfmt --to=iec $SIZE))"
           done
 
+          # ---- קביעת שם ZIP (כאן, אחרי שההורדה הצליחה) ----
+          if [[ -n "$USER_FILENAME" ]]; then
+            BASE_NAME="$USER_FILENAME"
+          else
+            # לוקח שם מהקובץ הראשון (כבר נקי ע"י yt-dlp), מסיר סיומת
+            FIRST_FILE=$(basename "${VIDEO_FILES[0]}")
+            BASE_NAME="${FIRST_FILE%.*}"
+            # מקצר ל-180 תווים ליתר ביטחון
+            BASE_NAME="${BASE_NAME:0:180}"
+          fi
+
+          ZIP_NAME="${BASE_NAME}.zip"
+          REMOTE_PATH="gdrive:${FOLDER}/${ZIP_NAME}"
+          TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
+
+          echo "   ZIP name: $ZIP_NAME"
+          echo "   Remote path: $REMOTE_PATH"
+
           # ---- יצירת ZIP עם כל הקבצים ----
           echo "🗜️ [$(date -u +"%H:%M:%S")] Creating ZIP with ${#VIDEO_FILES[@]} file(s)..."
-          # משתמש ב- -j כדי לשטח נתיבים (רק שמות קבצים בתוך ה-ZIP)
-          # עובר לתיקייה הזמנית כדי שהנתיבים ב-ZIP יהיו נקיים
           (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "${VIDEO_FILES[@]}")
 
           if [[ ! -s "$TMP_ZIP" ]]; then
@@ -206,9 +189,16 @@ jobs:
           ZIP_SIZE=$(stat -c%s "$TMP_ZIP")
           echo "   ZIP created: $ZIP_NAME ($(numfmt --to=iec $ZIP_SIZE))"
 
+          # ---- מחיקת ZIP ישן באותו שם (עכשיו כשיש שם סופי) ----
+          echo "🗑️ [$(date -u +"%H:%M:%S")] Removing old ZIP if exists..."
+          if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
+            rclone delete "$REMOTE_PATH"
+            echo "   Deleted old."
+          fi
+
           # ---- העלאה ל-Drive ----
           echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
-          rclone copy "$TMP_ZIP" "$DEST_PATH" --progress
+          rclone copy "$TMP_ZIP" "$REMOTE_PATH" --progress
           RCLONE_EXIT=$?
           [[ $RCLONE_EXIT -ne 0 ]] && { echo "❌ rclone exit: $RCLONE_EXIT"; exit $RCLONE_EXIT; }
 
@@ -222,7 +212,7 @@ jobs:
           echo "FILE_COUNT=${#VIDEO_FILES[@]}" >> $GITHUB_OUTPUT
 
       # --------------------------------------------------------------
-      # 6️⃣  שליחת אימייל (רץ תמיד, עצמאי לחלוטין)
+      # 5️⃣  שליחת אימייל (רץ תמיד, עצמאי לחלוטין)
       # --------------------------------------------------------------
       - name: Send log email (self-contained)
         if: always()
@@ -232,6 +222,7 @@ jobs:
           STATUS: ${{ steps.dl_upload.outputs.STATUS }}
           FILE_NAME: ${{ steps.dl_upload.outputs.FILE_NAME }}
           FILE_SIZE: ${{ steps.dl_upload.outputs.FILE_SIZE }}
+          FILE_COUNT: ${{ steps.dl_upload.outputs.FILE_COUNT }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
@@ -264,8 +255,9 @@ jobs:
           if [[ "$STATUS" == "success" ]]; then
             SUBJECT="✅ [GitHub Actions] X/Twitter Download SUCCESS - ${{ github.repository }}"
             BODY="ההורדה וההעלאה הושלמו בהצלחה.\n\n"
-            BODY+="📁 קובץ: $FILE_NAME\n"
-            BODY+="📦 גודל: $(numfmt --to=iec $FILE_SIZE 2>/dev/null || echo $FILE_SIZE bytes)\n"
+            BODY+="📁 קובץ ZIP: $FILE_NAME\n"
+            BODY+="📦 גודל ZIP: $(numfmt --to=iec $FILE_SIZE 2>/dev/null || echo $FILE_SIZE bytes)\n"
+            BODY+="🎬 סרטונים ב-ZIP: ${FILE_COUNT:-1}\n"
             BODY+="📂 תיקייה: ${{ github.event.inputs.folder }}\n"
             BODY+="🔗 ציוץ: ${{ github.event.inputs.url }}\n"
             BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
@@ -286,7 +278,7 @@ jobs:
           echo "✅ Email sent to $EMAIL_TO"
 
       # --------------------------------------------------------------
-      # 7️⃣  העלאת הלוג כ‑Artifact (גיבוי – תמיד עובד)
+      # 6️⃣  העלאת הלוג כ‑Artifact (גיבוי)
       # --------------------------------------------------------------
       - name: Upload log as Artifact
         if: always()
@@ -298,7 +290,7 @@ jobs:
           if-no-files-found: warn
 
       # --------------------------------------------------------------
-      # 8️⃣  סיכום סופי – קובע צבע הריצה
+      # 7️⃣  סיכום סופי
       # --------------------------------------------------------------
       - name: Final summary
         if: always()
