@@ -1,3 +1,4 @@
+# .github/workflows/upload-url-to-drive.yml
 name: Upload URL → Google Drive (Zip via temporary file)
 
 on:
@@ -23,7 +24,7 @@ jobs:
       contents: read
     steps:
       # --------------------------------------------------------------
-      # 1️⃣  התקנת כלי עבודה: rclone, chromium, curl, zip, mailutils
+      # 1️⃣  התקנת כלי עבודה
       # --------------------------------------------------------------
       - name: Install dependencies
         run: |
@@ -63,21 +64,17 @@ jobs:
           decoded_name=$(printf '%b' "$(echo -e "${raw_name//%/\\x}")")
           echo "🔤 Decoded name from URL = $decoded_name"
 
-          # זיהוי אם זה דף HTML לפי סיומת או Content-Type
+          # זיהוי אם זה דף HTML לפי Content-Type
           is_html=false
-          if [[ "$decoded_name" =~ \.(html?|php|asp|jsp)$ ]] || [[ "$FILE_URL" =~ ^https?://[^/]+/($|[^?]*[^/]\??) ]]; then
-            # נבדוק Content-Type בראשית ההורדה
-            content_type=$(curl -sI -L "$FILE_URL" | grep -i '^content-type:' | head -1 | cut -d' ' -f2- | tr -d '\r')
-            if [[ "$content_type" =~ text/html ]]; then
-              is_html=true
-            fi
+          content_type=$(curl -sI -L "$FILE_URL" | grep -i '^content-type:' | head -1 | cut -d' ' -f2- | tr -d '\r')
+          if [[ "$content_type" =~ text/html ]]; then
+            is_html=true
           fi
 
           if [[ -n "$USER_NAME" ]]; then
             base_name="$USER_NAME"
           else
             base_name="${decoded_name%.*}"
-            # אם אין סיומת או שזה HTML, נשתמש ב-timestamp
             if [[ "$base_name" == "$decoded_name" ]] || [[ "$is_html" == "true" ]]; then
               base_name="page_$(date +%Y%m%d_%H%M%S)"
             fi
@@ -129,12 +126,18 @@ jobs:
           DEST_PATH: ${{ steps.names.outputs.remote_path }}
           IS_HTML: ${{ steps.names.outputs.is_html }}
           BASE_NAME: ${{ steps.names.outputs.base_name }}
+          TARGET_FOLDER: ${{ github.event.inputs.folder }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          REPO_NAME: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ACTOR_NAME: ${{ github.actor }}
         run: |
           set -e
           set -o pipefail
 
           # לוג מרכזי
-          LOG_FILE="${{ runner.temp }}/process.log"
+          LOG_FILE="${RUNNER_TEMP}/process.log"
           exec > >(tee -a "$LOG_FILE") 2>&1
 
           echo "🚀 Starting process at $(date)"
@@ -151,7 +154,6 @@ jobs:
             echo "🌐 Capturing web page as MHTML using Chromium headless..."
             echo "⏳ This may take 10-30 seconds..."
 
-            # Chromium flags for headless MHTML capture
             chromium-browser \
               --headless=new \
               --disable-gpu \
@@ -165,7 +167,6 @@ jobs:
               --save-page-as-mhtml="$MHTML_FILE" \
               "$FILE_URL" 2>&1 | tail -20
 
-            # וידוא שהקובץ נוצר וגודלו תקין
             if [[ ! -s "$MHTML_FILE" ]]; then
               echo "❌ MHTML capture failed – file is empty or not created"
               ls -la "$TMP_DIR/"
@@ -186,7 +187,6 @@ jobs:
             fi
 
             echo "✅ Downloaded successfully ($(du -h "$DOWNLOADED_FILE" | cut -f1))"
-            # העתק עם השם הרצוי בתוך ה-ZIP
             cp "$DOWNLOADED_FILE" "${TMP_DIR}/${ORIGINAL_NAME}"
             INTERNAL_FILE="${TMP_DIR}/${ORIGINAL_NAME}"
           fi
@@ -212,73 +212,61 @@ jobs:
           echo "log_file=$LOG_FILE" >> $GITHUB_OUTPUT
 
       # --------------------------------------------------------------
-      # 6️⃣  שליחת אימייל במקרה כישלון (רוץ תמיד, בדוק סטטוס)
+      # 6️⃣  שליחת אימייל במקרה כישלון
       # --------------------------------------------------------------
       - name: Send email on failure
         if: failure()
         env:
           LOG_FILE: ${{ steps.process.outputs.log_file }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          WORKFLOW: ${{ github.workflow }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          WORKFLOW: ${{ github.workflow }}
           ACTOR: ${{ github.actor }}
+          INPUT_URL: ${{ github.event.inputs.url }}
+          INPUT_FOLDER: ${{ github.event.inputs.folder }}
         run: |
           set -e
 
-          # קריאת הלוג
           LOG_CONTENT=$(cat "$LOG_FILE" 2>/dev/null || echo "Log file not found")
 
-          # חילוץ שגיאה עיקרית
-          ERROR_SUMMARY=$(echo "$LOG_CONTENT" | grep -E "(❌|Error|FAILED|exit 1|failed)" | head -5 | sed 's/"/\\"/g')
+          ERROR_SUMMARY=$(echo "$LOG_CONTENT" | grep -E "(❌|Error|FAILED|exit 1|failed)" | head -5 | sed 's/"/\\"/g' || echo "No specific error pattern found")
 
           SUBJECT="❌ GitHub Actions Failed: $WORKFLOW"
-          BODY=$(cat <<EOF
-שלום,
-
-הריצה של ה-workflow **$WORKFLOW** נכשלה.
-
-📋 **פרטי הריצה:**
-- ריפו: $REPO
-- מריץ: $ACTOR
-- קישור לריצה: $RUN_URL
-- זמן: $(date '+%Y-%m-%d %H:%M:%S UTC')
-
-🔗 **URL שעובד:**
-${{ github.event.inputs.url }}
-
-📂 **תיקיית יעד:**
-${{ github.event.inputs.folder }}
-
-⚠️ **תקציר שגיאה:**
-$ERROR_SUMMARY
-
-📄 **לוג מלא (50 שורות אחרונות):**
-$(echo "$LOG_CONTENT" | tail -50)
-
----
-נשלח אוטומטית מ-GitHub Actions
-EOF
-)
-
-          # שליחה דרך sendmail (mailutils)
-          echo "$BODY" | mail -s "$SUBJECT" -r "p0556722432@gmail.com" -S smtp="smtp.gmail.com:587" -S smtp-auth=login -S smtp-auth-user="p0556722432@gmail.com" -S smtp-auth-password="$EMAIL_PASSWORD" -S tls=on "p0556722432@gmail.com"
+          
+          # בניית גוף האימייל עם cat ו-here-string לשמירה על עברית
+          {
+            echo "שלום,"
+            echo ""
+            echo "הריצה של ה-workflow **$WORKFLOW** נכשלה."
+            echo ""
+            echo "📋 **פרטי הריצה:**"
+            echo "- ריפו: $REPO"
+            echo "- מריץ: $ACTOR"
+            echo "- קישור לריצה: $RUN_URL"
+            echo "- זמן: $(date '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            echo "🔗 **URL שעובד:**"
+            echo "$INPUT_URL"
+            echo ""
+            echo "📂 **תיקיית יעד:**"
+            echo "$INPUT_FOLDER"
+            echo ""
+            echo "⚠️ **תקציר שגיאה:**"
+            echo "$ERROR_SUMMARY"
+            echo ""
+            echo "📄 **לוג מלא (50 שורות אחרונות):**"
+            echo "$LOG_CONTENT" | tail -50
+            echo ""
+            echo "---"
+            echo "נשלח אוטומטית מ-GitHub Actions"
+          } | mail -s "$SUBJECT" \
+            -r "p0556722432@gmail.com" \
+            -S smtp="smtp.gmail.com:587" \
+            -S smtp-auth=login \
+            -S smtp-auth-user="p0556722432@gmail.com" \
+            -S smtp-auth-password="$EMAIL_PASSWORD" \
+            -S tls=on \
+            "p0556722432@gmail.com"
 
           echo "📧 Failure email sent"
-
-      # --------------------------------------------------------------
-      # 7️⃣  אימייל הצלחה אופציונלי (הסר הערה אם רוצה)
-      # --------------------------------------------------------------
-      # - name: Send success email
-      #   if: success()
-      #   env:
-      #     EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-      #     RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      #   run: |
-      #     echo "✅ Upload completed successfully. Check: $RUN_URL" | \
-      #     mail -s "✅ GitHub Actions Success: Upload to Drive" \
-      #       -r "p0556722432@gmail.com" \
-      #       -S smtp="smtp.gmail.com:587" -S smtp-auth=login \
-      #       -S smtp-auth-user="p0556722432@gmail.com" \
-      #       -S smtp-auth-password="$EMAIL_PASSWORD" -S tls=on \
-      #       "p0556722432@gmail.com"
