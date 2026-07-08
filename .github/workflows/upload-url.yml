@@ -1,3 +1,4 @@
+# .github/workflows/upload-url-to-drive.yml
 name: Upload URL → Google Drive (Zip via temporary file)
 
 on:
@@ -6,7 +7,7 @@ on:
       url:
         description: "כתובת URL של הקובץ/דף להורדה"
         required: true
-        default: "https://huggingface.co/models?search=Ornith-1.0-9B-GGUF"
+        default: "https://upload.wikimedia.org/wikipedia/commons/d/d6/Her_First_Kiss_%281919%29.webm"
       folder:
         description: "תיקיית יעד ב‑Drive (ללא שם קובץ)"
         required: true
@@ -18,35 +19,18 @@ on:
 
 jobs:
   upload:
-    # --------------------------------------------------------------
-    # 🐳 מריצים הכול בתוך קונטיינר Playwright – Chrome עובד "ישר מהקופסה"
-    # --------------------------------------------------------------
     runs-on: ubuntu-latest
-    container:
-      image: mcr.microsoft.com/playwright:v1.40-noble   # Ubuntu 24.04 + Chrome + כל התלויות
-      options: --user root                               # הרצה כ‑root כדי לכתוב ל‑/home/runner ולהתקין rclone
-    env:
-      LOG_PATH: /home/runner/download_step.log
-
+    permissions:
+      contents: read
     steps:
       # --------------------------------------------------------------
-      # 0️⃣  יצירת קובץ לוג ריק מיד בהתחלה
+      # 1️⃣  התקנת כלי עבודה: rclone, chromium, curl, zip, mailutils
       # --------------------------------------------------------------
-      - name: Setup log file
+      - name: Install dependencies
         run: |
-          touch "$LOG_PATH"
-          echo "📝 Log file created at $LOG_PATH"
-          echo "=== Workflow started at $(date) ===" >> "$LOG_PATH"
-
-      # --------------------------------------------------------------
-      # 1️⃣  התקנת rclone בלבד (curl, zip, chrome, fonts – כבר בקונטיינר)
-      # --------------------------------------------------------------
-      - name: Install rclone
-        run: |
-          curl https://rclone.org/install.sh | sudo bash
-          rclone version
-          # וידוא ש‑Chrome קיים
-          google-chrome --version || chromium --version
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone chromium-browser zip curl mailutils > /dev/null
+          echo "✅ Dependencies installed"
 
       # --------------------------------------------------------------
       # 2️⃣  קונפיג rclone
@@ -62,41 +46,68 @@ jobs:
           scope = drive.file
           token = $RCLONE_GDRIVE_TOKEN
           EOF
+          echo "✅ rclone configured"
 
       # --------------------------------------------------------------
-      # 3️⃣  חישוב שמות
+      # 3️⃣  חישוב שמות וקביעת סוג התוכן
       # --------------------------------------------------------------
-      - name: Determine file names
+      - name: Determine file names and type
         id: names
         env:
           FILE_URL: ${{ github.event.inputs.url }}
           USER_NAME: ${{ github.event.inputs.filename }}
         run: |
           set -e
+
           raw_name=$(basename "$FILE_URL")
           raw_name=${raw_name%%\?*}
           decoded_name=$(printf '%b' "$(echo -e "${raw_name//%/\\x}")")
           echo "🔤 Decoded name from URL = $decoded_name"
 
+          # זיהוי אם זה דף HTML לפי סיומת או Content-Type
+          is_html=false
+          if [[ "$decoded_name" =~ \.(html?|php|asp|jsp)$ ]] || [[ "$FILE_URL" =~ ^https?://[^/]+/($|[^?]*[^/]\??) ]]; then
+            # נבדוק Content-Type בראשית ההורדה
+            content_type=$(curl -sI -L "$FILE_URL" | grep -i '^content-type:' | head -1 | cut -d' ' -f2- | tr -d '\r')
+            if [[ "$content_type" =~ text/html ]]; then
+              is_html=true
+            fi
+          fi
+
           if [[ -n "$USER_NAME" ]]; then
             base_name="$USER_NAME"
           else
             base_name="${decoded_name%.*}"
-            [[ "$base_name" == "$decoded_name" ]] && base_name="page"
+            # אם אין סיומת או שזה HTML, נשתמש ב-timestamp
+            if [[ "$base_name" == "$decoded_name" ]] || [[ "$is_html" == "true" ]]; then
+              base_name="page_$(date +%Y%m%d_%H%M%S)"
+            fi
           fi
 
-          zip_name="${base_name}.zip"
-          echo "📦 ZIP name on Drive      = $zip_name"
-          echo "base_name=$base_name"        >> $GITHUB_OUTPUT
-          echo "decoded_name=$decoded_name"  >> $GITHUB_OUTPUT
-          echo "zip_name=$zip_name"          >> $GITHUB_OUTPUT
+          if [[ "$is_html" == "true" ]]; then
+            original_name="${base_name}.mhtml"
+            zip_name="${base_name}.zip"
+          else
+            original_name="$decoded_name"
+            zip_name="${base_name}.zip"
+          fi
+
           remote_path="gdrive:${{ github.event.inputs.folder }}/$zip_name"
-          echo "remote_path=$remote_path"    >> $GITHUB_OUTPUT
+
+          echo "is_html=$is_html" >> $GITHUB_OUTPUT
+          echo "original_name=$original_name" >> $GITHUB_OUTPUT
+          echo "zip_name=$zip_name" >> $GITHUB_OUTPUT
+          echo "remote_path=$remote_path" >> $GITHUB_OUTPUT
+          echo "base_name=$base_name" >> $GITHUB_OUTPUT
+
+          echo "📦 ZIP name on Drive      = $zip_name"
+          echo "📁 Internal file name     = $original_name"
+          echo "🌐 Is HTML page          = $is_html"
 
       # --------------------------------------------------------------
-      # 4️⃣  מחיקת ZIP קודם אם קיים
+      # 4️⃣  מחיקת קובץ קיים באותו שם
       # --------------------------------------------------------------
-      - name: Delete old ZIP if it exists
+      - name: Delete old ZIP if exists
         env:
           REMOTE_PATH: ${{ steps.names.outputs.remote_path }}
         run: |
@@ -108,128 +119,167 @@ jobs:
           fi
 
       # --------------------------------------------------------------
-      # 5️⃣  הורדה חכמה + MHTML עם Chrome יציב (Hard Timeout 3 דקות)
+      # 5️⃣  הורדה / לכידת דף → ZIP → העלאה
       # --------------------------------------------------------------
-      - name: Download → (maybe MHTML) → zip → upload
-        id: download_zip
+      - name: Download or capture page → zip → upload
+        id: process
         env:
           FILE_URL: ${{ github.event.inputs.url }}
-          BASE_NAME: ${{ steps.names.outputs.base_name }}
+          ORIGINAL_NAME: ${{ steps.names.outputs.original_name }}
           ZIP_NAME: ${{ steps.names.outputs.zip_name }}
           DEST_PATH: ${{ steps.names.outputs.remote_path }}
+          IS_HTML: ${{ steps.names.outputs.is_html }}
+          BASE_NAME: ${{ steps.names.outputs.base_name }}
         run: |
           set -e
           set -o pipefail
 
-          # מפנה פלט לקובץ הלוג הגלובלי
-          exec > >(tee -a "$LOG_PATH") 2>&1
+          # לוג מרכזי
+          LOG_FILE="${{ runner.temp }}/process.log"
+          exec > >(tee -a "$LOG_FILE") 2>&1
+
+          echo "🚀 Starting process at $(date)"
+          echo "URL: $FILE_URL"
+          echo "Is HTML: $IS_HTML"
 
           TMP_DIR=$(mktemp -d)
           TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
           echo "📂 Working directory = $TMP_DIR"
 
-          # ---- 5.1 בדיקת Content-Type ----
-          echo "🔎 Checking Content-Type..."
-          CONTENT_TYPE=$(curl -sI -L "$FILE_URL" | grep -i '^content-type:' | head -1 | cut -d' ' -f2- | tr -d '\r\n')
-          echo "📋 Content-Type: $CONTENT_TYPE"
+          if [[ "$IS_HTML" == "true" ]]; then
+            # ---- לכידת דף אינטרנט כ-MHTML עם Chromium headless ----
+            MHTML_FILE="${TMP_DIR}/${ORIGINAL_NAME}"
+            echo "🌐 Capturing web page as MHTML using Chromium headless..."
+            echo "⏳ This may take 10-30 seconds..."
 
-          INTERNAL_FILE=""
-
-          if [[ "$CONTENT_TYPE" == text/html* ]]; then
-            # ---- 5.2 דף HTML → MHTML ----
-            MHTML_FILE="${TMP_DIR}/${BASE_NAME}.mhtml"
-            USER_DATA_DIR="${TMP_DIR}/chrome-profile"
-            mkdir -p "$USER_DATA_DIR"
-
-            echo "🌐 Saving page as MHTML via Chrome (max 3 min wall-clock)..."
-            
-            # בקונטיינר Playwright הבינארי נקרא google-chrome (או chromium)
-            CHROME_BIN=$(command -v google-chrome || command -v chromium)
-            echo "🔧 Using Chrome binary: $CHROME_BIN"
-
-            # דגלים מינימליים – הקונטיינר כבר מטפל ב‑GPU/Sandbox/Fonts
-            # --headless=new           : מנוע headless החדש
-            # --disable-dev-shm-usage  : חובה ב‑CI
-            # --virtual-time-budget=30000 : 30 שניות זמן וירטואלי
-            # --timeout=180000         : 180 שניות timeout פנימי של Chrome (מילישניות)
-            # --run-all-compositor-stages-before-draw : רינדור מלא
-            timeout 180 "$CHROME_BIN" \
+            # Chromium flags for headless MHTML capture
+            chromium-browser \
               --headless=new \
+              --disable-gpu \
+              --no-sandbox \
               --disable-dev-shm-usage \
-              --no-first-run \
-              --no-default-browser-check \
-              --user-data-dir="$USER_DATA_DIR" \
-              --virtual-time-budget=30000 \
-              --window-size=1920,1080 \
+              --disable-web-security \
+              --disable-features=VizDisplayCompositor \
               --run-all-compositor-stages-before-draw \
+              --virtual-time-budget=30000 \
+              --timeout=60000 \
               --save-page-as-mhtml="$MHTML_FILE" \
-              "$FILE_URL" 2>&1 | tail -60
+              "$FILE_URL" 2>&1 | tail -20
 
-            CHROME_EXIT=$?
-            if [[ $CHROME_EXIT -eq 124 ]]; then
-              echo "⏰ Chrome timed out after 180s (SIGTERM sent). Checking if MHTML was created..."
-            elif [[ $CHROME_EXIT -ne 0 ]]; then
-              echo "⚠️ Chrome exited with code $CHROME_EXIT"
-            else
-              echo "✅ Chrome finished normally"
-            fi
-
-            # אם נוצר קובץ לא ריק – נשתמש בו (אפילו אם חלקי)
-            if [[ -s "$MHTML_FILE" ]]; then
-              INTERNAL_FILE="$MHTML_FILE"
-              echo "✅ MHTML created (size: $(du -h "$MHTML_FILE" | cut -f1))"
-            else
-              echo "❌ MHTML file missing or empty after Chrome run"
-              echo "🔍 Debug: listing $TMP_DIR"
-              ls -la "$TMP_DIR"
+            # וידוא שהקובץ נוצר וגודלו תקין
+            if [[ ! -s "$MHTML_FILE" ]]; then
+              echo "❌ MHTML capture failed – file is empty or not created"
+              ls -la "$TMP_DIR/"
               exit 1
             fi
-          else
-            # ---- 5.3 קובץ רגיל (binaries) ----
-            ORIG_FILE="${TMP_DIR}/downloaded_file"
-            echo "⬇️ Downloading binary file with curl..."
-            timeout 300 curl -L -s -o "$ORIG_FILE" "$FILE_URL"
 
-            if [[ ! -s "$ORIG_FILE" ]]; then
+            echo "✅ MHTML captured successfully ($(du -h "$MHTML_FILE" | cut -f1))"
+            INTERNAL_FILE="$MHTML_FILE"
+          else
+            # ---- הורדת קובץ רגיל ----
+            DOWNLOADED_FILE="${TMP_DIR}/downloaded_file"
+            echo "⬇️ Downloading $FILE_URL → $DOWNLOADED_FILE"
+            curl -L -s -o "$DOWNLOADED_FILE" "$FILE_URL" --max-time 300 --retry 3 --retry-delay 5
+
+            if [[ ! -s "$DOWNLOADED_FILE" ]]; then
               echo "❌ Download failed or file is empty"
               exit 1
             fi
-            INTERNAL_FILE="$ORIG_FILE"
-            echo "✅ File downloaded: $(du -h "$ORIG_FILE" | cut -f1)"
+
+            echo "✅ Downloaded successfully ($(du -h "$DOWNLOADED_FILE" | cut -f1))"
+            # העתק עם השם הרצוי בתוך ה-ZIP
+            cp "$DOWNLOADED_FILE" "${TMP_DIR}/${ORIGINAL_NAME}"
+            INTERNAL_FILE="${TMP_DIR}/${ORIGINAL_NAME}"
           fi
 
-          # ---- 5.4 יצירת ZIP ----
-          EXT="${INTERNAL_FILE##*.}"
-          ZIP_INTERNAL_NAME="${BASE_NAME}.${EXT}"
-          echo "🗜️ Creating ZIP $TMP_ZIP with internal name '$ZIP_INTERNAL_NAME'"
-          cp "$INTERNAL_FILE" "${TMP_DIR}/${ZIP_INTERNAL_NAME}"
-          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$ZIP_INTERNAL_NAME")
+          # ---- יצירת ZIP ----
+          echo "🗜️ Creating ZIP $TMP_ZIP with internal name '$ORIGINAL_NAME'"
+          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$ORIGINAL_NAME")
 
           if [[ ! -s "$TMP_ZIP" ]]; then
-            echo "❌ Zip creation failed"
+            echo "❌ Zip creation failed – file is empty"
             exit 1
           fi
 
-          # ---- 5.5 העלאה ל‑Drive ----
+          echo "✅ ZIP created ($(du -h "$TMP_ZIP" | cut -f1))"
+
+          # ---- העלאה ל-Google Drive ----
           echo "🚀 Uploading ZIP to Drive: $DEST_PATH"
-          rclone copy "$TMP_ZIP" "$DEST_PATH" --progress
+          rclone copy "$TMP_ZIP" "$DEST_PATH" --progress --drive-chunk-size 64M
 
-          rm -rf "$TMP_DIR"
-          echo "✅ Finished – ZIP uploaded successfully"
+          echo "✅ Finished – ZIP uploaded successfully at $(date)"
+
+          # שמירת נתיב הלוג לשלב הבא
+          echo "log_file=$LOG_FILE" >> $GITHUB_OUTPUT
 
       # --------------------------------------------------------------
-      # 6️⃣  שליחת אימייל עם הלוג **בכל כישלון של ה‑job**
+      # 6️⃣  שליחת אימייל במקרה כישלון (רוץ תמיד, בדוק סטטוס)
       # --------------------------------------------------------------
-      - name: Send failure email with log
+      - name: Send email on failure
         if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          username: p0556722432@gmail.com
-          password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "❌ GitHub Actions FAILED: Upload URL → Drive"
-          to: p0556722432@gmail.com
-          from: p0556722432@gmail.com
-          body: ${{ env.LOG_PATH }}
-          attachments: ${{ env.LOG_PATH }}
+        env:
+          LOG_FILE: ${{ steps.process.outputs.log_file }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -e
+
+          # קריאת הלוג
+          LOG_CONTENT=$(cat "$LOG_FILE" 2>/dev/null || echo "Log file not found")
+
+          # חילוץ שגיאה עיקרית
+          ERROR_SUMMARY=$(echo "$LOG_CONTENT" | grep -E "(❌|Error|FAILED|exit 1|failed)" | head -5 | sed 's/"/\\"/g')
+
+          SUBJECT="❌ GitHub Actions Failed: $WORKFLOW"
+          BODY=$(cat <<EOF
+שלום,
+
+הריצה של ה-workflow **$WORKFLOW** נכשלה.
+
+📋 **פרטי הריצה:**
+- ריפו: $REPO
+- מריץ: $ACTOR
+- קישור לריצה: $RUN_URL
+- זמן: $(date '+%Y-%m-%d %H:%M:%S UTC')
+
+🔗 **URL שעובד:**
+${{ github.event.inputs.url }}
+
+📂 **תיקיית יעד:**
+${{ github.event.inputs.folder }}
+
+⚠️ **תקציר שגיאה:**
+$ERROR_SUMMARY
+
+📄 **לוג מלא (50 שורות אחרונות):**
+$(echo "$LOG_CONTENT" | tail -50)
+
+---
+נשלח אוטומטית מ-GitHub Actions
+EOF
+)
+
+          # שליחה דרך sendmail (mailutils)
+          echo "$BODY" | mail -s "$SUBJECT" -r "p0556722432@gmail.com" -S smtp="smtp.gmail.com:587" -S smtp-auth=login -S smtp-auth-user="p0556722432@gmail.com" -S smtp-auth-password="$EMAIL_PASSWORD" -S tls=on "p0556722432@gmail.com"
+
+          echo "📧 Failure email sent"
+
+      # --------------------------------------------------------------
+      # 7️⃣  אימייל הצלחה אופציונלי (הסר הערה אם רוצה)
+      # --------------------------------------------------------------
+      # - name: Send success email
+      #   if: success()
+      #   env:
+      #     EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      #     RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      #   run: |
+      #     echo "✅ Upload completed successfully. Check: $RUN_URL" | \
+      #     mail -s "✅ GitHub Actions Success: Upload to Drive" \
+      #       -r "p0556722432@gmail.com" \
+      #       -S smtp="smtp.gmail.com:587" -S smtp-auth=login \
+      #       -S smtp-auth-user="p0556722432@gmail.com" \
+      #       -S smtp-auth-password="$EMAIL_PASSWORD" -S tls=on \
+      #       "p0556722432@gmail.com"
