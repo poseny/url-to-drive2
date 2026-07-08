@@ -159,7 +159,7 @@ jobs:
             npm init -y > /dev/null
             npm install puppeteer@22 --omit=dev > /dev/null 2>&1
 
-            # ---- סקריפט Puppeteer משופר לאתרים כבדים (ynet וכו') ----
+            # ---- סקריפט Puppeteer משופר: חוסם רק טראקרים/פרסומות, מאפשר משאבים ----
             cat > save-mhtml.js <<'ENDOFSCRIPT'
           const puppeteer = require('puppeteer');
           const fs = require('fs');
@@ -185,16 +185,11 @@ jobs:
             try {
               const page = await browser.newPage();
               
-              // ---- חסימת משאבים מיותרים (מאיץ דרמטית ומונע networkidle timeout) ----
+              // ---- חסימה סלקטיבית: רק דומייני טראקינג/פרסומות ----
               await page.setRequestInterception(true);
               page.on('request', (req) => {
-                const type = req.resourceType();
                 const reqUrl = req.url();
-                // חוסמים: תמונות, פונטים, מדיה, CSS
-                if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
-                  return req.abort();
-                }
-                // חוסמים דומייני פרסומות/אנליטיקס ידועים
+                // רשימת דומיינים לחסימה (טראקרים, פרסומות, אנליטיקס)
                 const blockedDomains = [
                   'googletagmanager', 'google-analytics', 'googlesyndication',
                   'facebook.net', 'connect.facebook.net',
@@ -203,24 +198,30 @@ jobs:
                   'adsafeprotected', 'iasds01', 'moatads',
                   'scorecardresearch', 'quantserve',
                   'adisruptor', 'adnxs', 'rubiconproject',
-                  'pubmatic', 'openx', 'criteo'
+                  'pubmatic', 'openx', 'criteo',
+                  'hotjar', 'fullstory', 'mouseflow',
+                  'optimizely', 'vwo', 'abtest',
+                  'segment', 'mixpanel', 'amplitude',
+                  'intercom', 'drift', 'zendesk',
+                  'recaptcha', 'hcaptcha'
                 ];
                 if (blockedDomains.some(d => reqUrl.includes(d))) {
-                  return req.abort();
+                  return req.abort('blockedbyclient');
                 }
+                // כל השאר (תמונות, CSS, פונטים, JS של האתר) - נטענים רגיל
                 req.continue();
               });
 
               await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
               await page.setViewport({ width: 1920, height: 1080 });
               
-              // ---- המתנה חכמה: DOM מוכן בלבד (לא מחכה לרשת שקטה) ----
+              // ---- ניווט: מחכה ל-DOM מוכן ----
               await page.goto(url, { 
                 waitUntil: 'domcontentloaded',
                 timeout: 120000 
               });
               
-              // מחכים לאלמנט עוגן שמעיד על תוכן ראשי נטען
+              // מחכים לאלמנט עוגן שמעיד על תוכן ראשי
               const anchorSelectors = [
                 'header', 'main', 'article', 
                 '.main-content', '#main-content', 
@@ -237,15 +238,21 @@ jobs:
                   console.log('✅ Anchor found:', selector);
                   anchorFound = true;
                   break;
-                } catch (e) {
-                  //שיכים לבא
-                }
+                } catch (e) {}
               }
               if (!anchorFound) {
-                console.log('⚠️ No specific anchor found, continuing anyway...');
+                console.log('⚠️ No specific anchor found, continuing...');
               }
               
-              // גלילה קלה להפעלת lazy-load של תוכן ראשי
+              // ---- קריטי: המתנה למשאבים (תמונות, CSS, פונטים) להיטען ----
+              try {
+                await page.waitForNetworkIdle({ idleTime: 3000, timeout: 30000 });
+                console.log('✅ Network mostly idle (resources loaded)');
+              } catch (e) {
+                console.log('⚠️ Network idle timeout, continuing anyway...');
+              }
+              
+              // גלילה קלה להפעלת lazy-load
               await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
               await new Promise(r => setTimeout(r, 2000));
               await page.evaluate(() => window.scrollTo(0, 0));
