@@ -20,7 +20,6 @@ on:
         required: false
         default: ""
 
-# משתני סביבה קבועים לאימייל (ללא runner.temp)
 env:
   EMAIL_TO: "p0556722432@gmail.com"
   EMAIL_FROM: "p0556722432@gmail.com"
@@ -271,7 +270,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: workflow-log-${{ github.run_id }}
-          path: ${{ env.LOG_FILE }}
+          path: ${{ runner.temp }}/workflow_log.txt   # ✅ תוקן: runner.temp זמין כאן
           retention-days: 7
           if-no-files-found: warn
 
