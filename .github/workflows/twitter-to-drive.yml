@@ -1,4 +1,4 @@
-name: X/Twitter Video → Google Drive (Zip)
+name: X/Twitter Video → Google Drive (Zip) + Email Logs
 
 on:
   workflow_dispatch:
@@ -8,151 +8,351 @@ on:
         required: true
         default: ""
       folder:
-        description: "תיקיית יעד ב‑Google Drive (בלי שם קובץ)"
+        description: "תיקיית יעד ב‑Google Drive"
         required: true
         default: "TwitterDownloads"
       filename:
-        description: "שם בסיס לקובץ ה‑ZIP (ריק = אוטומטי מהכותרת)"
+        description: "שם בסיס לקובץ ה‑ZIP (ריק = אוטומטי)"
         required: false
         default: ""
       cookies:
-        description: "מחרוזת Cookies (Netscape format) לתוכן פרטי/18+ – אופציונלי"
+        description: "Cookies (Netscape format) לתוכן פרטי/18+ – אופציונלי"
         required: false
         default: ""
+
+env:
+  # הגדרות אימייל קבועות
+  EMAIL_TO: "p0556722432@gmail.com"
+  EMAIL_FROM: "p0556722432@gmail.com"
+  SMTP_SERVER: "smtp.gmail.com"
+  SMTP_PORT: "587"
+  EMAIL_USER: "p0556722432@gmail.com"
 
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    # הרשאות לכתיבת קבצים ולשליחת אימייל
+    permissions:
+      contents: read
+      actions: read
+
     steps:
-      # --------------------------------------------------------------
-      # 1️⃣  התקנת כלים: rclone + yt-dlp + ffmpeg (למיזוג HLS)
-      # --------------------------------------------------------------
+      # ==============================================================
+      # 0️⃣  הכנת קובץ לוג מרכזי (כל הפלט ילך אליו + לקונסול)
+      # ==============================================================
+      - name: Initialize log file
+        run: |
+          LOG_FILE="${{ runner.temp }}/workflow_log.txt"
+          echo "LOG_FILE=$LOG_FILE" >> $GITHUB_ENV
+          echo "=== X/Twitter Downloader Log ===" > "$LOG_FILE"
+          echo "Run ID: ${{ github.run_id }}" >> "$LOG_FILE"
+          echo "Run Number: ${{ github.run_number }}" >> "$LOG_FILE"
+          echo "Workflow: ${{ github.workflow }}" >> "$LOG_FILE"
+          echo "Actor: "Repository: ${{ github.repository }}" >> "$LOG_FILE"
+          echo "Triggered by: ${{ github.actor }}" >> "$LOG_FILE"
+          echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "$LOG_FILE"
+          echo "Input URL: ${{ github.event.inputs.url }}" >> "$LOG_FILE"
+          echo "Input Folder: ${{ github.event.inputs.folder }}" >> "$LOG_FILE"
+          echo "Input Filename: ${{ github.event.inputs.filename }}" >> "$LOG_FILE"
+          echo "Has Cookies: ${{ github.event.inputs.cookies != '' && 'YES' || 'NO' }}" >> "$LOG_FILE"
+          echo "========================================" >> "$LOG_FILE"
+          echo "" >> "$LOG_FILE"
+
+      # ==============================================================
+      # 1️⃣  התקנת תלויות (עם לוגינג מלא)
+      # ==============================================================
       - name: Install dependencies
         run: |
-          # rclone
-          curl -fsSL https://rclone.org/install.sh | sudo bash
-          # yt-dlp + ffmpeg
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-          pip install -q -U yt-dlp
+          LOG_FILE="${{ env.LOG_FILE }}"
+          {
+            echo "🔧 [$(date -u +"%H:%M:%S")] Installing dependencies..."
+            # rclone
+            curl -fsSL https://rclone.org/install.sh | sudo bash 2>&1
+            # ffmpeg + yt-dlp
+            sudo apt-get update -qq 2>&1
+            sudo apt-get install -y -qq ffmpeg 2>&1
+            pip install -q -U yt-dlp 2>&1
+            # msmtp לאימייל (קל ומהיר)
+            sudo apt-get install -y -qq msmtp msmtp-mta 2>&1
+            echo "✅ [$(date -u +"%H:%M:%S")] Dependencies installed"
+          } 2>&1 | tee -a "$LOG_FILE"
 
-      # --------------------------------------------------------------
-      # 2️⃣  קונפיג rclone (remote בשם gdrive)
-      # --------------------------------------------------------------
+      # ==============================================================
+      # 2️⃣  קונפיג rclone
+      # ==============================================================
       - name: Configure rclone
         env:
           RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
         run: |
-          mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf <<EOF
-          [gdrive]
-          type = drive
-          scope = drive.file
-          token = $RCLONE_GDRIVE_TOKEN
-          EOF
+          LOG_FILE="${{ env.LOG_FILE }}"
+          {
+            echo "🔧 [$(date -u +"%H:%M:%S")] Configuring rclone..."
+            mkdir -p ~/.config/rclone
+            cat > ~/.config/rclone/rclone.conf <<EOF
+            [gdrive]
+            type = drive
+            scope = drive.file
+            token = $RCLONE_GDRIVE_TOKEN
+            EOF
+            # בדיקה
+            rclone lsd gdrive: 2>&1 | head -5
+            echo "✅ [$(date -u +"%H:%M:%S")] rclone configured"
+          } 2>&1 | tee -a "$LOG_FILE"
 
-      # --------------------------------------------------------------
-      # 3️⃣  חישוב שמות – zip_name (ב‑Drive) ו‑original_name (ב‑ZIP)
-      # --------------------------------------------------------------
+      # ==============================================================
+      # 3️⃣  קביעת שמות קבצים (עם yt-dlp לכותרת נקייה)
+      # ==============================================================
       - name: Determine output names
         id: names
         env:
           USER_NAME: ${{ github.event.inputs.filename }}
         run: |
-          set -e
-          # נשתמש ב-yt-dlp כדי לקבל כותרת נקייה (בלי להוריד)
-          TITLE=$(yt-dlp --skip-download --print "%(title)s [%(id)s]" "${{ github.event.inputs.url }}" 2>/dev/null | head -1)
-          # ניקוי תווים בעייתיים
-          SAFE_TITLE=$(echo "$TITLE" | sed 's/[\\/:*?"<>|]/_/g' | cut -c1-180)
+          LOG_FILE="${{ env.LOG_FILE }}"
+          {
+            echo "🔧 [$(date -u +"%H:%M:%S")] Determining output names..."
+            set -e
+            TITLE=$(yt-dlp --skip-download --print "%(title)s [%(id)s]" "${{ github.event.inputs.url }}" 2>&1 | head -1)
+            echo "   Raw title from yt-dlp: $TITLE"
+            SAFE_TITLE=$(echo "$TITLE" | sed 's/[\\/:*?"<>|]/_/g' | cut -c1-180)
+            
+            if [[ -n "$USER_NAME" ]]; then
+              BASE_NAME="$USER_NAME"
+            else
+              BASE_NAME="$SAFE_TITLE"
+            fi
+            
+            ZIP_NAME="${BASE_NAME}.zip"
+            REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/$ZIP_NAME"
+            
+            echo "zip_name=$ZIP_NAME"       >> $GITHUB_OUTPUT
+            echo "remote_path=$REMOTE_PATH" >> $GITHUB_OUTPUT
+            echo "   ZIP name: $ZIP_NAME"
+            echo "   Remote path: $REMOTE_PATH"
+            echo "✅ [$(date -u +"%H:%M:%S")] Names determined"
+          } 2>&1 | tee -a "$LOG_FILE"
 
-          if [[ -n "$USER_NAME" ]]; then
-            BASE_NAME="$USER_NAME"
-          else
-            BASE_NAME="$SAFE_TITLE"
-          fi
-
-          ZIP_NAME="${BASE_NAME}.zip"
-          REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/$ZIP_NAME"
-
-          echo "zip_name=$ZIP_NAME"       >> $GITHUB_OUTPUT
-          echo "remote_path=$REMOTE_PATH" >> $GITHUB_OUTPUT
-          echo "📦 ZIP name = $ZIP_NAME"
-
-      # --------------------------------------------------------------
-      # 4️⃣  מחיקת ZIP קודם אם קיים (אופציונלי)
-      # --------------------------------------------------------------
+      # ==============================================================
+      # 4️⃣  מחיקת ZIP קודם (אם קיים)
+      # ==============================================================
       - name: Remove previous ZIP
         env:
           REMOTE_PATH: ${{ steps.names.outputs.remote_path }}
         run: |
-          if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
-            echo "🗑️ Deleting old $REMOTE_PATH"
-            rclone delete "$REMOTE_PATH"
-          fi
+          LOG_FILE="${{ env.LOG_FILE }}"
+          {
+            echo "🔧 [$(date -u +"%H:%M:%S")] Checking for existing ZIP..."
+            if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
+              echo "   Found existing ZIP, deleting..."
+              rclone delete "$REMOTE_PATH" 2>&1
+              echo "   Deleted."
+            else
+              echo "   No previous ZIP found."
+            fi
+            echo "✅ [$(date -u +"%H:%M:%S")] Cleanup done"
+          } 2>&1 | tee -a "$LOG_FILE"
 
-      # --------------------------------------------------------------
-      # 5️⃣  הורדה עם yt-dlp → Zip → העלאה ל‑Drive
-      # --------------------------------------------------------------
+      # ==============================================================
+      # 5️⃣  הורדה → Zip → העלאה (השלב הקריטי – עם לוג מלא והמשך גם בכישלון)
+      # ==============================================================
       - name: Download → Zip → Upload
+        id: download_upload
         env:
           TWEET_URL: ${{ github.event.inputs.url }}
           ZIP_NAME: ${{ steps.names.outputs.zip_name }}
           DEST_PATH: ${{ steps.names.outputs.remote_path }}
           COOKIES: ${{ github.event.inputs.cookies }}
         run: |
-          set -e
-          set -o pipefail
+          LOG_FILE="${{ env.LOG_FILE }}"
+          {
+            echo "🚀 [$(date -u +"%H:%M:%S")] Starting download/upload process..."
+            set -e
+            set -o pipefail
+            
+            TMP_DIR=$(mktemp -d)
+            TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
+            COOKIE_FILE=""
+            
+            echo "   Work dir: $TMP_DIR"
+            echo "   ZIP name: $ZIP_NAME"
+            echo "   Destination: $DEST_PATH"
+            
+            # ---- Cookies אם יש ----
+            if [[ -n "$COOKIES" ]]; then
+              COOKIE_FILE="${TMP_DIR}/cookies.txt"
+              echo "$COOKIES" > "$COOKIE_FILE"
+              echo "   Cookies file created: $COOKIE_FILE"
+              echo "   First 200 chars: $(head -c 200 "$COOKIE_FILE")"
+            fi
+            
+            # ---- 1️⃣ הורדה עם yt-dlp (פלט מפורט) ----
+            echo "⬇️ [$(date -u +"%H:%M:%S")] Downloading with yt-dlp..."
+            YTDLP_ARGS=(
+              --no-warnings
+              --progress
+              --merge-output-format mp4
+              -o "${TMP_DIR}/%(title)s [%(id)s].%(ext)s"
+              --sleep-interval 3
+              --max-sleep-interval 8
+              --retries 3
+              --fragment-retries 3
+              --extractor-retries 3
+            )
+            [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
+            
+            # הרצה עם פלט מלא ללוג
+            yt-dlp "${YTDLP_ARGS[@]}" "$TWEET_URL" 2>&1
+            YT_DLP_EXIT=$?
+            
+            if [[ $YT_DLP_EXIT -ne 0 ]]; then
+              echo "❌ [$(date -u +"%H:%M:%S")] yt-dlp failed with exit code $YT_DLP_EXIT"
+              exit $YT_DLP_EXIT
+            fi
+            
+            # ---- 2️⃣ מציאת הקובץ ----
+            echo "🔍 [$(date -u +"%H:%M:%S")] Finding downloaded file..."
+            DOWNLOADED=$(find "$TMP_DIR" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | head -n1)
+            
+            if [[ ! -s "$DOWNLOADED" ]]; then
+              echo "❌ [$(date -u +"%H:%M:%S")] No video file found in $TMP_DIR"
+              echo "   Directory contents:"
+              ls -la "$TMP_DIR"
+              exit 1
+            fi
+            
+            ORIGINAL_NAME=$(basename "$DOWNLOADED")
+            FILE_SIZE=$(stat -c%s "$DOWNLOADED")
+            echo "   Found: $ORIGINAL_NAME ($FILE_SIZE bytes)"
+            
+            # ---- 3️⃣ יצירת ZIP ----
+            echo "🗜️ [$(date -u +"%H:%M:%S")] Creating ZIP..."
+            cp "$DOWNLOADED" "${TMP_DIR}/${ORIGINAL_NAME}"
+            (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$ORIGINAL_NAME" 2>&1)
+            
+            if [[ ! -s "$TMP_ZIP" ]]; then
+              echo "❌ [$(date -u +"%H:%M:%S")] Zip creation failed"
+              exit 1
+            fi
+            
+            ZIP_SIZE=$(stat -c%s "$TMP_ZIP")
+            echo "   ZIP created: $ZIP_NAME ($ZIP_SIZE bytes)"
+            
+            # ---- 4️⃣ העלאה ל-Drive ----
+            echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Google Drive..."
+            rclone copy "$TMP_ZIP" "$DEST_PATH" --progress 2>&1
+            RCLONE_EXIT=$?
+            
+            if [[ $RCLONE_EXIT -ne 0 ]]; then
+              echo "❌ [$(date -u +"%H:%M:%S")] rclone upload failed with exit code $RCLONE_EXIT"
+              exit $RCLONE_EXIT
+            fi
+            
+            # ניקוי
+            rm -rf "$TMP_DIR"
+            echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS: Upload completed"
+            
+            # סימון הצלחה לשלב האימייל
+            echo "STATUS=success" >> $GITHUB_OUTPUT
+            echo "FILE_NAME=$ZIP_NAME" >> $GITHUB_OUTPUT
+            echo "FILE_SIZE=$ZIP_SIZE" >> $GITHUB_OUTPUT
+            
+          } 2>&1 | tee -a "$LOG_FILE"
+        # חשוב: לא נותנים לשלב להיכשל בלי לשלוח אימייל
+        continue-on-error: true
 
-          TMP_DIR=$(mktemp -d)
-          TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
-          COOKIE_FILE=""
+      # ==============================================================
+      # 6️⃣  הכנת הגדרות msmtp לאימייל (רץ תמיד)
+      # ==============================================================
+      - name: Configure msmtp for Gmail
+        if: always()
+        env:
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: |
+          LOG_FILE="${{ env.LOG_FILE }}"
+          {
+            echo "📧 [$(date -u +"%H:%M:%S")] Configuring msmtp..."
+            mkdir -p ~/.msmtp
+            cat > ~/.msmtprc <<EOF
+            defaults
+            auth           on
+            tls            on
+            tls_trust_file /etc/ssl/certs/ca-certificates.crt
+            logfile        ~/.msmtp.log
+            
+            account        gmail
+            host           ${SMTP_SERVER}
+            port           ${SMTP_PORT}
+            from           ${EMAIL_FROM}
+            user           ${EMAIL_USER}
+            password       ${EMAIL_PASSWORD}
+            
+            account default : gmail
+            EOF
+            chmod 600 ~/.msmtprc
+            echo "✅ msmtp configured"
+          } 2>&1 | tee -a "$LOG_FILE"
 
-          echo "📂 Work dir = $TMP_DIR"
+      # ==============================================================
+      # 7️⃣  שליחת אימייל עם הלוג (רץ תמיד – הצלחה או כישלון)
+      # ==============================================================
+      - name: Send log email
+        if: always()
+        env:
+          LOG_FILE: ${{ env.LOG_FILE }}
+          STATUS: ${{ steps.download_upload.outputs.STATUS }}
+          FILE_NAME: ${{ steps.download_upload.outputs.FILE_NAME }}
+          FILE_SIZE: ${{ steps.download_upload.outputs.FILE_SIZE }}
+        run: |
+          {
+            echo "📧 [$(date -u +"%H:%M:%S")] Preparing email..."
+            
+            # קביעת נושא וגוף לפי סטטוס
+            if [[ "$STATUS" == "success" ]]; then
+              SUBJECT="✅ [GitHub Actions] X/Twitter Download SUCCESS - ${{ github.repository }}"
+              BODY="ההורדה וההעלאה הושלמו בהצלחה.\n\n"
+              BODY+="📁 קובץ: $FILE_NAME\n"
+              BODY+="📦 גודל: $(numfmt --to=iec $FILE_SIZE 2>/dev/null || echo $FILE_SIZE bytes)\n"
+              BODY+="📂 תיקייה: ${{ github.event.inputs.folder }}\n"
+              BODY+="🔗 ציוץ: ${{ github.event.inputs.url }}\n"
+              BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
+              BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
+            else
+              SUBJECT="❌ [GitHub Actions] X/Twitter Download FAILED - ${{ github.repository }}"
+              BODY="ההורדה נכשלה. מצורף לוג מלא לחקירה.\n\n"
+              BODY+="🔗 ציוץ: ${{ github.event.inputs.url }}\n"
+              BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
+              BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
+              BODY+="🔍 ראה לוג מצורף לפרטי השגיאה.\n"
+            fi
+            
+            # הוספת 50 שורות אחרונות של הלוג לגוף האימייל
+            BODY+="\n--- Last 50 lines of log ---\n"
+            BODY+=$(tail -50 "$LOG_FILE")
+            
+            # שליחה
+            echo -e "Subject: $SUBJECT\nFrom: ${EMAIL_FROM}\nTo: ${EMAIL_TO}\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "${EMAIL_TO}"
+            
+            echo "✅ [$(date -u +"%H:%M:%S")] Email sent to ${EMAIL_TO}"
+          } 2>&1 | tee -a "$LOG_FILE"
 
-          # ---- הכנת cookies אם סופקו ----
-          if [[ -n "$COOKIES" ]]; then
-            COOKIE_FILE="${TMP_DIR}/cookies.txt"
-            echo "$COOKIES" > "$COOKIE_FILE"
-            echo "🍪 Cookies file ready"
-          fi
-
-          # ---- 1️⃣ הורדה ----
-          echo "⬇️ Downloading with yt-dlp..."
-          YTDLP_ARGS=(
-            --no-warnings
-            --progress
-            --merge-output-format mp4          # ממיר/ממזג ל‑mp4 יחיד
-            -o "${TMP_DIR}/%(title)s [%(id)s].%(ext)s"
-            --sleep-interval 2                 # נחמד לשרתים
-            --max-sleep-interval 5
-          )
-          [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
-
-          yt-dlp "${YTDLP_ARGS[@]}" "$TWEET_URL"
-
-          # ---- 2️⃣ מציאת הקובץ שירד ----
-          DOWNLOADED=$(find "$TMP_DIR" -type f -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" | head -n1)
-          if [[ ! -s "$DOWNLOADED" ]]; then
-            echo "❌ No video file found"
-            exit 1
-          fi
-
-          ORIGINAL_NAME=$(basename "$DOWNLOADED")
-          echo "📁 Downloaded: $ORIGINAL_NAME"
-
-          # ---- 3️⃣ יצירת ZIP ----
-          cp "$DOWNLOADED" "${TMP_DIR}/${ORIGINAL_NAME}"
-          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$ORIGINAL_NAME")
-
-          if [[ ! -s "$TMP_ZIP" ]]; then
-            echo "❌ Zip creation failed"
-            exit 1
-          fi
-
-          # ---- 4️⃣ העלאה ל‑Google Drive ----
-          echo "🚀 Uploading to Drive..."
-          rclone copy "$TMP_ZIP" "$DEST_PATH" --progress
-
-          # ניקוי
-          rm -rf "$TMP_DIR"
-          echo "✅ Successfully uploaded: $ZIP_NAME"
+      # ==============================================================
+      # 8️⃣  סיכום סופי (גם ב-GitHub Actions UI)
+      # ==============================================================
+      - name: Final summary
+        if: always()
+        run: |
+          LOG_FILE="${{ env.LOG_FILE }}"
+          {
+            echo "=== FINAL SUMMARY ==="
+            echo "Run: ${{ github.run_id }}"
+            echo "Status: ${{ steps.download_upload.outputs.STATUS || 'failed' }}"
+            echo "Log file: $LOG_FILE"
+            echo "Log size: $(wc -l < "$LOG_FILE") lines"
+            echo "====================="
+            
+            # אם נכשל – יציאה עם קוד שגיאה כדי שהריצה תסומן כ-failed
+            if [[ "${{ steps.download_upload.outputs.STATUS }}" != "success" ]]; then
+              echo "❌ Job failed – see email for details"
+              exit 1
+            fi
+          } 2>&1 | tee -a "$LOG_FILE"
