@@ -1,10 +1,10 @@
-name: X/Twitter Video → Google Drive (Zip) + Email Logs
+name: X/Twitter Video → Google Drive (Robust + Logs + Email + Artifact)
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "קישור לציוץ (x.com/.../status/... או twitter.com/.../status/...)"
+        description: "קישור לציוץ (x.com/.../status/...)"
         required: true
         default: ""
       folder:
@@ -12,16 +12,17 @@ on:
         required: true
         default: "TwitterDownloads"
       filename:
-        description: "שם בסיס לקובץ ה‑ZIP (ריק = אוטומטי)"
+        description: "שם בסיס ל‑ZIP (ריק = אוטומטי)"
         required: false
         default: ""
       cookies:
-        description: "Cookies (Netscape format) לתוכן פרטי/18+ – אופציונלי"
+        description: "Cookies (Netscape format) – אופציונלי"
         required: false
         default: ""
 
+# 🔑 הגדרת נתיב הלוג ברמת ה‑job – זמין מיידית בכל השלבים
 env:
-  # הגדרות אימייל קבועות
+  LOG_FILE: ${{ runner.temp }}/workflow_log.txt
   EMAIL_TO: "p0556722432@gmail.com"
   EMAIL_FROM: "p0556722432@gmail.com"
   SMTP_SERVER: "smtp.gmail.com"
@@ -32,327 +33,262 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # הרשאות לכתיבת קבצים ולשליחת אימייל
     permissions:
       contents: read
       actions: read
+    # 🛑 לא נופלים אף פעם – ממשיכים לשלבי לוג/אימייל/Artifact
+    # (הסיכום בסוף יחזיר קוד שגיאה אם צריך)
 
     steps:
-      # ==============================================================
-      # 0️⃣  הכנת קובץ לוג מרכזי (כל הפלט ילך אליו + לקונסול)
-      # ==============================================================
-      - name: Initialize log file
+      # --------------------------------------------------------------
+      # 0️⃣  אתחול לוג – פשוט, בלי pipe, בלי tee, לא יכול להיכשל
+      # --------------------------------------------------------------
+      - name: Init log
         run: |
-          LOG_FILE="${{ runner.temp }}/workflow_log.txt"
-          echo "LOG_FILE=$LOG_FILE" >> $GITHUB_ENV
           echo "=== X/Twitter Downloader Log ===" > "$LOG_FILE"
           echo "Run ID: ${{ github.run_id }}" >> "$LOG_FILE"
           echo "Run Number: ${{ github.run_number }}" >> "$LOG_FILE"
-          echo "Workflow: ${{ github.workflow }}" >> "$LOG_FILE"
-          echo "Actor: "Repository: ${{ github.repository }}" >> "$LOG_FILE"
-          echo "Triggered by: ${{ github.actor }}" >> "$LOG_FILE"
+          echo "Repo: ${{ github.repository }}" >> "$LOG_FILE"
+          echo "Actor: ${{ github.actor }}" >> "$LOG_FILE"
           echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "$LOG_FILE"
-          echo "Input URL: ${{ github.event.inputs.url }}" >> "$LOG_FILE"
-          echo "Input Folder: ${{ github.event.inputs.folder }}" >> "$LOG_FILE"
-          echo "Input Filename: ${{ github.event.inputs.filename }}" >> "$LOG_FILE"
+          echo "URL: ${{ github.event.inputs.url }}" >> "$LOG_FILE"
+          echo "Folder: ${{ github.event.inputs.folder }}" >> "$LOG_FILE"
+          echo "Filename: ${{ github.event.inputs.filename }}" >> "$LOG_FILE"
           echo "Has Cookies: ${{ github.event.inputs.cookies != '' && 'YES' || 'NO' }}" >> "$LOG_FILE"
           echo "========================================" >> "$LOG_FILE"
           echo "" >> "$LOG_FILE"
 
-      # ==============================================================
-      # 1️⃣  התקנת תלויות (עם לוגינג מלא)
-      # ==============================================================
+      # --------------------------------------------------------------
+      # 1️⃣  התקנת תלויות
+      # --------------------------------------------------------------
       - name: Install dependencies
+        continue-on-error: true
         run: |
-          LOG_FILE="${{ env.LOG_FILE }}"
-          {
-            echo "🔧 [$(date -u +"%H:%M:%S")] Installing dependencies..."
-            # rclone
-            curl -fsSL https://rclone.org/install.sh | sudo bash 2>&1
-            # ffmpeg + yt-dlp
-            sudo apt-get update -qq 2>&1
-            sudo apt-get install -y -qq ffmpeg 2>&1
-            pip install -q -U yt-dlp 2>&1
-            # msmtp לאימייל (קל ומהיר)
-            sudo apt-get install -y -qq msmtp msmtp-mta 2>&1
-            echo "✅ [$(date -u +"%H:%M:%S")] Dependencies installed"
-          } 2>&1 | tee -a "$LOG_FILE"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🔧 [$(date -u +"%H:%M:%S")] Installing dependencies..."
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg msmtp msmtp-mta
+          pip install -q -U yt-dlp
+          echo "✅ Dependencies installed"
 
-      # ==============================================================
+      # --------------------------------------------------------------
       # 2️⃣  קונפיג rclone
-      # ==============================================================
+      # --------------------------------------------------------------
       - name: Configure rclone
+        continue-on-error: true
         env:
           RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
         run: |
-          LOG_FILE="${{ env.LOG_FILE }}"
-          {
-            echo "🔧 [$(date -u +"%H:%M:%S")] Configuring rclone..."
-            mkdir -p ~/.config/rclone
-            cat > ~/.config/rclone/rclone.conf <<EOF
-            [gdrive]
-            type = drive
-            scope = drive.file
-            token = $RCLONE_GDRIVE_TOKEN
-            EOF
-            # בדיקה
-            rclone lsd gdrive: 2>&1 | head -5
-            echo "✅ [$(date -u +"%H:%M:%S")] rclone configured"
-          } 2>&1 | tee -a "$LOG_FILE"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🔧 [$(date -u +"%H:%M:%S")] Configuring rclone..."
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [gdrive]
+          type = drive
+          scope = drive.file
+          token = $RCLONE_GDRIVE_TOKEN
+          EOF
+          rclone lsd gdrive: | head -5
+          echo "✅ rclone configured"
 
-      # ==============================================================
-      # 3️⃣  קביעת שמות קבצים (עם yt-dlp לכותרת נקייה)
-      # ==============================================================
+      # --------------------------------------------------------------
+      # 3️⃣  קביעת שמות (כותרת מה‑yt-dlp)
+      # --------------------------------------------------------------
       - name: Determine output names
+        continue-on-error: true
         id: names
         env:
           USER_NAME: ${{ github.event.inputs.filename }}
         run: |
-          LOG_FILE="${{ env.LOG_FILE }}"
-          {
-            echo "🔧 [$(date -u +"%H:%M:%S")] Determining output names..."
-            set -e
-            TITLE=$(yt-dlp --skip-download --print "%(title)s [%(id)s]" "${{ github.event.inputs.url }}" 2>&1 | head -1)
-            echo "   Raw title from yt-dlp: $TITLE"
-            SAFE_TITLE=$(echo "$TITLE" | sed 's/[\\/:*?"<>|]/_/g' | cut -c1-180)
-            
-            if [[ -n "$USER_NAME" ]]; then
-              BASE_NAME="$USER_NAME"
-            else
-              BASE_NAME="$SAFE_TITLE"
-            fi
-            
-            ZIP_NAME="${BASE_NAME}.zip"
-            REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/$ZIP_NAME"
-            
-            echo "zip_name=$ZIP_NAME"       >> $GITHUB_OUTPUT
-            echo "remote_path=$REMOTE_PATH" >> $GITHUB_OUTPUT
-            echo "   ZIP name: $ZIP_NAME"
-            echo "   Remote path: $REMOTE_PATH"
-            echo "✅ [$(date -u +"%H:%M:%S")] Names determined"
-          } 2>&1 | tee -a "$LOG_FILE"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🔧 [$(date -u +"%H:%M:%S")] Determining names..."
+          TITLE=$(yt-dlp --skip-download --print "%(title)s [%(id)s]" "${{ github.event.inputs.url }}" 2>&1 | head -1)
+          echo "   Raw title: $TITLE"
+          SAFE_TITLE=$(echo "$TITLE" | sed 's/[\\/:*?"<>|]/_/g' | cut -c1-180)
+          BASE_NAME="${USER_NAME:-$SAFE_TITLE}"
+          ZIP_NAME="${BASE_NAME}.zip"
+          REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/$ZIP_NAME"
+          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "remote_path=$REMOTE_PATH" >> $GITHUB_OUTPUT
+          echo "   ZIP: $ZIP_NAME"
+          echo "✅ Names determined"
 
-      # ==============================================================
-      # 4️⃣  מחיקת ZIP קודם (אם קיים)
-      # ==============================================================
+      # --------------------------------------------------------------
+      # 4️⃣  מחיקת ZIP קודם
+      # --------------------------------------------------------------
       - name: Remove previous ZIP
+        continue-on-error: true
         env:
           REMOTE_PATH: ${{ steps.names.outputs.remote_path }}
         run: |
-          LOG_FILE="${{ env.LOG_FILE }}"
-          {
-            echo "🔧 [$(date -u +"%H:%M:%S")] Checking for existing ZIP..."
-            if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
-              echo "   Found existing ZIP, deleting..."
-              rclone delete "$REMOTE_PATH" 2>&1
-              echo "   Deleted."
-            else
-              echo "   No previous ZIP found."
-            fi
-            echo "✅ [$(date -u +"%H:%M:%S")] Cleanup done"
-          } 2>&1 | tee -a "$LOG_FILE"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🔧 [$(date -u +"%H:%M:%S")] Checking old ZIP..."
+          if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
+            rclone delete "$REMOTE_PATH"
+            echo "   Deleted."
+          else
+            echo "   None found."
+          fi
 
-      # ==============================================================
-      # 5️⃣  הורדה → Zip → העלאה (השלב הקריטי – עם לוג מלא והמשך גם בכישלון)
-      # ==============================================================
+      # --------------------------------------------------------------
+      # 5️⃣  הורדה → Zip → העלאה (השלב המרכזי)
+      # --------------------------------------------------------------
       - name: Download → Zip → Upload
-        id: download_upload
+        continue-on-error: true
+        id: dl_upload
         env:
           TWEET_URL: ${{ github.event.inputs.url }}
           ZIP_NAME: ${{ steps.names.outputs.zip_name }}
           DEST_PATH: ${{ steps.names.outputs.remote_path }}
           COOKIES: ${{ github.event.inputs.cookies }}
         run: |
-          LOG_FILE="${{ env.LOG_FILE }}"
-          {
-            echo "🚀 [$(date -u +"%H:%M:%S")] Starting download/upload process..."
-            set -e
-            set -o pipefail
-            
-            TMP_DIR=$(mktemp -d)
-            TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
-            COOKIE_FILE=""
-            
-            echo "   Work dir: $TMP_DIR"
-            echo "   ZIP name: $ZIP_NAME"
-            echo "   Destination: $DEST_PATH"
-            
-            # ---- Cookies אם יש ----
-            if [[ -n "$COOKIES" ]]; then
-              COOKIE_FILE="${TMP_DIR}/cookies.txt"
-              echo "$COOKIES" > "$COOKIE_FILE"
-              echo "   Cookies file created: $COOKIE_FILE"
-              echo "   First 200 chars: $(head -c 200 "$COOKIE_FILE")"
-            fi
-            
-            # ---- 1️⃣ הורדה עם yt-dlp (פלט מפורט) ----
-            echo "⬇️ [$(date -u +"%H:%M:%S")] Downloading with yt-dlp..."
-            YTDLP_ARGS=(
-              --no-warnings
-              --progress
-              --merge-output-format mp4
-              -o "${TMP_DIR}/%(title)s [%(id)s].%(ext)s"
-              --sleep-interval 3
-              --max-sleep-interval 8
-              --retries 3
-              --fragment-retries 3
-              --extractor-retries 3
-            )
-            [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
-            
-            # הרצה עם פלט מלא ללוג
-            yt-dlp "${YTDLP_ARGS[@]}" "$TWEET_URL" 2>&1
-            YT_DLP_EXIT=$?
-            
-            if [[ $YT_DLP_EXIT -ne 0 ]]; then
-              echo "❌ [$(date -u +"%H:%M:%S")] yt-dlp failed with exit code $YT_DLP_EXIT"
-              exit $YT_DLP_EXIT
-            fi
-            
-            # ---- 2️⃣ מציאת הקובץ ----
-            echo "🔍 [$(date -u +"%H:%M:%S")] Finding downloaded file..."
-            DOWNLOADED=$(find "$TMP_DIR" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | head -n1)
-            
-            if [[ ! -s "$DOWNLOADED" ]]; then
-              echo "❌ [$(date -u +"%H:%M:%S")] No video file found in $TMP_DIR"
-              echo "   Directory contents:"
-              ls -la "$TMP_DIR"
-              exit 1
-            fi
-            
-            ORIGINAL_NAME=$(basename "$DOWNLOADED")
-            FILE_SIZE=$(stat -c%s "$DOWNLOADED")
-            echo "   Found: $ORIGINAL_NAME ($FILE_SIZE bytes)"
-            
-            # ---- 3️⃣ יצירת ZIP ----
-            echo "🗜️ [$(date -u +"%H:%M:%S")] Creating ZIP..."
-            cp "$DOWNLOADED" "${TMP_DIR}/${ORIGINAL_NAME}"
-            (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$ORIGINAL_NAME" 2>&1)
-            
-            if [[ ! -s "$TMP_ZIP" ]]; then
-              echo "❌ [$(date -u +"%H:%M:%S")] Zip creation failed"
-              exit 1
-            fi
-            
-            ZIP_SIZE=$(stat -c%s "$TMP_ZIP")
-            echo "   ZIP created: $ZIP_NAME ($ZIP_SIZE bytes)"
-            
-            # ---- 4️⃣ העלאה ל-Drive ----
-            echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Google Drive..."
-            rclone copy "$TMP_ZIP" "$DEST_PATH" --progress 2>&1
-            RCLONE_EXIT=$?
-            
-            if [[ $RCLONE_EXIT -ne 0 ]]; then
-              echo "❌ [$(date -u +"%H:%M:%S")] rclone upload failed with exit code $RCLONE_EXIT"
-              exit $RCLONE_EXIT
-            fi
-            
-            # ניקוי
-            rm -rf "$TMP_DIR"
-            echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS: Upload completed"
-            
-            # סימון הצלחה לשלב האימייל
-            echo "STATUS=success" >> $GITHUB_OUTPUT
-            echo "FILE_NAME=$ZIP_NAME" >> $GITHUB_OUTPUT
-            echo "FILE_SIZE=$ZIP_SIZE" >> $GITHUB_OUTPUT
-            
-          } 2>&1 | tee -a "$LOG_FILE"
-        # חשוב: לא נותנים לשלב להיכשל בלי לשלוח אימייל
-        continue-on-error: true
+          exec >> "$LOG_FILE" 2>&1
+          echo "🚀 [$(date -u +"%H:%M:%S")] Starting download/upload..."
+          set -e
+          set -o pipefail
 
-      # ==============================================================
-      # 6️⃣  הכנת הגדרות msmtp לאימייל (רץ תמיד)
-      # ==============================================================
-      - name: Configure msmtp for Gmail
+          TMP_DIR=$(mktemp -d)
+          TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
+          COOKIE_FILE=""
+
+          echo "   Work dir: $TMP_DIR"
+
+          if [[ -n "$COOKIES" ]]; then
+            COOKIE_FILE="${TMP_DIR}/cookies.txt"
+            echo "$COOKIES" > "$COOKIE_FILE"
+            echo "   Cookies file ready"
+          fi
+
+          # ---- הורדה ----
+          echo "⬇️ [$(date -u +"%H:%M:%S")] Downloading with yt-dlp..."
+          YTDLP_ARGS=(
+            --no-warnings --progress --merge-output-format mp4
+            -o "${TMP_DIR}/%(title)s [%(id)s].%(ext)s"
+            --sleep-interval 3 --max-sleep-interval 8
+            --retries 3 --fragment-retries 3 --extractor-retries 3
+          )
+          [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
+
+          yt-dlp "${YTDLP_ARGS[@]}" "$TWEET_URL"
+          YT_DLP_EXIT=$?
+          [[ $YT_DLP_EXIT -ne 0 ]] && { echo "❌ yt yt-dlp exit: $YT_DLP_EXIT"; exit $YT_DLP_EXIT; }
+
+          # ---- מציאת קובץ ----
+          DOWNLOADED=$(find "$TMP_DIR" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | head -n1)
+          [[ ! -s "$DOWNLOADED" ]] && { echo "❌ No video file found"; ls -la "$TMP_DIR"; exit 1; }
+          ORIGINAL_NAME=$(basename "$DOWNLOADED")
+          echo "   Found: $ORIGINAL_NAME ($(stat -c%s "$DOWNLOADED") bytes)"
+
+          # ---- ZIP ----
+          cp "$DOWNLOADED" "${TMP_DIR}/${ORIGINAL_NAME}"
+          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$ORIGINAL_NAME")
+          [[ ! -s "$TMP_ZIP" ]] && { echo "❌ Zip failed"; exit 1; }
+          ZIP_SIZE=$(stat -c%s "$TMP_ZIP")
+          echo "   ZIP: $ZIP_NAME ($ZIP_SIZE bytes)"
+
+          # ---- העלאה ----
+          echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
+          rclone copy "$TMP_ZIP" "$DEST_PATH" --progress
+          RCLONE_EXIT=$?
+          [[ $RCLONE_EXIT -ne 0 ]] && { echo "❌ rclone exit: $RCLONE_EXIT"; exit $RCLONE_EXIT; }
+
+          rm -rf "$TMP_DIR"
+          echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
+
+          # פלטים לשלב האימייל
+          echo "STATUS=success" >> $GITHUB_OUTPUT
+          echo "FILE_NAME=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "FILE_SIZE=$ZIP_SIZE" >> $GITHUB_OUTPUT
+
+      # --------------------------------------------------------------
+      # 6️⃣  שליחת אימייל + הגדרת msmtp **באותו שלב** (רץ תמיד)
+      # --------------------------------------------------------------
+      - name: Send log email (self-contained)
         if: always()
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          STATUS: ${{ steps.dl_upload.outputs.STATUS }}
+          FILE_NAME: ${{ steps.dl_upload.outputs.FILE_NAME }}
+          FILE_SIZE: ${{ steps.dl_upload.outputs.FILE_SIZE }}
         run: |
-          LOG_FILE="${{ env.LOG_FILE }}"
-          {
-            echo "📧 [$(date -u +"%H:%M:%S")] Configuring msmtp..."
-            mkdir -p ~/.msmtp
-            cat > ~/.msmtprc <<EOF
-            defaults
-            auth           on
-            tls            on
-            tls_trust_file /etc/ssl/certs/ca-certificates.crt
-            logfile        ~/.msmtp.log
-            
-            account        gmail
-            host           ${SMTP_SERVER}
-            port           ${SMTP_PORT}
-            from           ${EMAIL_FROM}
-            user           ${EMAIL_USER}
-            password       ${EMAIL_PASSWORD}
-            
-            account default : gmail
-            EOF
-            chmod 600 ~/.msmtprc
-            echo "✅ msmtp configured"
-          } 2>&1 | tee -a "$LOG_FILE"
+          exec >> "$LOG_FILE" 2>&1
+          echo "📧 [$(date -u +"%H:%M:%S")] Preparing email..."
 
-      # ==============================================================
-      # 7️⃣  שליחת אימייל עם הלוג (רץ תמיד – הצלחה או כישלון)
-      # ==============================================================
-      - name: Send log email
+          # בדיקת סוד
+          if [[ -z "$EMAIL_PASSWORD" ]]; then
+            echo "⚠️ EMAIL_PASSWORD secret is EMPTY – skipping email send"
+            exit 0
+          fi
+
+          # הגדרת msmtp במקום
+          mkdir -p ~/.msmtp
+          cat > ~/.msmtprc <<EOF
+          defaults
+          auth on
+          tls on
+          tls_trust_file /etc/ssl/certs/ca-certificates.crt
+          logfile ~/.msmtp.log
+          account gmail
+          host $SMTP_SERVER
+          port $SMTP_PORT
+          from $EMAIL_FROM
+          user $EMAIL_USER
+          password $EMAIL_PASSWORD
+          account default : gmail
+          EOF
+          chmod 600 ~/.msmtprc
+
+          # בניית הודעה
+          if [[ "$STATUS" == "success" ]]; then
+            SUBJECT="✅ [GitHub Actions] X/Twitter Download SUCCESS - ${{ github.repository }}"
+            BODY="ההורדה וההעלאה הושלמו בהצלחה.\n\n"
+            BODY+="📁 קובץ: $FILE_NAME\n"
+            BODY+="📦 גודל: $(numfmt --to=iec $FILE_SIZE 2>/dev/null || echo $FILE_SIZE bytes)\n"
+            BODY+="📂 תיקייה: ${{ github.event.inputs.folder }}\n"
+            BODY+="🔗 ציוץ: ${{ github.event.inputs.url }}\n"
+            BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
+            BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
+          else
+            SUBJECT="❌ [GitHub Actions] X/Twitter Download FAILED - ${{ github.repository }}"
+            BODY="ההורדה נכשלה. מצורף לוג מלא.\n\n"
+            BODY+="🔗 ציוץ: ${{ github.event.inputs.url }}\n"
+            BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
+            BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
+            BODY+="🔍 ראה לוג מצורף.\n"
+          fi
+
+          BODY+="\n--- Last 60 lines of log ---\n"
+          BODY+=$(tail -60 "$LOG_FILE")
+
+          # שליחה
+          echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
+          echo "✅ Email sent to $EMAIL_TO"
+
+      # --------------------------------------------------------------
+      # 7️⃣  העלאת הלוג כ‑Artifact (גיבוי – זמין להורדה מ‑Actions UI)
+      # --------------------------------------------------------------
+      - name: Upload log as Artifact
         if: always()
-        env:
-          LOG_FILE: ${{ env.LOG_FILE }}
-          STATUS: ${{ steps.download_upload.outputs.STATUS }}
-          FILE_NAME: ${{ steps.download_upload.outputs.FILE_NAME }}
-          FILE_SIZE: ${{ steps.download_upload.outputs.FILE_SIZE }}
-        run: |
-          {
-            echo "📧 [$(date -u +"%H:%M:%S")] Preparing email..."
-            
-            # קביעת נושא וגוף לפי סטטוס
-            if [[ "$STATUS" == "success" ]]; then
-              SUBJECT="✅ [GitHub Actions] X/Twitter Download SUCCESS - ${{ github.repository }}"
-              BODY="ההורדה וההעלאה הושלמו בהצלחה.\n\n"
-              BODY+="📁 קובץ: $FILE_NAME\n"
-              BODY+="📦 גודל: $(numfmt --to=iec $FILE_SIZE 2>/dev/null || echo $FILE_SIZE bytes)\n"
-              BODY+="📂 תיקייה: ${{ github.event.inputs.folder }}\n"
-              BODY+="🔗 ציוץ: ${{ github.event.inputs.url }}\n"
-              BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
-              BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
-            else
-              SUBJECT="❌ [GitHub Actions] X/Twitter Download FAILED - ${{ github.repository }}"
-              BODY="ההורדה נכשלה. מצורף לוג מלא לחקירה.\n\n"
-              BODY+="🔗 ציוץ: ${{ github.event.inputs.url }}\n"
-              BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
-              BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
-              BODY+="🔍 ראה לוג מצורף לפרטי השגיאה.\n"
-            fi
-            
-            # הוספת 50 שורות אחרונות של הלוג לגוף האימייל
-            BODY+="\n--- Last 50 lines of log ---\n"
-            BODY+=$(tail -50 "$LOG_FILE")
-            
-            # שליחה
-            echo -e "Subject: $SUBJECT\nFrom: ${EMAIL_FROM}\nTo: ${EMAIL_TO}\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "${EMAIL_TO}"
-            
-            echo "✅ [$(date -u +"%H:%M:%S")] Email sent to ${EMAIL_TO}"
-          } 2>&1 | tee -a "$LOG_FILE"
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-log-${{ github.run_id }}
+          path: ${{ env.LOG_FILE }}
+          retention-days: 7
+          if-no-files-found: warn
 
-      # ==============================================================
-      # 8️⃣  סיכום סופי (גם ב-GitHub Actions UI)
-      # ==============================================================
+      # --------------------------------------------------------------
+      # 8️⃣  סיכום סופי – קובע צבע הריצה (ירוק/אדום)
+      # --------------------------------------------------------------
       - name: Final summary
         if: always()
         run: |
-          LOG_FILE="${{ env.LOG_FILE }}"
-          {
-            echo "=== FINAL SUMMARY ==="
-            echo "Run: ${{ github.run_id }}"
-            echo "Status: ${{ steps.download_upload.outputs.STATUS || 'failed' }}"
-            echo "Log file: $LOG_FILE"
-            echo "Log size: $(wc -l < "$LOG_FILE") lines"
-            echo "====================="
-            
-            # אם נכשל – יציאה עם קוד שגיאה כדי שהריצה תסומן כ-failed
-            if [[ "${{ steps.download_upload.outputs.STATUS }}" != "success" ]]; then
-              echo "❌ Job failed – see email for details"
-              exit 1
-            fi
-          } 2>&1 | tee -a "$LOG_FILE"
+          exec >> "$LOG_FILE" 2>&1
+          echo "=== FINAL SUMMARY ==="
+          echo "Run: ${{ github.run_id }}"
+          echo "Status: ${{ steps.dl_upload.outputs.STATUS || 'failed' }}"
+          echo "Log lines: $(wc -l < "$LOG_FILE")"
+          echo "====================="
+          if [[ "${{ steps.dl_upload.outputs.STATUS }}" != "success" ]]; then
+            echo "❌ Job failed – check email or download log artifact"
+            exit 1
+          fi
