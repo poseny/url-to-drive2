@@ -130,7 +130,7 @@ jobs:
           fi
 
       # --------------------------------------------------------------
-      # 5️⃣  הורדה → Zip → העלאה (השלב המרכזי)
+      # 5️⃣  הורדה → Zip → העלאה (מתוקן: תומך ריבוי סרטונים, בלי cp מיותר)
       # --------------------------------------------------------------
       - name: Download → Zip → Upload
         continue-on-error: true
@@ -174,20 +174,39 @@ jobs:
           YT_DLP_EXIT=$?
           [[ $YT_DLP_EXIT -ne 0 ]] && { echo "❌ yt-dlp exit: $YT_DLP_EXIT"; exit $YT_DLP_EXIT; }
 
-          # ---- מציאת קובץ ----
-          DOWNLOADED=$(find "$TMP_DIR" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | head -n1)
-          [[ ! -s "$DOWNLOADED" ]] && { echo "❌ No video file found"; ls -la "$TMP_DIR"; exit 1; }
-          ORIGINAL_NAME=$(basename "$DOWNLOADED")
-          echo "   Found: $ORIGINAL_NAME ($(stat -c%s "$DOWNLOADED") bytes)"
+          # ---- מציאת כל קבצי הוידאו שהורדו ----
+          echo "🔍 [$(date -u +"%H:%M:%S")] Finding downloaded video files..."
+          mapfile -t VIDEO_FILES < <(find "$TMP_DIR" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | sort)
+          
+          if [[ ${#VIDEO_FILES[@]} -eq 0 ]]; then
+            echo "❌ No video files found in $TMP_DIR"
+            ls -la "$TMP_DIR"
+            exit 1
+          fi
 
-          # ---- ZIP ----
-          cp "$DOWNLOADED" "${TMP_DIR}/${ORIGINAL_NAME}"
-          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$ORIGINAL_NAME")
-          [[ ! -s "$TMP_ZIP" ]] && { echo "❌ Zip failed"; exit 1; }
+          echo "   Found ${#VIDEO_FILES[@]} video file(s):"
+          TOTAL_SIZE=0
+          for f in "${VIDEO_FILES[@]}"; do
+            SIZE=$(stat -c%s "$f")
+            TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
+            echo "     - $(basename "$f") ($(numfmt --to=iec $SIZE))"
+          done
+
+          # ---- יצירת ZIP עם כל הקבצים ----
+          echo "🗜️ [$(date -u +"%H:%M:%S")] Creating ZIP with ${#VIDEO_FILES[@]} file(s)..."
+          # משתמש ב- -j כדי לשטח נתיבים (רק שמות קבצים בתוך ה-ZIP)
+          # עובר לתיקייה הזמנית כדי שהנתיבים ב-ZIP יהיו נקיים
+          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "${VIDEO_FILES[@]}")
+
+          if [[ ! -s "$TMP_ZIP" ]]; then
+            echo "❌ Zip creation failed"
+            exit 1
+          fi
+
           ZIP_SIZE=$(stat -c%s "$TMP_ZIP")
-          echo "   ZIP: $ZIP_NAME ($ZIP_SIZE bytes)"
+          echo "   ZIP created: $ZIP_NAME ($(numfmt --to=iec $ZIP_SIZE))"
 
-          # ---- העלאה ----
+          # ---- העלאה ל-Drive ----
           echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
           rclone copy "$TMP_ZIP" "$DEST_PATH" --progress
           RCLONE_EXIT=$?
@@ -200,6 +219,7 @@ jobs:
           echo "STATUS=success" >> $GITHUB_OUTPUT
           echo "FILE_NAME=$ZIP_NAME" >> $GITHUB_OUTPUT
           echo "FILE_SIZE=$ZIP_SIZE" >> $GITHUB_OUTPUT
+          echo "FILE_COUNT=${#VIDEO_FILES[@]}" >> $GITHUB_OUTPUT
 
       # --------------------------------------------------------------
       # 6️⃣  שליחת אימייל (רץ תמיד, עצמאי לחלוטין)
