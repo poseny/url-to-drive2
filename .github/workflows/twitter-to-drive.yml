@@ -20,9 +20,8 @@ on:
         required: false
         default: ""
 
-# 🔑 הגדרת נתיב הלוג ברמת ה‑job – זמין מיידית בכל השלבים
+# משתני סביבה קבועים לאימייל (ללא runner.temp)
 env:
-  LOG_FILE: ${{ runner.temp }}/workflow_log.txt
   EMAIL_TO: "p0556722432@gmail.com"
   EMAIL_FROM: "p0556722432@gmail.com"
   SMTP_SERVER: "smtp.gmail.com"
@@ -36,15 +35,15 @@ jobs:
     permissions:
       contents: read
       actions: read
-    # 🛑 לא נופלים אף פעם – ממשיכים לשלבי לוג/אימייל/Artifact
-    # (הסיכום בסוף יחזיר קוד שגיאה אם צריך)
 
     steps:
       # --------------------------------------------------------------
-      # 0️⃣  אתחול לוג – פשוט, בלי pipe, בלי tee, לא יכול להיכשל
+      # 0️⃣  אתחול לוג – מגדיר LOG_FILE ב-GITHUB_ENV עם $RUNNER_TEMP
       # --------------------------------------------------------------
       - name: Init log
         run: |
+          echo "LOG_FILE=$RUNNER_TEMP/workflow_log.txt" >> $GITHUB_ENV
+          
           echo "=== X/Twitter Downloader Log ===" > "$LOG_FILE"
           echo "Run ID: ${{ github.run_id }}" >> "$LOG_FILE"
           echo "Run Number: ${{ github.run_number }}" >> "$LOG_FILE"
@@ -171,7 +170,7 @@ jobs:
 
           yt-dlp "${YTDLP_ARGS[@]}" "$TWEET_URL"
           YT_DLP_EXIT=$?
-          [[ $YT_DLP_EXIT -ne 0 ]] && { echo "❌ yt yt-dlp exit: $YT_DLP_EXIT"; exit $YT_DLP_EXIT; }
+          [[ $YT_DLP_EXIT -ne 0 ]] && { echo "❌ yt-dlp exit: $YT_DLP_EXIT"; exit $YT_DLP_EXIT; }
 
           # ---- מציאת קובץ ----
           DOWNLOADED=$(find "$TMP_DIR" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | head -n1)
