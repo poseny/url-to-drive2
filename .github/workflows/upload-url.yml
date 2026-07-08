@@ -149,27 +149,63 @@ jobs:
 
           if [[ "$IS_HTML" == "true" ]]; then
             MHTML_FILE="${TMP_DIR}/${ORIGINAL_NAME}"
-            echo "🌐 Capturing web page as MHTML using Chromium headless (old mode)..."
+            echo "🌐 Capturing web page as MHTML using Puppeteer (Node.js)..."
             echo "⏳ This may take 30-60 seconds for heavy pages..."
 
-            USER_DATA_DIR="${TMP_DIR}/chrome-profile"
-            mkdir -p "$USER_DATA_DIR"
+            # ---- התקנת Node.js + Puppeteer ----
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+            sudo apt-get install -y -qq nodejs > /dev/null
+            cd "$TMP_DIR"
+            npm init -y > /dev/null
+            npm install puppeteer@22 --omit=dev > /dev/null 2>&1
 
-            # ---- הפקודה המתוקנת ----
-            xvfb-run -a --server-args="-screen 0 1920x1080x24" \
-              chromium-browser \
-                --headless=old \
-                --disable-gpu \
-                --no-sandbox \
-                --disable-dev-shm-usage \
-                --disable-dbus \
-                --disable-web-security \
-                --user-data-dir="$USER_DATA_DIR" \
-                --virtual-time-budget=60000 \
-                --timeout=120000 \
-                --run-all-compositor-stages-before-draw \
-                --save-page-as-mhtml="$MHTML_FILE" \
-                "$FILE_URL" 2>&1 | tail -30
+            # ---- סקריפט Puppeteer לשמירת MHTML ----
+            cat > save-mhtml.js <<'ENDOFSCRIPT'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
+
+          const url = process.argv[2];
+          const outputPath = process.argv[3];
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              headless: 'shell',
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor',
+                '--single-process',
+                '--no-zygote'
+              ]
+            });
+
+            try {
+              const page = await browser.newPage();
+              await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+              await page.setViewport({ width: 1920, height: 1080 });
+              await page.goto(url, { waitUntil: 'networkidle0', timeout: 120000 });
+              await new Promise(r => setTimeout(r, 3000));
+
+              const client = await page.target().createCDPSession();
+              const result = await client.send('Page.captureSnapshot', { format: 'mhtml' });
+              
+              fs.writeFileSync(outputPath, result.data);
+              console.log('✅ MHTML saved:', outputPath, '(' + (result.data.length / 1024).toFixed(1) + ' KB)');
+              
+            } catch (err) {
+              console.error('❌ Error:', err.message);
+              process.exit(1);
+            } finally {
+              await browser.close();
+            }
+          })();
+          ENDOFSCRIPT
+
+            # ---- הרצה ----
+            node save-mhtml.js "$FILE_URL" "$MHTML_FILE" 2>&1 | tail -20
 
             if [[ ! -s "$MHTML_FILE" ]]; then
               echo "❌ MHTML capture failed – file is empty or not created"
@@ -202,7 +238,7 @@ jobs:
             exit 1
           fi
 
-          echo "✅ ZIP created ($(du -h "$TMP_ZIP" | cut -h" | cut -f1))"
+          echo "✅ ZIP created ($(du -h "$TMP_ZIP" | cut -f1))"
 
           echo "🚀 Uploading ZIP to Drive: $DEST_PATH"
           rclone copy "$TMP_ZIP" "$DEST_PATH" --progress --drive-chunk-size 64M
