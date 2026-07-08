@@ -1,0 +1,158 @@
+name: X/Twitter Video → Google Drive (Zip)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "קישור לציוץ (x.com/.../status/... או twitter.com/.../status/...)"
+        required: true
+        default: ""
+      folder:
+        description: "תיקיית יעד ב‑Google Drive (בלי שם קובץ)"
+        required: true
+        default: "TwitterDownloads"
+      filename:
+        description: "שם בסיס לקובץ ה‑ZIP (ריק = אוטומטי מהכותרת)"
+        required: false
+        default: ""
+      cookies:
+        description: "מחרוזת Cookies (Netscape format) לתוכן פרטי/18+ – אופציונלי"
+        required: false
+        default: ""
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # --------------------------------------------------------------
+      # 1️⃣  התקנת כלים: rclone + yt-dlp + ffmpeg (למיזוג HLS)
+      # --------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          # rclone
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          # yt-dlp + ffmpeg
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -q -U yt-dlp
+
+      # --------------------------------------------------------------
+      # 2️⃣  קונפיג rclone (remote בשם gdrive)
+      # --------------------------------------------------------------
+      - name: Configure rclone
+        env:
+          RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [gdrive]
+          type = drive
+          scope = drive.file
+          token = $RCLONE_GDRIVE_TOKEN
+          EOF
+
+      # --------------------------------------------------------------
+      # 3️⃣  חישוב שמות – zip_name (ב‑Drive) ו‑original_name (ב‑ZIP)
+      # --------------------------------------------------------------
+      - name: Determine output names
+        id: names
+        env:
+          USER_NAME: ${{ github.event.inputs.filename }}
+        run: |
+          set -e
+          # נשתמש ב-yt-dlp כדי לקבל כותרת נקייה (בלי להוריד)
+          TITLE=$(yt-dlp --skip-download --print "%(title)s [%(id)s]" "${{ github.event.inputs.url }}" 2>/dev/null | head -1)
+          # ניקוי תווים בעייתיים
+          SAFE_TITLE=$(echo "$TITLE" | sed 's/[\\/:*?"<>|]/_/g' | cut -c1-180)
+
+          if [[ -n "$USER_NAME" ]]; then
+            BASE_NAME="$USER_NAME"
+          else
+            BASE_NAME="$SAFE_TITLE"
+          fi
+
+          ZIP_NAME="${BASE_NAME}.zip"
+          REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/$ZIP_NAME"
+
+          echo "zip_name=$ZIP_NAME"       >> $GITHUB_OUTPUT
+          echo "remote_path=$REMOTE_PATH" >> $GITHUB_OUTPUT
+          echo "📦 ZIP name = $ZIP_NAME"
+
+      # --------------------------------------------------------------
+      # 4️⃣  מחיקת ZIP קודם אם קיים (אופציונלי)
+      # --------------------------------------------------------------
+      - name: Remove previous ZIP
+        env:
+          REMOTE_PATH: ${{ steps.names.outputs.remote_path }}
+        run: |
+          if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
+            echo "🗑️ Deleting old $REMOTE_PATH"
+            rclone delete "$REMOTE_PATH"
+          fi
+
+      # --------------------------------------------------------------
+      # 5️⃣  הורדה עם yt-dlp → Zip → העלאה ל‑Drive
+      # --------------------------------------------------------------
+      - name: Download → Zip → Upload
+        env:
+          TWEET_URL: ${{ github.event.inputs.url }}
+          ZIP_NAME: ${{ steps.names.outputs.zip_name }}
+          DEST_PATH: ${{ steps.names.outputs.remote_path }}
+          COOKIES: ${{ github.event.inputs.cookies }}
+        run: |
+          set -e
+          set -o pipefail
+
+          TMP_DIR=$(mktemp -d)
+          TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
+          COOKIE_FILE=""
+
+          echo "📂 Work dir = $TMP_DIR"
+
+          # ---- הכנת cookies אם סופקו ----
+          if [[ -n "$COOKIES" ]]; then
+            COOKIE_FILE="${TMP_DIR}/cookies.txt"
+            echo "$COOKIES" > "$COOKIE_FILE"
+            echo "🍪 Cookies file ready"
+          fi
+
+          # ---- 1️⃣ הורדה ----
+          echo "⬇️ Downloading with yt-dlp..."
+          YTDLP_ARGS=(
+            --no-warnings
+            --progress
+            --merge-output-format mp4          # ממיר/ממזג ל‑mp4 יחיד
+            -o "${TMP_DIR}/%(title)s [%(id)s].%(ext)s"
+            --sleep-interval 2                 # נחמד לשרתים
+            --max-sleep-interval 5
+          )
+          [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
+
+          yt-dlp "${YTDLP_ARGS[@]}" "$TWEET_URL"
+
+          # ---- 2️⃣ מציאת הקובץ שירד ----
+          DOWNLOADED=$(find "$TMP_DIR" -type f -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" | head -n1)
+          if [[ ! -s "$DOWNLOADED" ]]; then
+            echo "❌ No video file found"
+            exit 1
+          fi
+
+          ORIGINAL_NAME=$(basename "$DOWNLOADED")
+          echo "📁 Downloaded: $ORIGINAL_NAME"
+
+          # ---- 3️⃣ יצירת ZIP ----
+          cp "$DOWNLOADED" "${TMP_DIR}/${ORIGINAL_NAME}"
+          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$ORIGINAL_NAME")
+
+          if [[ ! -s "$TMP_ZIP" ]]; then
+            echo "❌ Zip creation failed"
+            exit 1
+          fi
+
+          # ---- 4️⃣ העלאה ל‑Google Drive ----
+          echo "🚀 Uploading to Drive..."
+          rclone copy "$TMP_ZIP" "$DEST_PATH" --progress
+
+          # ניקוי
+          rm -rf "$TMP_DIR"
+          echo "✅ Successfully uploaded: $ZIP_NAME"
