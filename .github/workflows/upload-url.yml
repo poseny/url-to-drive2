@@ -135,12 +135,14 @@ jobs:
           set -e
           set -o pipefail
 
-          LOG_FILE="${RUNNER_TEMP}/process.log"
+          # נתיב לוג קבוע - שימוש במשתנה הסביבה של הראנר
+          LOG_FILE="$RUNNER_TEMP/process.log"
           exec > >(tee -a "$LOG_FILE") 2>&1
 
           echo "🚀 Starting process at $(date)"
           echo "URL: $FILE_URL"
           echo "Is HTML: $IS_HTML"
+          echo "Log file: $LOG_FILE"
 
           TMP_DIR=$(mktemp -d)
           TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
@@ -216,15 +218,12 @@ jobs:
 
           echo "✅ Finished – ZIP uploaded successfully at $(date)"
 
-          echo "log_file=$LOG_FILE" >> $GITHUB_OUTPUT
-
       # --------------------------------------------------------------
-      # 6️⃣  שליחת אימייל במקרה כישלון (עם msmtp - בלי heredoc בעייתי)
+      # 6️⃣  שליחת אימייל במקרה כישלון (משתמש באותו $RUNNER_TEMP)
       # --------------------------------------------------------------
       - name: Send email on failure
         if: failure()
         env:
-          LOG_FILE: ${{ steps.process.outputs.log_file }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           WORKFLOW: ${{ github.workflow }}
           REPO: ${{ github.repository }}
@@ -235,6 +234,8 @@ jobs:
         run: |
           set -e
 
+          # אותו נתיב בדיוק כמו בשלב הקודם
+          LOG_FILE="$RUNNER_TEMP/process.log"
           LOG_CONTENT=$(cat "$LOG_FILE" 2>/dev/null || echo "Log file not found: $LOG_FILE")
 
           echo "📧 Preparing failure email..."
@@ -243,7 +244,7 @@ jobs:
 
           ERROR_SUMMARY=$(echo "$LOG_CONTENT" | grep -E "(❌|Error|FAILED|exit 1|failed)" -i | head -5 | sed 's/"/\\"/g' || echo "No specific error pattern found")
 
-          # כתיבת קונפיג msmtp בלי heredoc - באמצעות printf
+          # כתיבת קונפיג msmtp עם printf
           printf "defaults\nauth           on\ntls            on\ntls_trust_file /etc/ssl/certs/ca-certificates.crt\nlogfile        ~/.msmtp.log\n\naccount        gmail\nhost           smtp.gmail.com\nport           587\nfrom           p0556722432@gmail.com\nuser           p0556722432@gmail.com\npassword       %s\n\naccount default : gmail\n" "$EMAIL_PASSWORD" > ~/.msmtprc
           chmod 600 ~/.msmtprc
 
