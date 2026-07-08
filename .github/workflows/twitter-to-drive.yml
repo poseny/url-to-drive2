@@ -37,32 +37,27 @@ jobs:
 
     steps:
       # --------------------------------------------------------------
-      # 0️⃣  אתחול לוג – מגדיר LOG_FILE ב-GITHUB_ENV עם $RUNNER_TEMP
+      # 1️⃣  התקנת תלויות + יצירת לוג (השלב הראשון שרץ בוודאות)
       # --------------------------------------------------------------
-      - name: Init log
-        run: |
-          echo "LOG_FILE=$RUNNER_TEMP/workflow_log.txt" >> $GITHUB_ENV
-          
-          echo "=== X/Twitter Downloader Log ===" > "$LOG_FILE"
-          echo "Run ID: ${{ github.run_id }}" >> "$LOG_FILE"
-          echo "Run Number: ${{ github.run_number }}" >> "$LOG_FILE"
-          echo "Repo: ${{ github.repository }}" >> "$LOG_FILE"
-          echo "Actor: ${{ github.actor }}" >> "$LOG_FILE"
-          echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "$LOG_FILE"
-          echo "URL: ${{ github.event.inputs.url }}" >> "$LOG_FILE"
-          echo "Folder: ${{ github.event.inputs.folder }}" >> "$LOG_FILE"
-          echo "Filename: ${{ github.event.inputs.filename }}" >> "$LOG_FILE"
-          echo "Has Cookies: ${{ github.event.inputs.cookies != '' && 'YES' || 'NO' }}" >> "$LOG_FILE"
-          echo "========================================" >> "$LOG_FILE"
-          echo "" >> "$LOG_FILE"
-
-      # --------------------------------------------------------------
-      # 1️⃣  התקנת תלויות
-      # --------------------------------------------------------------
-      - name: Install dependencies
+      - name: Install dependencies & Init log
         continue-on-error: true
+        shell: bash
         run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
+          echo "=== X/Twitter Downloader Log ==="
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run Number: ${{ github.run_number }}"
+          echo "Repo: ${{ github.repository }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo "URL: ${{ github.event.inputs.url }}"
+          echo "Folder: ${{ github.event.inputs.folder }}"
+          echo "Filename: ${{ github.event.inputs.filename }}"
+          echo "Has Cookies: ${{ github.event.inputs.cookies != '' && 'YES' || 'NO' }}"
+          echo "========================================"
+          echo ""
+          
           echo "🔧 [$(date -u +"%H:%M:%S")] Installing dependencies..."
           curl -fsSL https://rclone.org/install.sh | sudo bash
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg msmtp msmtp-mta
@@ -74,9 +69,11 @@ jobs:
       # --------------------------------------------------------------
       - name: Configure rclone
         continue-on-error: true
+        shell: bash
         env:
           RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
         run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
           echo "🔧 [$(date -u +"%H:%M:%S")] Configuring rclone..."
           mkdir -p ~/.config/rclone
@@ -95,9 +92,11 @@ jobs:
       - name: Determine output names
         continue-on-error: true
         id: names
+        shell: bash
         env:
           USER_NAME: ${{ github.event.inputs.filename }}
         run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
           echo "🔧 [$(date -u +"%H:%M:%S")] Determining names..."
           TITLE=$(yt-dlp --skip-download --print "%(title)s [%(id)s]" "${{ github.event.inputs.url }}" 2>&1 | head -1)
@@ -116,9 +115,11 @@ jobs:
       # --------------------------------------------------------------
       - name: Remove previous ZIP
         continue-on-error: true
+        shell: bash
         env:
           REMOTE_PATH: ${{ steps.names.outputs.remote_path }}
         run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
           echo "🔧 [$(date -u +"%H:%M:%S")] Checking old ZIP..."
           if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
@@ -134,12 +135,14 @@ jobs:
       - name: Download → Zip → Upload
         continue-on-error: true
         id: dl_upload
+        shell: bash
         env:
           TWEET_URL: ${{ github.event.inputs.url }}
           ZIP_NAME: ${{ steps.names.outputs.zip_name }}
           DEST_PATH: ${{ steps.names.outputs.remote_path }}
           COOKIES: ${{ github.event.inputs.cookies }}
         run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
           echo "🚀 [$(date -u +"%H:%M:%S")] Starting download/upload..."
           set -e
@@ -199,26 +202,27 @@ jobs:
           echo "FILE_SIZE=$ZIP_SIZE" >> $GITHUB_OUTPUT
 
       # --------------------------------------------------------------
-      # 6️⃣  שליחת אימייל + הגדרת msmtp **באותו שלב** (רץ תמיד)
+      # 6️⃣  שליחת אימייל (רץ תמיד, עצמאי לחלוטין)
       # --------------------------------------------------------------
       - name: Send log email (self-contained)
         if: always()
+        shell: bash
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           STATUS: ${{ steps.dl_upload.outputs.STATUS }}
           FILE_NAME: ${{ steps.dl_upload.outputs.FILE_NAME }}
           FILE_SIZE: ${{ steps.dl_upload.outputs.FILE_SIZE }}
         run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
           echo "📧 [$(date -u +"%H:%M:%S")] Preparing email..."
 
-          # בדיקת סוד
           if [[ -z "$EMAIL_PASSWORD" ]]; then
             echo "⚠️ EMAIL_PASSWORD secret is EMPTY – skipping email send"
             exit 0
           fi
 
-          # הגדרת msmtp במקום
+          # הגדרת msmtp
           mkdir -p ~/.msmtp
           cat > ~/.msmtprc <<EOF
           defaults
@@ -258,28 +262,29 @@ jobs:
           BODY+="\n--- Last 60 lines of log ---\n"
           BODY+=$(tail -60 "$LOG_FILE")
 
-          # שליחה
           echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
           echo "✅ Email sent to $EMAIL_TO"
 
       # --------------------------------------------------------------
-      # 7️⃣  העלאת הלוג כ‑Artifact (גיבוי – זמין להורדה מ‑Actions UI)
+      # 7️⃣  העלאת הלוג כ‑Artifact (גיבוי – תמיד עובד)
       # --------------------------------------------------------------
       - name: Upload log as Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: workflow-log-${{ github.run_id }}
-          path: ${{ runner.temp }}/workflow_log.txt   # ✅ תוקן: runner.temp זמין כאן
+          path: ${{ runner.temp }}/workflow_log.txt
           retention-days: 7
           if-no-files-found: warn
 
       # --------------------------------------------------------------
-      # 8️⃣  סיכום סופי – קובע צבע הריצה (ירוק/אדום)
+      # 8️⃣  סיכום סופי – קובע צבע הריצה
       # --------------------------------------------------------------
       - name: Final summary
         if: always()
+        shell: bash
         run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
           echo "=== FINAL SUMMARY ==="
           echo "Run: ${{ github.run_id }}"
