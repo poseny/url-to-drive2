@@ -7,7 +7,7 @@ on:
       url:
         description: "כתובת URL של הקובץ/דף להורדה"
         required: true
-        default: "https://upload.wikimedia.org/wikipedia/commons/d/d6/Her_First_Kiss_%281919%29.webm"
+        default: "https://huggingface.co/models?search=Ornith-1.0-9B-GGUF"
       folder:
         description: "תיקיית יעד ב‑Drive (ללא שם קובץ)"
         required: true
