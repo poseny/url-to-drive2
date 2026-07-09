@@ -1,4 +1,4 @@
-name: X/Twitter Profile → Video Links List → Google Drive (Nitter - No Auth)
+name: X/Twitter Profile → Video Links List → Google Drive (Nitter - Robust)
 
 on:
   workflow_dispatch:
@@ -45,7 +45,7 @@ jobs:
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           echo "LOG_FILE=$LOG_FILE" >> $GITHUB_ENV
           {
-            echo "=== X/Twitter Profile Video Lister (Nitter) ==="
+            echo "=== X/Twitter Profile Video Lister (Nitter Robust) ==="
             echo "Run ID: ${{ github.run_id }}"
             echo "Run Number: ${{ github.run_number }}"
             echo "Repo: ${{ github.repository }}"
@@ -54,12 +54,12 @@ jobs:
             echo "Profile: ${{ github.event.inputs.profile_url }}"
             echo "Days back: ${{ github.event.inputs.days }}"
             echo "Folder: ${{ github.event.inputs.folder }}"
-            echo "=============================================="
+            echo "====================================================="
             echo ""
           } > "$LOG_FILE"
 
       # ==============================================================
-      # 1️⃣  התקנת תלויות (yt-dlp binary + rclone + msmtp)
+      # 1️⃣  התקנת תלויות
       # ==============================================================
       - name: Install dependencies
         continue-on-error: true
@@ -67,20 +67,12 @@ jobs:
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "🔧 [$(date -u +"%H:%M:%S")] Installing yt-dlp (binary), rclone, msmtp..."
-          
-          # rclone
+          echo "🔧 [$(date -u +"%H:%M:%S")] Installing yt-dlp, rclone, msmtp, xmlstarlet..."
           curl -fsSL https://rclone.org/install.sh | sudo bash
-          
-          # msmtp
-          sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta
-          
-          # yt-dlp: בינארי רשמי אחרון
-          echo "   Downloading yt-dlp binary..."
+          sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta xmlstarlet
           sudo curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -o /usr/local/bin/yt-dlp
           sudo chmod +x /usr/local/bin/yt-dlp
           yt-dlp --version
-          
           echo "✅ Dependencies installed"
 
       # ==============================================================
@@ -106,9 +98,9 @@ jobs:
           echo "✅ rclone configured"
 
       # ==============================================================
-      # 3️⃣  שליפת רשימת ציוצי וידאו דרך Nitter (ללא Cookies!)
+      # 3️⃣  שליפת ציוצי וידאו דרך Nitter (ללא pipes שבורים)
       # ==============================================================
-      - name: Fetch video tweets via Nitter
+      - name: Fetch video tweets via Nitter (file-based parsing)
         continue-on-error: true
         id: fetch_videos
         shell: bash
@@ -140,7 +132,7 @@ jobs:
           echo "   Cutoff: $(date -u -d @${CUTOFF_TS}) (TS: $CUTOFF_TS)"
           echo "   Output: ${OUT_BASE}.txt"
 
-          # ---- רשימת מופעי Nitter ציבוריים פעילים (נכון ל-2026) ----
+          # ---- רשימת מופעי Nitter ----
           NITTER_INSTANCES=(
             "https://nitter.net"
             "https://nitter.1d4.us"
@@ -154,7 +146,6 @@ jobs:
           SUCCESS_INSTANCE=""
 
           for INSTANCE in "${NITTER_INSTANCES[@]}"; do
-            # Nitter מספק RSS לפרופיל: /username/rss
             URL="${INSTANCE}/${USERNAME}/rss"
             echo "   🔄 Trying: $URL"
             
@@ -163,7 +154,6 @@ jobs:
               -H "Accept: application/xml, application/rss+xml, text/xml" \
               "$URL" --max-time 20 --connect-timeout 10)
             
-            # בדיקה: האם קיבלנו RSS תקין
             if echo "$RESPONSE" | grep -qE "^<\?xml|^<rss"; then
               RSS_XML="$RESPONSE"
               SUCCESS_INSTANCE="$INSTANCE"
@@ -183,25 +173,37 @@ jobs:
 
           echo "   Using instance: $SUCCESS_INSTANCE"
 
-          # ---- פירסור RSS + סינון וידאו + תאריך ----
-          # נשתמש ב-xmlstarlet (מותקן) לפירסור XML אמין
-          echo "$RSS_XML" | xmlstarlet sel -T -t \
+          # ---- שמירת XML לקובץ (למניעת broken pipes) ----
+          RSS_FILE="${TMP_DIR}/feed.xml"
+          echo "$RSS_XML" > "$RSS_FILE"
+
+          # ---- פרסור XML לקובץ ביניים (שורה אחת לפריט: pubDate|link|description) ----
+          PARSED_FILE="${TMP_DIR}/parsed.txt"
+          # xmlstarlet: לכל item מדפיס pubDate|link|description (עם נרמול רווחים)
+          xmlstarlet sel -T -t \
             -m "//item" \
             -v "pubDate" -o "|" \
             -v "link" -o "|" \
             -v "description" -n \
-          2>/dev/null | while IFS='|' read -r PUBDATE LINK DESC; do
-            # המרת תאריך ל-timestamp
+            "$RSS_FILE" 2>/dev/null | sed 's/|/|/g' > "$PARSED_FILE"
+
+          # ---- עיבוד הקובץ המפורסר (בלי pipes, בלי subshells) ----
+          > "$OUT_TXT"  # ריק
+          while IFS='|' read -r PUBDATE LINK DESC; do
+            # דילוג על שורות ריקות
+            [[ -z "$PUBDATE" ]] && continue
+            
+            # המרת תאריך
             ITEM_TS=$(date -u -d "$PUBDATE" +%s 2>/dev/null || echo 0)
-            if [[ $ITEM_TS -ge $CUTOFF_TS ]]; then
-              # בדיקה אם התיאור מכיל וידאו
-              if echo "$DESC" | grep -qiE "video|mp4|m3u8|type=.video"; then
-                # המרת קישור Nitter -> x.com
-                X_LINK=$(echo "$LINK" | sed -E 's|https?://[^/]+/([^/]+)/status/([0-9]+).*|https://x.com/\1/status/\2|')
-                echo "$X_LINK"
-              fi
+            [[ $ITEM_TS -lt $CUTOFF_TS ]] && continue
+            
+            # בדיקת וידאו בתיאור
+            if echo "$DESC" | grep -qiE "video|mp4|m3u8|type=.video"; then
+              # המרת קישור Nitter -> x.com
+              X_LINK=$(echo "$LINK" | sed -E 's|https?://[^/]+/([^/]+)/status/([0-9]+).*|https://x.com/\1/status/\2|')
+              echo "$X_LINK" >> "$OUT_TXT"
             fi
-          done > "$OUT_TXT"
+          done < "$PARSED_FILE"
 
           # הסרת כפילויות
           if [[ -s "$OUT_TXT" ]]; then
