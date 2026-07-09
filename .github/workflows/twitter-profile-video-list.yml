@@ -41,7 +41,8 @@ jobs:
 
     steps:
       # --------------------------------------------------------------
-      # 1️⃣  התקנת תלויות + לוג
+      # --------------------------------------------------------------
+      # 1️⃣  התקנת תלויות + לוג (עם yt-dlp בינארי רשמי – חסין תקלות)
       # --------------------------------------------------------------
       - name: Install dependencies & Init log
         continue-on-error: true
@@ -57,10 +58,19 @@ jobs:
           echo "========================================"
           echo ""
           
-          echo "🔧 [$(date -u +"%H:%M:%S")] Installing gallery-dl, rclone, msmtp..."
+          echo "🔧 [$(date -u +"%H:%M:%S")] Installing dependencies..."
+          # rclone
           curl -fsSL https://rclone.org/install.sh | sudo bash
-          sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta
-          pip install -q -U gallery-dl
+          # ffmpeg, msmtp
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg msmtp msmtp-mta
+          
+          # yt-dlp: הורדת בינארי רשמי (עובד תמיד, בלי pip/venv)
+          echo "   Downloading yt-dlp binary..."
+          sudo curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -o /usr/local/bin/yt-dlp
+          sudo chmod +x /usr/local/bin/yt-dlp
+          # בדיקה
+          yt-dlp --version
+          
           echo "✅ Dependencies installed"
 
       # --------------------------------------------------------------
