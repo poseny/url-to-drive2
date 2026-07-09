@@ -1,4 +1,4 @@
-name: X/Twitter Profile → Video Links List → Google Drive (yt-dlp Only - Robust)
+name: X/Twitter Profile → Video Links List → Google Drive (yt-dlp Only - Final Fixed)
 
 on:
   workflow_dispatch:
@@ -41,7 +41,7 @@ jobs:
 
     steps:
       # --------------------------------------------------------------
-      # 1️⃣  התקנת תלויות + לוג (רק yt-dlp בינארי – מוכח שעובד)
+      # 1️⃣  התקנת תלויות + לוג (yt-dlp בינארי רשמי)
       # --------------------------------------------------------------
       - name: Install dependencies & Init log
         continue-on-error: true
@@ -58,12 +58,9 @@ jobs:
           echo ""
           
           echo "🔧 [$(date -u +"%H:%M:%S")] Installing yt-dlp (binary), rclone, msmtp..."
-          # rclone
           curl -fsSL https://rclone.org/install.sh | sudo bash
-          # msmtp
           sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta
           
-          # yt-dlp: בינארי רשמי (כמו שעובד לך בהורדת וידאו)
           echo "   Downloading yt-dlp binary..."
           sudo curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -o /usr/local/bin/yt-dlp
           sudo chmod +x /usr/local/bin/yt-dlp
@@ -94,7 +91,7 @@ jobs:
           echo "✅ rclone configured"
 
       # --------------------------------------------------------------
-      # 3️⃣  שליפת רשימת ציוצי וידאו עם yt-dlp (תיקון URL קסום)
+      # 3️⃣  שליפת רשימת ציוצי וידאו עם yt-dlp (תיקון URL, בלי --extractor)
       # --------------------------------------------------------------
       - name: Generate video links list (yt-dlp)
         continue-on-error: true
@@ -116,7 +113,7 @@ jobs:
           COOKIE_FILE=""
           [[ -n "$COOKIES" ]] && { COOKIE_FILE="${TMP_DIR}/cookies.txt"; echo "$COOKIES" > "$COOKIE_FILE"; echo "   Cookies loaded"; }
 
-          # 🎯 הקסם: המרת x.com → twitter.com כדי שה-extractor יזהה פרופיל
+          # 🎯 הקסם: המרת x.com → twitter.com (ה-extractor מזהה פרופיל רק כך)
           TWITTER_URL=$(echo "$PROFILE_URL" | sed 's|https://x\.com|https://twitter.com|')
           echo "   Original URL: $PROFILE_URL"
           echo "   Using URL:    $TWITTER_URL"
@@ -135,13 +132,7 @@ jobs:
           echo "   Remote path: ${REMOTE_PATH}"
           echo "   Date filter: now-${DAYS}days"
 
-          # ---- הרצת yt-dlp ----
-          # --skip-download       : לא להוריד וידאו, רק מטא-דאטה
-          # --dateafter now-30d   : רק ציוצים מ-30 יום אחרונים
-          # --match-filter "duration > 0" : רק ציוצים עם וידאו (duration > 0)
-          # --print-to-file "%(webpage_url)s" FILE : כתוב רק URL של הציוץ
-          # --sleep-interval 1    : נחמד לשרת
-          # --extractor twitter:user : כפיית extractor (אופציונלי, בטוח)
+          # ---- הרצת yt-dlp (ללא --extractor השגוי) ----
           YTDLP_ARGS=(
             --skip-download
             --dateafter "now-${DAYS}days"
@@ -151,7 +142,6 @@ jobs:
             --max-sleep-interval 3
             --no-warnings
             --progress
-            --extractor "twitter:user"
           )
           [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
           YTDLP_ARGS+=("$TWITTER_URL")
