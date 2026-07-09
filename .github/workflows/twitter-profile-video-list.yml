@@ -1,4 +1,4 @@
-name: X/Twitter Profile → Video Links List → Google Drive (DEBUG VERSION)
+name: X/Twitter Profile → Video Links List → Google Drive (Final Working Version)
 
 on:
   workflow_dispatch:
@@ -49,18 +49,18 @@ jobs:
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "=== X/Twitter Profile Video Lister (DEBUG) ==="
+          echo "=== X/Twitter Profile Video Lister (gallery-dl) ==="
           echo "Run ID: ${{ github.run_id }}"
           echo "Profile: ${{ github.event.inputs.profile_url }}"
           echo "Days back: ${{ github.event.inputs.days }}"
           echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-          echo "=============================================="
+          echo "=================================================="
           echo ""
           
-          echo "🔧 [$(date -u +"%H:%M:%S")] Installing yt-dlp, rclone, msmtp..."
+          echo "🔧 [$(date -u +"%H:%M:%S")] Installing gallery-dl, rclone, msmtp..."
           curl -fsSL https://rclone.org/install.sh | sudo bash
           sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta
-          pip install -q -U yt-dlp
+          pip install -q -U gallery-dl
           echo "✅ Dependencies installed"
 
       # --------------------------------------------------------------
@@ -86,47 +86,94 @@ jobs:
           echo "✅ rclone configured"
 
       # --------------------------------------------------------------
-      # 3️⃣  DEBUG: בדיקת שדות אמיתיים של 10 הציוצים הראשונים
+      # 3️⃣  שליפת רשימת ציוצים עם gallery-dl + סינון תאריך/וידאו ב-bash
       # --------------------------------------------------------------
-      - name: DEBUG – Inspect tweet fields
+      - name: Generate video links list (gallery-dl)
         continue-on-error: true
-        id: gen_list          # ✅ תוקן: חזר ל-gen_list כדי שהאימייל יעבוד
+        id: gen_list
         shell: bash
         env:
           PROFILE_URL: ${{ github.event.inputs.profile_url }}
           DAYS: ${{ github.event.inputs.days }}
+          USER_FILENAME: ${{ github.event.inputs.filename }}
           COOKIES: ${{ github.event.inputs.cookies }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "🔬 [$(date -u +"%H:%M:%S")] DEBUG: Fetching raw fields for first 10 tweets..."
+          echo "🚀 [$(date -u +"%H:%M:%S")] Scraping profile with gallery-dl..."
           set -e
           set -o pipefail
 
           TMP_DIR=$(mktemp -d)
           COOKIE_FILE=""
-          [[ -n "$COOKIES" ]] && { COOKIE_FILE="${TMP_DIR}/cookies.txt"; echo "$COOKIES" > "$COOKIE_FILE"; }
+          [[ -n "$COOKIES" ]] && { COOKIE_FILE="${TMP_DIR}/cookies.txt"; echo "$COOKIES" > "$COOKIE_FILE"; echo "   Cookies loaded"; }
 
-          # מדפיס שדות רלוונטיים ל-10 פריטים ראשונים (בלי פילטר, בלי תאריך)
-          yt-dlp \
-            --skip-download \
-            --playlist-end 10 \
-            --print "%(id)s | %(upload_date)s | %(duration)s | %(formats)d | %(thumbnails)d | %(webpage_url)s" \
-            ${COOKIE_FILE:+--cookies "$COOKIE_FILE"} \
-            "$PROFILE_URL"
-          
-          YTDLP_EXIT=$?
-          [[ $YTDLP_EXIT -ne 0 ]] && { echo "❌ yt-dlp exit: $YTDLP_EXIT"; exit $YTDLP_EXIT; }
-          
-          echo "✅ DEBUG done – check log/email for output above"
+          # חישוב timestamp cutoff (לפני N ימים)
+          CUTOFF_TS=$(date -u -d "-${DAYS} days" +%s)
+          echo "   Cutoff date: $(date -u -d @${CUTOFF_TS}) (timestamp: ${CUTOFF_TS})"
 
-          # ---- פלטים דמה כדי שהשלבים הבאים (אימייל/סיכום) לא יפלו ----
-          echo "STATUS=debug_done" >> $GITHUB_OUTPUT
-          echo "FILE_NAME=debug.txt" >> $GITHUB_OUTPUT
-          echo "TWEET_COUNT=0" >> $GITHUB_OUTPUT
+          # קביעת שם קובץ פלט
+          if [[ -n "$USER_FILENAME" ]]; then
+            OUT_BASE="$USER_FILENAME"
+          else
+            USERNAME=$(echo "$PROFILE_URL" | sed -E 's|.*[/:]([^/?]+)(\?.*)?$|\1|')
+            OUT_BASE="${USERNAME}_videos_last_${DAYS}days_$(date -u +%Y%m%d)"
+          fi
+          OUT_TXT="${TMP_DIR}/${OUT_BASE}.txt"
+          REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/${OUT_BASE}.txt"
+
+          echo "   Output file: ${OUT_BASE}.txt"
+          echo "   Remote path: ${REMOTE_PATH}"
+
+          # ---- הרצת gallery-dl ----
+          # -q: quiet
+          # -g: print URLs only (tweet URLs)
+          # --dateafter: gallery-dl תומך בפורמט יחסי "now-30days"
+          # --filter "video": רק פריטים עם וידאו (מובנה בגלריה)
+          # --cookies: אם צריך
+          GALLERY_ARGS=(
+            -q
+            -g
+            --dateafter "now-${DAYS}days"
+            --filter "video"
+          )
+          [[ -n "$COOKIE_FILE" ]] && GALLERY_ARGS+=(--cookies "$COOKIE_FILE")
+          GALLERY_ARGS+=("$PROFILE_URL")
+
+          echo "🔍 [$(date -u +"%H:%M:%S")] Running gallery-dl..."
+          # שומר פלט לקובץ וסופר שורות
+          gallery-dl "${GALLERY_ARGS[@]}" | tee "$OUT_TXT" | wc -l | read COUNT
+          
+          # אם gallery-dl נכשל (קוד יציאה לא 0) - נופלים
+          GALLERY_EXIT=${PIPESTATUS[0]}
+          [[ $GALLERY_EXIT -ne 0 ]] && { echo "❌ gallery-dl exit: $GALLERY_EXIT"; exit $GALLERY_EXIT; }
+
+          # בדיקה אם הקובץ ריק (לא נמצאו ציוצים)
+          if [[ ! -s "$OUT_TXT" ]]; then
+            echo "⚠️ No video tweets found in the last ${DAYS} days."
+            echo "# No video tweets found for ${PROFILE_URL} in last ${DAYS} days (as of $(date -u))" > "$OUT_TXT"
+            COUNT=0
+          else
+            echo "✅ Found $COUNT video tweet(s)."
+          fi
+
+          # ---- העלאה ל-Drive ----
+          echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
+          rclone copy "$OUT_TXT" "$REMOTE_PATH" --progress
+          RCLONE_EXIT=$?
+          [[ $RCLONE_EXIT -ne 0 ]] && { echo "❌ rclone exit: $RCLONE_EXIT"; exit $RCLONE_EXIT; }
+
+          rm -rf "$TMP_DIR"
+          echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
+
+          # פלטים לאימייל
+          echo "STATUS=success" >> $GITHUB_OUTPUT
+          echo "FILE_NAME=${OUT_BASE}.txt" >> $GITHUB_OUTPUT
+          echo "TWEET_COUNT=$COUNT" >> $GITHUB_OUTPUT
+          echo "REMOTE_PATH=$REMOTE_PATH" >> $GITHUB_OUTPUT
 
       # --------------------------------------------------------------
-      # 4️⃣  שליחת אימייל (רץ תמיד)
+      # 4️⃣  שליחת אימייל
       # --------------------------------------------------------------
       - name: Send log email
         if: always()
@@ -163,13 +210,7 @@ jobs:
           EOF
           chmod 600 ~/.msmtprc
 
-          if [[ "$STATUS" == "debug_done" ]]; then
-            SUBJECT="🔬 [GitHub Actions] DEBUG Output - X Profile Video List - ${{ github.repository }}"
-            BODY="פלט דיבאוג מצורף (10 ציוצים ראשונים).\n\n"
-            BODY+="👤 פרופיל: ${{ github.event.inputs.profile_url }}\n"
-            BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
-            BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
-          elif [[ "$STATUS" == "success" ]]; then
+          if [[ "$STATUS" == "success" ]]; then
             SUBJECT="✅ [GitHub Actions] X Profile Video List Ready - ${{ github.repository }}"
             BODY="הסריקה הושלמה בהצלחה.\n\n"
             BODY+="📁 קובץ: $FILE_NAME\n"
@@ -217,6 +258,8 @@ jobs:
           echo "=== FINAL SUMMARY ==="
           echo "Run: ${{ github.run_id }}"
           echo "Status: ${{ steps.gen_list.outputs.STATUS || 'failed' }}"
-          echo "Log lines: $(wc -l < "$LOG_FILE")"
+          echo "Tweets found: ${{ steps.gen_list.outputs.TWEET_COUNT || '0' }}"
           echo "====================="
-          # לא עושים exit 1 בדיבאוג כדי שהריצה תסומן ירוק
+          if [[ "${{ steps.gen_list.outputs.STATUS }}" != "success" ]]; then
+            exit 1
+          fi
