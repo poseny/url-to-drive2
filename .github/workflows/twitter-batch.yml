@@ -1,4 +1,4 @@
-name: הרבה לינקים X/Twitter Batch → Google Drive (Matrix + Summary Email)
+name: X/Twitter Batch → Google Drive (Matrix + Summary Email)
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ env:
 
 jobs:
   # --------------------------------------------------------------
-  # 0️⃣  הכנה: קריאת הקובץ ובניית Matrix
+  # 0️⃣  הכנה: קריאת הקובץ ובניית Matrix (מתוקן)
   # --------------------------------------------------------------
   prepare:
     runs-on: ubuntu-latest
@@ -41,18 +41,29 @@ jobs:
           FILE="${{ github.event.inputs.urls_file }}"
           if [[ ! -f "$FILE" ]]; then
             echo "❌ File $FILE not found"
-            echo "urls_json=[]" >> $GITHUB_OUTPUT
+            {
+              echo 'urls_json<<EOF'
+              echo '[]'
+              echo 'EOF'
+            } >> $GITHUB_OUTPUT
             exit 0
           fi
           
           mapfile -t URLS < <(grep -E '^https?://' "$FILE" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
           
           JSON=$(printf '%s\n' "${URLS[@]}" | jq -R . | jq -s .)
-          echo "urls_json=$JSON" >> $GITHUB_OUTPUT
+          
+          # תיקון: delimiter syntax לפלט בטוח
+          {
+            echo 'urls_json<<EOF'
+            echo "$JSON"
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+          
           echo "📋 Found ${#URLS[@]} URLs to process"
 
   # --------------------------------------------------------------
-  # 1️⃣  עיבוד כל קישור (רץ במקביל לפי Matrix)
+  # 1️⃣  עיבוד כל קישור (Matrix)
   # --------------------------------------------------------------
   upload:
     needs: prepare
@@ -66,7 +77,6 @@ jobs:
       max-parallel: 2
       matrix:
         url: ${{ fromJson(needs.prepare.outputs.urls) }}
-    # משתנים ייחודיים לכל ריצה
     env:
       TWEET_URL: ${{ matrix.url }}
       FOLDER: ${{ github.event.inputs.folder }}
@@ -75,9 +85,6 @@ jobs:
       MATRIX_INDEX: ${{ strategy.job-index }}
 
     steps:
-      # --------------------------------------------------------------
-      # 1️⃣  התקנת תלויות + לוג (לכל job בנפרד)
-      # --------------------------------------------------------------
       - name: Install dependencies & Init log
         continue-on-error: true
         shell: bash
@@ -98,9 +105,6 @@ jobs:
           pip install -q -U yt-dlp
           echo "✅ Dependencies installed"
 
-      # --------------------------------------------------------------
-      # 2️⃣  קונפיג rclone
-      # --------------------------------------------------------------
       - name: Configure rclone
         continue-on-error: true
         shell: bash
@@ -120,9 +124,6 @@ jobs:
           rclone lsd gdrive: | head -5
           echo "✅ rclone configured"
 
-      # --------------------------------------------------------------
-      # 3️⃣  הורדה → Zip → העלאה (הכל בשלב אחד)
-      # --------------------------------------------------------------
       - name: Download → Zip → Upload
         continue-on-error: true
         id: dl_upload
@@ -145,7 +146,6 @@ jobs:
             echo "   Cookies file ready"
           fi
 
-          # ---- הורדה ----
           echo "⬇️ [$(date -u +"%H:%M:%S")] Downloading with yt-dlp..."
           YTDLP_ARGS=(
             --no-warnings --progress --merge-output-format mp4
@@ -159,7 +159,6 @@ jobs:
           YT_DLP_EXIT=$?
           [[ $YT_DLP_EXIT -ne 0 ]] && { echo "❌ yt-dlp exit: $YT_DLP_EXIT"; exit $YT_DLP_EXIT; }
 
-          # ---- מציאת קבצים ----
           echo "🔍 [$(date -u +"%H:%M:%S")] Finding downloaded video files..."
           mapfile -t VIDEO_FILES < <(find "$TMP_DIR" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | sort)
           
@@ -174,7 +173,6 @@ jobs:
             echo "     - $(basename "$f") ($(numfmt --to=iec $(stat -c%s "$f")))"
           done
 
-          # ---- שם ZIP (מבוסס על הקובץ הראשון) ----
           FIRST_FILE=$(basename "${VIDEO_FILES[0]}")
           BASE_NAME="${FIRST_FILE%.*}"
           BASE_NAME="${BASE_NAME:0:180}"
@@ -184,7 +182,6 @@ jobs:
 
           echo "   ZIP name: $ZIP_NAME"
 
-          # ---- יצירת ZIP ----
           echo "🗜️ [$(date -u +"%H:%M:%S")] Creating ZIP..."
           (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "${VIDEO_FILES[@]}")
           
@@ -192,7 +189,6 @@ jobs:
           ZIP_SIZE=$(stat -c%s "$TMP_ZIP")
           echo "   ZIP size: $(numfmt --to=iec $ZIP_SIZE)"
 
-          # ---- מחיקת ישן והעלאה ----
           if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
             rclone delete "$REMOTE_PATH"
           fi
@@ -205,16 +201,12 @@ jobs:
           rm -rf "$TMP_DIR"
           echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
 
-          # פלטים לסיכום
           echo "STATUS=success" >> $GITHUB_OUTPUT
           echo "FILE_NAME=$ZIP_NAME" >> $GITHUB_OUTPUT
           echo "FILE_SIZE=$ZIP_SIZE" >> $GITHUB_OUTPUT
           echo "FILE_COUNT=${#VIDEO_FILES[@]}" >> $GITHUB_OUTPUT
           echo "TWEET_URL=$TWEET_URL" >> $GITHUB_OUTPUT
 
-      # --------------------------------------------------------------
-      # 4️⃣  העלאת לוג כ-Artifact (לכל job)
-      # --------------------------------------------------------------
       - name: Upload log as Artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -225,7 +217,7 @@ jobs:
           if-no-files-found: warn
 
   # --------------------------------------------------------------
-  # 5️⃣  סיכום סופי + אימייל אחד (רץ אחרי כל ה-jobs)
+  # 2️⃣  סיכום סופי + אימייל אחד
   # --------------------------------------------------------------
   summary:
     needs: [prepare, upload]
@@ -239,7 +231,7 @@ jobs:
         shell: bash
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          TOTAL_JOBS: ${{ needs.prepare.outputs.urls }}  # JSON array
+          TOTAL_JOBS_JSON: ${{ needs.prepare.outputs.urls }}
         run: |
           LOG_FILE="$RUNNER_TEMP/summary_log.txt"
           exec >> "$LOG_FILE" 2>&1
@@ -249,31 +241,9 @@ jobs:
           echo "Folder: ${{ github.event.inputs.folder }}"
           echo ""
 
-          # ניתוח תוצאות מה-jobs של upload
-          SUCCESS=0
-          FAILED=0
-          TOTAL_SIZE=0
-          DETAILS=""
-
-          # עובר על כל ה-jobs של upload דרך GitHub API (פשוט יותר: קורא מה-needs)
-          # מכיוון שאין גישה ישירה ל-outputs של matrix jobs ב-needs,
-          # נשתמש ב-gitunescape JSON של ה-URLs ונבנה טבלה ידנית מה-context
-          # בפועל הכי פשוט: נשתמש ב-github context של ה-jobs
-          # אבל GitHub לא חושף את זה בקלות ב-needs.
-          # חלופה: נכתוב קובץ סיכום משותף (artifact) או נשתמש ב-job summary.
-          
-          # כאן נשתמש בגישה פשוטה: נדפיס את ה-matrix המקורי ונסמן הצלחה/כישלון לפי תוצאת ה-job
-          # לצורך המייל – נבנה טקסט מה-JSON של ה-URLs ונבדוק סטטוס כל job מ-needs.upload.result
-          
-          # GitHub Actions לא מאפשר גישה קלה ל-outputs של matrix jobs ב-needs.
-          # הפתרון המעשי: נשתמש ב-job summary של GitHub (שמופיע ב-UI) ונשלח במייל את הלינק לריצה.
-          # וגם נכתוב סיכום לקובץ ונעלה כ-artifact.
-
-          echo "📊 Batch completed for ${{ github.repository }}"
-          echo "🔗 Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo ""
-          echo "URLs processed:"
-          echo "${TOTAL_JOBS}" | jq -r '.[]' | nl -w2 -s'. '
+          # הדפסת רשימת הקישורים מהמטריקס המקורי
+          echo "URLs in batch:"
+          echo "$TOTAL_JOBS_JSON" | jq -r '.[]' | nl -w2 -s'. '
           
           # שליחת אימייל סיכום
           if [[ -n "$EMAIL_PASSWORD" ]]; then
@@ -301,7 +271,7 @@ jobs:
             BODY+="📂 תיקייה: ${{ github.event.inputs.folder }}\n"
             BODY+="🔗 צפייה בפרטים: $BATCH_URL\n\n"
             BODY+="קישורים שעובדו:\n"
-            BODY+=$(echo "$TOTAL_JOBS" | jq -r '.[]' | nl -w2 -s'. ' | sed 's/^/  /')
+            BODY+=$(echo "$TOTAL_JOBS_JSON" | jq -r '.[]' | nl -w2 -s'. ' | sed 's/^/  /')
             BODY+="\n\nלפירוט מלא (איזה הצליח/נכשל, לוגים) – כנס ללינק הריצה למעלה."
 
             echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
