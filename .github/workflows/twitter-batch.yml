@@ -12,7 +12,7 @@ on:
         required: true
         default: "TwitterDownloads"
       cookies:
-        description: "Cookies (Netscape format) – אופציונלי"
+        description: "Cookies (Netscape format) – אופציונלי, יחול על כל הקישורים"
         required: false
         default: ""
 
@@ -25,7 +25,7 @@ env:
 
 jobs:
   # --------------------------------------------------------------
-  # 0️⃣  הכנה: קריאת הקובץ ובניית Matrix (מתוקן)
+  # 0️⃣  הכנה: קריאת הקובץ ובניית Matrix JSON
   # --------------------------------------------------------------
   prepare:
     runs-on: ubuntu-latest
@@ -53,7 +53,7 @@ jobs:
           
           JSON=$(printf '%s\n' "${URLS[@]}" | jq -R . | jq -s .)
           
-          # תיקון: delimiter syntax לפלט בטוח
+          # delimiter syntax לפלט בטוח ל-GITHUB_OUTPUT
           {
             echo 'urls_json<<EOF'
             echo "$JSON"
@@ -63,7 +63,7 @@ jobs:
           echo "📋 Found ${#URLS[@]} URLs to process"
 
   # --------------------------------------------------------------
-  # 1️⃣  עיבוד כל קישור (Matrix)
+  # 1️⃣  עיבוד כל קישור (Matrix – רץ במקביל, מבודד)
   # --------------------------------------------------------------
   upload:
     needs: prepare
@@ -73,8 +73,8 @@ jobs:
       contents: read
       actions: read
     strategy:
-      fail-fast: false
-      max-parallel: 2
+      fail-fast: false          # נמשיך גם אם אחד נכשל
+      max-parallel: 2           # 2 במקביל (מניעת rate limit)
       matrix:
         url: ${{ fromJson(needs.prepare.outputs.urls) }}
     env:
@@ -85,6 +85,7 @@ jobs:
       MATRIX_INDEX: ${{ strategy.job-index }}
 
     steps:
+      # ---- 1. התקנת תלויות + אתחול לוג ----
       - name: Install dependencies & Init log
         continue-on-error: true
         shell: bash
@@ -105,6 +106,7 @@ jobs:
           pip install -q -U yt-dlp
           echo "✅ Dependencies installed"
 
+      # ---- 2. קונפיג rclone ----
       - name: Configure rclone
         continue-on-error: true
         shell: bash
@@ -124,6 +126,7 @@ jobs:
           rclone lsd gdrive: | head -5
           echo "✅ rclone configured"
 
+      # ---- 3. הורדה → Zip → העלאה (השלב המרכזי) ----
       - name: Download → Zip → Upload
         continue-on-error: true
         id: dl_upload
@@ -146,6 +149,7 @@ jobs:
             echo "   Cookies file ready"
           fi
 
+          # הורדה
           echo "⬇️ [$(date -u +"%H:%M:%S")] Downloading with yt-dlp..."
           YTDLP_ARGS=(
             --no-warnings --progress --merge-output-format mp4
@@ -159,6 +163,7 @@ jobs:
           YT_DLP_EXIT=$?
           [[ $YT_DLP_EXIT -ne 0 ]] && { echo "❌ yt-dlp exit: $YT_DLP_EXIT"; exit $YT_DLP_EXIT; }
 
+          # מציאת קבצים
           echo "🔍 [$(date -u +"%H:%M:%S")] Finding downloaded video files..."
           mapfile -t VIDEO_FILES < <(find "$TMP_DIR" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | sort)
           
@@ -173,6 +178,7 @@ jobs:
             echo "     - $(basename "$f") ($(numfmt --to=iec $(stat -c%s "$f")))"
           done
 
+          # שם ZIP
           FIRST_FILE=$(basename "${VIDEO_FILES[0]}")
           BASE_NAME="${FIRST_FILE%.*}"
           BASE_NAME="${BASE_NAME:0:180}"
@@ -182,6 +188,7 @@ jobs:
 
           echo "   ZIP name: $ZIP_NAME"
 
+          # יצירת ZIP
           echo "🗜️ [$(date -u +"%H:%M:%S")] Creating ZIP..."
           (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "${VIDEO_FILES[@]}")
           
@@ -189,6 +196,7 @@ jobs:
           ZIP_SIZE=$(stat -c%s "$TMP_ZIP")
           echo "   ZIP size: $(numfmt --to=iec $ZIP_SIZE)"
 
+          # מחיקת ישן והעלאה
           if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
             rclone delete "$REMOTE_PATH"
           fi
@@ -201,12 +209,14 @@ jobs:
           rm -rf "$TMP_DIR"
           echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
 
+          # פלטים לסיכום
           echo "STATUS=success" >> $GITHUB_OUTPUT
           echo "FILE_NAME=$ZIP_NAME" >> $GITHUB_OUTPUT
           echo "FILE_SIZE=$ZIP_SIZE" >> $GITHUB_OUTPUT
           echo "FILE_COUNT=${#VIDEO_FILES[@]}" >> $GITHUB_OUTPUT
           echo "TWEET_URL=$TWEET_URL" >> $GITHUB_OUTPUT
 
+      # ---- 4. העלאת לוג כ-Artifact (לכל job) ----
       - name: Upload log as Artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -217,7 +227,7 @@ jobs:
           if-no-files-found: warn
 
   # --------------------------------------------------------------
-  # 2️⃣  סיכום סופי + אימייל אחד
+  # 2️⃣  סיכום סופי + אימייל אחד (רץ אחרי כולם)
   # --------------------------------------------------------------
   summary:
     needs: [prepare, upload]
@@ -227,6 +237,11 @@ jobs:
     permissions:
       actions: read
     steps:
+      # 👇 קריטי: התקנת msmtp + jq בראנר הנקי הזה
+      - name: Install mail deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta jq
+
       - name: Collect results & Send summary email
         shell: bash
         env:
@@ -241,7 +256,7 @@ jobs:
           echo "Folder: ${{ github.event.inputs.folder }}"
           echo ""
 
-          # הדפסת רשימת הקישורים מהמטריקס המקורי
+          # הדפסת רשימת הקישורים
           echo "URLs in batch:"
           echo "$TOTAL_JOBS_JSON" | jq -r '.[]' | nl -w2 -s'. '
           
