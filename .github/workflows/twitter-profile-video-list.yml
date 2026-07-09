@@ -97,90 +97,40 @@ jobs:
 
       # --------------------------------------------------------------
       # --------------------------------------------------------------
-      # 3️⃣  הפקת רשימת קישורים עם yt-dlp (יציב, מהיר, תומך הכל)
+      # 3️⃣  DEBUG: בדיקת שדות אמיתיים של 10 הציוצים הראשונים
       # --------------------------------------------------------------
-      - name: Generate video links list (yt-dlp)
+      - name: DEBUG – Inspect tweet fields
         continue-on-error: true
-        id: gen_list
+        id: debug_fields
         shell: bash
         env:
           PROFILE_URL: ${{ github.event.inputs.profile_url }}
           DAYS: ${{ github.event.inputs.days }}
-          USER_FILENAME: ${{ github.event.inputs.filename }}
           COOKIES: ${{ github.event.inputs.cookies }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "🚀 [$(date -u +"%H:%M:%S")] Scanning profile for videos with yt-dlp..."
+          echo "🔬 [$(date -u +"%H:%M:%S")] DEBUG: Fetching raw fields for first 10 tweets..."
           set -e
           set -o pipefail
 
           TMP_DIR=$(mktemp -d)
           COOKIE_FILE=""
-          [[ -n "$COOKIES" ]] && { COOKIE_FILE="${TMP_DIR}/cookies.txt"; echo "$COOKIES" > "$COOKIE_FILE"; echo "   Cookies loaded"; }
+          [[ -n "$COOKIES" ]] && { COOKIE_FILE="${TMP_DIR}/cookies.txt"; echo "$COOKIES" > "$COOKIE_FILE"; }
 
-          # קביעת שם קובץ פלט
-          if [[ -n "$USER_FILENAME" ]]; then
-            OUT_BASE="$USER_FILENAME"
-          else
-            USERNAME=$(echo "$PROFILE_URL" | sed -E 's|.*[/:]([^/?]+)(\?.*)?$|\1|')
-            OUT_BASE="${USERNAME}_videos_last_${DAYS}days_$(date -u +%Y%m%d)"
-          fi
-          OUT_TXT="${TMP_DIR}/${OUT_BASE}.txt"
-          REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/${OUT_BASE}.txt"
-
-          echo "   Output file: ${OUT_BASE}.txt"
-          echo "   Date filter: now-${DAYS}days"
-          echo "   Remote path: ${REMOTE_PATH}"
-
-          # ---- בניית ארגומנטים ל-yt-dlp (מתוקן) ----
-          # --skip-download       : לא להוריד קבצי וידאו/אודיו (רק מטא-דאטה)
-          # --dateafter now-30d   : רק ציוצים מ-30 יום אחרונים
-          # --match-filter "duration > 0" : רק פריטים עם משך זמן > 0 (וידאו/GIF אמיתיים)
-          # --print-to-file "%(webpage_url)s" FILE : כתוב רק את הקישור לציוץ
-          # --sleep-interval 1    : נחמד לשרת
-          YTDLP_ARGS=(
-            --skip-download
-            --dateafter "now-${DAYS}days"
-            --match-filter "duration > 0"
-            --print-to-file "%(webpage_url)s" "$OUT_TXT"
-            --sleep-interval 1
-            --max-sleep-interval 3
-            --no-warnings
-            --progress
-          )
-          [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
-          YTDLP_ARGS+=("$PROFILE_URL")
-          echo "🔍 [$(date -u +"%H:%M:%S")] Running yt-dlp..."
-          yt-dlp "${YTDLP_ARGS[@]}"
+          # מדפיס שדות רלוונטיים ל-10 פריטים ראשונים (בלי פילטר, בלי תאריך)
+          yt-dlp \
+            --skip-download \
+            --playlist-end 10 \
+            --print "%(id)s | %(upload_date)s | %(duration)s | %(formats)d | %(thumbnails)d | %(webpage_url)s" \
+            ${COOKIE_FILE:+--cookies "$COOKIE_FILE"} \
+            "$PROFILE_URL"
+          
           YTDLP_EXIT=$?
           [[ $YTDLP_EXIT -ne 0 ]] && { echo "❌ yt-dlp exit: $YTDLP_EXIT"; exit $YTDLP_EXIT; }
-
-          # ---- בדיקת תוצאות ----
-          if [[ ! -s "$OUT_TXT" ]]; then
-            echo "⚠️ No video tweets found in the last ${DAYS} days."
-            echo "# No video tweets found for ${PROFILE_URL} in last ${DAYS} days (as of $(date -u))" > "$OUT_TXT"
-            COUNT=0
-          else
-            COUNT=$(wc -l < "$OUT_TXT")
-            echo "✅ Found $COUNT video tweet(s)."
-          fi
-
-          # ---- העלאה ל-Drive ----
-          echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
-          rclone copy "$OUT_TXT" "$REMOTE_PATH" --progress
-          RCLONE_EXIT=$?
-          [[ $RCLONE_EXIT -ne 0 ]] && { echo "❌ rclone exit: $RCLONE_EXIT"; exit $RCLONE_EXIT; }
-
-          rm -rf "$TMP_DIR"
-          echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
-
-          # פלטים לאימייל
-          echo "STATUS=success" >> $GITHUB_OUTPUT
-          echo "FILE_NAME=${OUT_BASE}.txt" >> $GITHUB_OUTPUT
-          echo "TWEET_COUNT=$COUNT" >> $GITHUB_OUTPUT
-          echo "REMOTE_PATH=$REMOTE_PATH" >> $GITHUB_OUTPUT
-
+          
+          echo "✅ DEBUG done – check log/email for output above"
+          echo "STATUS=debug_done" >> $GITHUB_OUTPUT
       # --------------------------------------------------------------
       # 4️⃣  שליחת אימייל
       # --------------------------------------------------------------
