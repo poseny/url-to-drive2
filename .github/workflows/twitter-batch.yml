@@ -1,4 +1,4 @@
-name: X/Twitter Batch → Google Drive (Matrix + Summary Email)
+name: הרבה לנקיםX/Twitter Batch → Google Drive (Matrix + Summary Email)
 
 on:
   workflow_dispatch:
