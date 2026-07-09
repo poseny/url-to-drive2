@@ -1,4 +1,4 @@
-name: X/Twitter Profile → Video Links List → Google Drive (Nitter - Robust)
+name: X/Twitter Profile → Video Links List → Google Drive (yt-dlp + Nitter - Final)
 
 on:
   workflow_dispatch:
@@ -45,7 +45,7 @@ jobs:
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           echo "LOG_FILE=$LOG_FILE" >> $GITHUB_ENV
           {
-            echo "=== X/Twitter Profile Video Lister (Nitter Robust) ==="
+            echo "=== X/Twitter Profile Video Lister (yt-dlp + Nitter) ==="
             echo "Run ID: ${{ github.run_id }}"
             echo "Run Number: ${{ github.run_number }}"
             echo "Repo: ${{ github.repository }}"
@@ -54,12 +54,12 @@ jobs:
             echo "Profile: ${{ github.event.inputs.profile_url }}"
             echo "Days back: ${{ github.event.inputs.days }}"
             echo "Folder: ${{ github.event.inputs.folder }}"
-            echo "====================================================="
+            echo "========================================================"
             echo ""
           } > "$LOG_FILE"
 
       # ==============================================================
-      # 1️⃣  התקנת תלויות
+      # 1️⃣  התקנת תלויות (רק yt-dlp binary + rclone + msmtp)
       # ==============================================================
       - name: Install dependencies
         continue-on-error: true
@@ -67,9 +67,9 @@ jobs:
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "🔧 [$(date -u +"%H:%M:%S")] Installing yt-dlp, rclone, msmtp, xmlstarlet..."
+          echo "🔧 [$(date -u +"%H:%M:%S")] Installing yt-dlp (binary), rclone, msmtp..."
           curl -fsSL https://rclone.org/install.sh | sudo bash
-          sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta xmlstarlet
+          sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta
           sudo curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -o /usr/local/bin/yt-dlp
           sudo chmod +x /usr/local/bin/yt-dlp
           yt-dlp --version
@@ -98,9 +98,9 @@ jobs:
           echo "✅ rclone configured"
 
       # ==============================================================
-      # 3️⃣  שליפת ציוצי וידאו דרך Nitter (ללא pipes שבורים)
+      # 3️⃣  הקסם: yt-dlp על Nitter (Extractor רשמי: NitterUser)
       # ==============================================================
-      - name: Fetch video tweets via Nitter (file-based parsing)
+      - name: Fetch video tweets via yt-dlp (Nitter Extractor)
         continue-on-error: true
         id: fetch_videos
         shell: bash
@@ -111,12 +111,11 @@ jobs:
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "🚀 [$(date -u +"%H:%M:%S")] Fetching profile via Nitter instances..."
+          echo "🚀 [$(date -u +"%H:%M:%S")] Fetching via yt-dlp NitterUser extractor..."
           set -e
           set -o pipefail
 
           USERNAME=$(echo "$PROFILE_URL" | sed -E 's|.*[/:]([^/?]+)(\?.*)?$|\1|')
-          CUTOFF_TS=$(date -u -d "-${DAYS} days" +%s)
           
           TMP_DIR=$(mktemp -d)
           
@@ -129,10 +128,10 @@ jobs:
           REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/${OUT_BASE}.txt"
 
           echo "   Username: $USERNAME"
-          echo "   Cutoff: $(date -u -d @${CUTOFF_TS}) (TS: $CUTOFF_TS)"
           echo "   Output: ${OUT_BASE}.txt"
+          echo "   Date filter: now-${DAYS}days"
 
-          # ---- רשימת מופעי Nitter ----
+          # ---- רשימת מופעי Nitter לנסות (Fallback) ----
           NITTER_INSTANCES=(
             "https://nitter.net"
             "https://nitter.1d4.us"
@@ -142,96 +141,74 @@ jobs:
             "https://nitter.unixfox.eu"
           )
 
-          RSS_XML=""
-          SUCCESS_INSTANCE=""
-
+          SUCCESS=0
           for INSTANCE in "${NITTER_INSTANCES[@]}"; do
-            URL="${INSTANCE}/${USERNAME}/rss"
-            echo "   🔄 Trying: $URL"
+            NITTER_URL="${INSTANCE}/${USERNAME}"
+            echo "   🔄 Trying: $NITTER_URL"
             
-            RESPONSE=$(curl -sL --retry 2 --retry-delay 3 \
-              -H "User-Agent: Mozilla/5.0 (compatible; GitHub Actions Nitter Client)" \
-              -H "Accept: application/xml, application/rss+xml, text/xml" \
-              "$URL" --max-time 20 --connect-timeout 10)
-            
-            if echo "$RESPONSE" | grep -qE "^<\?xml|^<rss"; then
-              RSS_XML="$RESPONSE"
-              SUCCESS_INSTANCE="$INSTANCE"
-              echo "   ✅ Success with: $INSTANCE"
-              break
+            # בדיקה מהירה שהמופע חי
+            if ! curl -sL --max-time 10 -o /dev/null -w "%{http_code}" "$NITTER_URL" | grep -q "^200$"; then
+              echo "   ⚠️ Instance not reachable (non-200)"
+              continue
+            fi
+
+            # ---- הפקודה המנצחת ----
+            # yt-dlp מזהה אוטומטית NitterUser extractor לפי הדומיין/נתיב
+            YTDLP_ARGS=(
+              --skip-download
+              --dateafter "now-${DAYS}days"
+              --match-filter "duration > 0"
+              --print-to-file "%(webpage_url)s" "$OUT_TXT"
+              --sleep-interval 1
+              --max-sleep-interval 3
+              --no-warnings
+              --progress
+              --extractor-retries 3
+            )
+            YTDLP_ARGS+=("$NITTER_URL")
+
+            echo "🔍 [$(date -u +"%H:%M:%S")] Running yt-dlp on $INSTANCE..."
+            if yt-dlp "${YTDLP_ARGS[@]}"; then
+              YTDLP_EXIT=0
             else
-              echo "   ⚠️ Failed/Empty: $INSTANCE (first 100 chars: $(echo "$RESPONSE" | head -c 100))"
+              YTDLP_EXIT=$?
+            fi
+
+            if [[ $YTDLP_EXIT -eq 0 && -s "$OUT_TXT" ]]; then
+              COUNT=$(wc -l < "$OUT_TXT")
+              echo "✅ Success with $INSTANCE – found $COUNT video tweet(s)."
+              SUCCESS=1
+              break
+            elif [[ $YTDLP_EXIT -eq 0 ]]; then
+              echo "⚠️ yt-dlp succeeded but found 0 videos on $INSTANCE."
+            else
+              echo "❌ yt-dlp failed on $INSTANCE (exit: $YTDLP_EXIT)"
             fi
           done
 
-          if [[ -z "$RSS_XML" ]]; then
-            echo "❌ All Nitter instances failed or blocked."
-            echo "STATUS=failed" >> $GITHUB_OUTPUT
-            rm -rf "$TMP_DIR"
-            exit 0
-          fi
-
-          echo "   Using instance: $SUCCESS_INSTANCE"
-
-          # ---- שמירת XML לקובץ (למניעת broken pipes) ----
-          RSS_FILE="${TMP_DIR}/feed.xml"
-          echo "$RSS_XML" > "$RSS_FILE"
-
-          # ---- פרסור XML לקובץ ביניים (שורה אחת לפריט: pubDate|link|description) ----
-          PARSED_FILE="${TMP_DIR}/parsed.txt"
-          # xmlstarlet: לכל item מדפיס pubDate|link|description (עם נרמול רווחים)
-          xmlstarlet sel -T -t \
-            -m "//item" \
-            -v "pubDate" -o "|" \
-            -v "link" -o "|" \
-            -v "description" -n \
-            "$RSS_FILE" 2>/dev/null | sed 's/|/|/g' > "$PARSED_FILE"
-
-          # ---- עיבוד הקובץ המפורסר (בלי pipes, בלי subshells) ----
-          > "$OUT_TXT"  # ריק
-          while IFS='|' read -r PUBDATE LINK DESC; do
-            # דילוג על שורות ריקות
-            [[ -z "$PUBDATE" ]] && continue
-            
-            # המרת תאריך
-            ITEM_TS=$(date -u -d "$PUBDATE" +%s 2>/dev/null || echo 0)
-            [[ $ITEM_TS -lt $CUTOFF_TS ]] && continue
-            
-            # בדיקת וידאו בתיאור
-            if echo "$DESC" | grep -qiE "video|mp4|m3u8|type=.video"; then
-              # המרת קישור Nitter -> x.com
-              X_LINK=$(echo "$LINK" | sed -E 's|https?://[^/]+/([^/]+)/status/([0-9]+).*|https://x.com/\1/status/\2|')
-              echo "$X_LINK" >> "$OUT_TXT"
-            fi
-          done < "$PARSED_FILE"
-
-          # הסרת כפילויות
-          if [[ -s "$OUT_TXT" ]]; then
-            sort -u "$OUT_TXT" -o "$OUT_TXT"
-          fi
-
-          if [[ ! -s "$OUT_TXT" ]]; then
-            echo "⚠️ No video tweets found in last ${DAYS} days via Nitter."
-            echo "# No video tweets found via Nitter for ${PROFILE_URL} in last ${DAYS} days (as of $(date -u))" > "$OUT_TXT"
+          if [[ $SUCCESS -eq 0 ]]; then
+            echo "❌ All Nitter instances failed or returned no videos."
+            echo "# No video tweets found via yt-dlp+Nitter for ${PROFILE_URL} in last ${DAYS} days (as of $(date -u))" > "$OUT_TXT"
             COUNT=0
+            echo "STATUS=failed" >> $GITHUB_OUTPUT
           else
-            COUNT=$(wc -l < "$OUT_TXT")
-            echo "✅ Found $COUNT video tweet(s) via Nitter ($SUCCESS_INSTANCE)."
+            echo "STATUS=success" >> $GITHUB_OUTPUT
           fi
 
-          # ---- העלאה ל-Drive ----
-          echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
-          rclone copy "$OUT_TXT" "$REMOTE_PATH" --progress
-          RCLONE_EXIT=$?
-          [[ $RCLONE_EXIT -ne 0 ]] && { echo "❌ rclone exit: $RCLONE_EXIT"; exit $RCLONE_EXIT; }
-
-          rm -rf "$TMP_DIR"
-          echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
-
-          echo "STATUS=success" >> $GITHUB_OUTPUT
           echo "FILE_NAME=${OUT_BASE}.txt" >> $GITHUB_OUTPUT
           echo "TWEET_COUNT=$COUNT" >> $GITHUB_OUTPUT
           echo "REMOTE_PATH=$REMOTE_PATH" >> $GITHUB_OUTPUT
+
+          # ---- העלאה ל-Drive ----
+          if [[ $COUNT -gt 0 ]]; then
+            echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
+            rclone copy "$OUT_TXT" "$REMOTE_PATH" --progress
+            RCLONE_EXIT=$?
+            [[ $RCLONE_EXIT -ne 0 ]] && { echo "❌ rclone exit: $RCLONE_EXIT"; exit $RCLONE_EXIT; }
+          fi
+
+          rm -rf "$TMP_DIR"
+          echo "✅ [$(date -u +"%H:%M:%S")] DONE"
 
       # ==============================================================
       # 4️⃣  שליחת אימייל
@@ -273,10 +250,10 @@ jobs:
 
           if [[ "$STATUS" == "success" ]]; then
             SUBJECT="✅ [GitHub Actions] X Profile Video List Ready - ${{ github.repository }}"
-            BODY="הסריקה הושלמה בהצלחה (דרך Nitter - ללא Cookies).\n\n"
+            BODY="הסריקה הושלמה בהצלחה (yt-dlp + NitterUser Extractor).\n\n"
             BODY+="📁 קובץ: $FILE_NAME\n"
             BODY+="🔗 ציוצי וידאו שנמצאו: ${TWEET_COUNT:-0}\n"
-            BODY+="🛠️ שיטה: Nitter Public Instances (RSS)\n"
+            BODY+="🛠️ שיטה: yt-dlp (NitterUser Extractor)\n"
             BODY+="📂 תיקייה: ${{ github.event.inputs.folder }}\n"
             BODY+="👤 פרופיל: ${{ github.event.inputs.profile_url }}\n"
             BODY+="📅 טווח: ${{ github.event.inputs.days }} ימים אחורה\n"
@@ -284,10 +261,11 @@ jobs:
             BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
           else
             SUBJECT="❌ [GitHub Actions] X Profile Video List FAILED - ${{ github.repository }}"
-            BODY="הסריקה נכשלה. מצורף לוג מלא.\n\n"
+            BODY="הסריקה נכשלה – כל מופעי Nitter נכשלו או לא החזירו וידאו.\n\n"
             BODY+="👤 פרופיל: ${{ github.event.inputs.profile_url }}\n"
             BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
             BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
+            BODY+="💡 ייתכן שהפרופיל פרטי, מוגבל גיל, או שכל מופעי Nitter ציבוריים חסומים כרגע.\n"
           fi
 
           BODY+="\n--- Last 60 lines of log ---\n"
