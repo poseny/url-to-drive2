@@ -20,155 +20,23 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      # ----------------------------------------------------------------
-      # 1️⃣  התקנות (curl/zip/rclone/msmtp כבר במערכת או מותקנים)
-      # ----------------------------------------------------------------
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq curl zip rclone msmtp 2>&1 | tail -1
-          echo "✅ Dependencies installed"
-
-      # ----------------------------------------------------------------
-      # 2️⃣  קונפיג rclone
-      # ----------------------------------------------------------------
-      - name: Write rclone config
+      - name: Scan + Upload + Email (guaranteed report)
         env:
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
-        run: |
-          mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf <<EOF
-          [gdrive]
-          type = drive
-          scope = drive.file
-          token = $RCLONE_GDRIVE_TOKEN
-          EOF
-          echo "✅ rclone configured"
-
-      # ----------------------------------------------------------------
-      # 3️⃣  סריקת הפרופיל (גישת syndication, ללא חשבון)
-      # ----------------------------------------------------------------
-      - name: Scan profile for video tweets
-        id: gen_list
-        env:
           USERNAME: ${{ github.event.inputs.username }}
           DAYS: ${{ github.event.inputs.days }}
           FOLDER: ${{ github.event.inputs.folder }}
         run: |
-          set -e
-          LOG=/tmp/scan.log
-          # מקליט את הכל (stdout+stderr) גם לקובץ וגם למסך
-          exec > >(tee -a "$LOG") 2>&1
-
-          DATE=$(date -u +%Y%m%d)
-          OUT="/tmp/${USERNAME}_videos_last_${DAYS}days_${DATE}.txt"
-          REMOTE="gdrive:${FOLDER}/${USERNAME}_videos_last_${DAYS}days_${DATE}.txt"
-          echo "🚀 Scanning @$USERNAME for last $DAYS days"
-          echo "   OUT=$OUT"
-          echo "   REMOTE=$REMOTE"
-
           set +e
-          python3 - "$USERNAME" "$DAYS" "$OUT" <<'PY'
-          import json, re, sys, urllib.request, urllib.parse, datetime
+          # ============ לוג + דואר (חובה להגיע) ============
+          LOG=/tmp/scan.log
+          exec > "$LOG" 2>&1
+          STATUS="unknown"
+          TWEETS=0
 
-          screen, days, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-          cutoff = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - days*86400
-          results = []
-          cursor = None
-          for page in range(12):  # עד 12 עמודים כדי לכסות 30 יום
-              url = ("https://cdn.syndication.twitter.com/timeline/profile.json"
-                     "?screen_name=%s&with_replies=false&limit=100" % screen)
-              if cursor:
-                  url += "&max_position=" + urllib.parse.quote(cursor)
-              req = urllib.request.Request(url, headers={
-                  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-                  "Accept": "application/json, text/javascript, */*; q=0.01",
-                  "X-Requested-With": "XMLHttpRequest",
-                  "Referer": "https://x.com/%s" % screen})
-              try:
-                  with urllib.request.urlopen(req, timeout=30) as r:
-                      data = json.load(r)
-              except Exception as e:
-                  print("⚠️ fetch error page %d: %s" % (page, e)); break
-              body = data.get("body", "") or ""
-              if not body.strip():
-                  print("⚠️ empty body (login-wall / blocked by X) – anonymous syndication is blocked"); break
-              matches = list(re.finditer(r'data-tweet-id="(\d+)"', body))
-              positions = [m.start() for m in matches]
-              for i, m in enumerate(matches):
-                  tid = m.group(1)
-                  start = m.start()
-                  end = positions[i+1] if i+1 < len(positions) else len(body)
-                  block = body[start:end]
-                  tm = re.search(r'data-time="(\d+)"', block)
-                  ttime = int(tm.group(1)) if tm else 0
-                  is_video = ("PlayableMedia" in block) or ("<video" in block) \
-                             or ('data-card-type="player"' in block) or ("twitter:video" in block)
-                  if is_video and ttime >= cutoff:
-                      results.append((ttime, tid))
-              cursor = data.get("min_position") or data.get("max_position")
-              if (not cursor) or data.get("has_more_items") is False:
-                  break
-
-          seen = set(); final = []
-          for t, tid in sorted(results):
-              if tid in seen:
-                  continue
-              seen.add(tid)
-              final.append("https://x.com/%s/status/%s" % (screen, tid))
-
-          with open(out, "w", encoding="utf-8") as f:
-              if final:
-                  f.write("# Video tweets from @%s (last %d days)\n" % (screen, days))
-                  f.write("\n".join(final) + "\n")
-              else:
-                  f.write("# No video tweets found for @%s in last %d days\n" % (screen, days))
-
-          print("🔢 Found %d video tweet(s) for @%s" % (len(final), screen))
-          PY
-          RC=$?
-          set -e
-          echo "PY_RC=$RC"
-          if [ "$RC" -ne 0 ]; then
-            echo "status=fail" >> "$GITHUB_OUTPUT"
-          else
-            echo "status=ok"   >> "$GITHUB_OUTPUT"
-          fi
-          echo "out_path=$OUT"        >> "$GITHUB_OUTPUT"
-          echo "remote_path=$REMOTE"  >> "$GITHUB_OUTPUT"
-          echo "file_name=$(basename "$OUT")" >> "$GITHUB_OUTPUT"
-          echo "tweet_count=$(grep -c '^https://x.com' "$OUT" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
-
-      # ----------------------------------------------------------------
-      # 4️⃣  העלאת ה‑TXT ל‑Drive (copyto = קובץ בודד לנתיב מדויק)
-      # ----------------------------------------------------------------
-      - name: Upload TXT to Drive
-        if: always()
-        env:
-          OUT: ${{ steps.gen_list.outputs.out_path }}
-          REMOTE: ${{ steps.gen_list.outputs.remote_path }}
-        run: |
-          if [ -f "$OUT" ]; then
-            echo "🚀 Uploading $OUT → $REMOTE"
-            rclone copyto "$OUT" "$REMOTE" --progress && echo "✅ Uploaded" || echo "❌ Upload failed"
-          else
-            echo "⚠️ No output file to upload"
-          fi
-
-      # ----------------------------------------------------------------
-      # 5️⃣  שליחת הלוג במייל (msmtp + סיסמת אפליקציה)
-      # ----------------------------------------------------------------
-      - name: Send log email
-        if: always()
-        env:
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          STATUS: ${{ steps.gen_list.outputs.status }}
-          FILE_NAME: ${{ steps.gen_list.outputs.file_name }}
-          TWEET_COUNT: ${{ steps.gen_list.outputs.tweet_count }}
-          USERNAME: ${{ github.event.inputs.username }}
-          DAYS: ${{ github.event.inputs.days }}
-        run: |
-          cat > ~/.msmtprc <<EOF
+          send_email() {
+            cat > ~/.msmtprc <<EOM
           defaults
           auth on
           tls on
@@ -179,16 +47,118 @@ jobs:
           user p0556722432@gmail.com
           password $EMAIL_PASSWORD
           from p0556722432@gmail.com
-          EOF
-          chmod 600 ~/.msmtprc
-          {
-            echo "Subject: X scan - @$USERNAME ($TWEET_COUNT videos, status=$STATUS)"
-            echo "From: p0556722432@gmail.com"
-            echo "To: p0556722432@gmail.com"
-            echo ""
-            echo "👤 Profile: @$USERNAME | days: $DAYS | found: $TWEET_COUNT | status: $STATUS"
-            echo "📁 File: $FILE_NAME"
-            echo "--- LOG ---"
-            cat /tmp/scan.log
-          } | msmtp p0556722432@gmail.com
-          echo "📧 Email sent"
+          EOM
+            chmod 600 ~/.msmtprc
+            {
+              echo "Subject: X scan report - @$USERNAME (status=$STATUS, tweets=$TWEETS)"
+              echo "From: p0556722432@gmail.com"
+              echo "To: p0556722432@gmail.com"
+              echo ""
+              echo "👤 Profile: @$USERNAME | days: $DAYS | status: $STATUS | tweets: $TWEETS"
+              echo "🕒 Time: $(date -u)"
+              echo "--- FULL LOG ---"
+              cat "$LOG"
+            } | msmtp p0556722432@gmail.com
+            echo "📧 Email attempt finished"
+          }
+          trap send_email EXIT
+
+          # ============ התקנות ============
+          echo "=== Install deps ==="
+          sudo apt-get update -qq 2>&1 | tail -2
+          sudo apt-get install -y -qq curl zip rclone msmtp 2>&1 | tail -3
+          echo "✅ deps done"
+
+          # ============ rclone config ============
+          echo "=== rclone config ==="
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOC
+          [gdrive]
+          type = drive
+          scope = drive.file
+          token = $RCLONE_GDRIVE_TOKEN
+          EOC
+          echo "✅ rclone config done"
+
+          # ============ סריקת הפרופיל (ללא חשבון) ============
+          echo "=== Scan @$USERNAME ==="
+          DATE=$(date -u +%Y%m%d)
+          OUT="/tmp/${USERNAME}_videos_last_${DAYS}days_${DATE}.txt"
+          REMOTE="gdrive:${FOLDER}/${USERNAME}_videos_last_${DAYS}days_${DATE}.txt"
+          echo "OUT=$OUT"
+          echo "REMOTE=$REMOTE"
+
+          python3 - "$USERNAME" "$DAYS" "$OUT" <<'PY'
+          import json, re, sys, urllib.request, urllib.parse, datetime
+          screen, days, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+          cutoff = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - days*86400
+          results, seen = [], set()
+          cursor = None
+          blocked = False
+          for page in range(15):
+              url = "https://cdn.syndication.twitter.com/timeline/profile.json?screen_name=%s&with_replies=false&limit=100" % screen
+              if cursor:
+                  url += "&max_position=" + urllib.parse.quote(cursor)
+              req = urllib.request.Request(url, headers={
+                  "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+                  "Accept":"application/json, text/javascript, */*; q=0.01",
+                  "X-Requested-With":"XMLHttpRequest",
+                  "Referer":"https://x.com/%s" % screen})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      data = json.load(r)
+              except Exception as e:
+                  print("⚠️ fetch error page %d: %s" % (page, e)); break
+              body = data.get("body","") or ""
+              if not body.strip():
+                  blocked = True
+                  print("⚠️ empty body (LOGIN-WALL / X blocked anonymous syndication)")
+                  break
+              matches = list(re.finditer(r'data-tweet-id="(\d+)"', body))
+              positions = [m.start() for m in matches]
+              for i,m in enumerate(matches):
+                  tid = m.group(1)
+                  start = m.start()
+                  end = positions[i+1] if i+1 < len(positions) else len(body)
+                  block = body[start:end]
+                  tm = re.search(r'data-time="(\d+)"', block)
+                  ttime = int(tm.group(1)) if tm else 0
+                  is_video = ("PlayableMedia" in block) or ("<video" in block) or ('data-card-type="player"' in block) or ("twitter:video" in block) or ("data-tweet-media" in block)
+                  if is_video and ttime >= cutoff:
+                      results.append((ttime, tid))
+              cursor = data.get("min_position") or data.get("max_position")
+              if (not cursor) or data.get("has_more_items") is False:
+                  break
+          final = []
+          for t,tid in sorted(results):
+              if tid in seen: continue
+              seen.add(tid)
+              final.append("https://x.com/%s/status/%s" % (screen, tid))
+          with open(out,"w",encoding="utf-8") as f:
+              if final:
+                  f.write("# Video tweets from @%s (last %d days)\n" % (screen, days))
+                  f.write("\n".join(final)+"\n")
+              else:
+                  if blocked:
+                      f.write("# BLOCKED: X requires login (anonymous syndication disabled)\n")
+                  else:
+                      f.write("# No video tweets found for @%s in last %d days\n" % (screen, days))
+          print("🔢 Found %d video tweet(s); blocked=%s" % (len(final), blocked))
+          PY
+          RC=$?
+          echo "python RC=$RC"
+
+          if [ -f "$OUT" ]; then
+            TWEETS=$(grep -cE '^https://x\.com/' "$OUT" 2>/dev/null || echo 0)
+          fi
+
+          # ============ העלאה לדרייב ============
+          echo "=== Upload ==="
+          if [ -f "$OUT" ]; then
+            rclone copyto "$OUT" "$REMOTE" --progress 2>&1 && echo "✅ uploaded" || echo "❌ upload failed"
+          else
+            echo "⚠️ no output file"
+          fi
+
+          if [ "$RC" -eq 0 ]; then STATUS="ok"; else STATUS="fail"; fi
+          echo "=== DONE status=$STATUS tweets=$TWEETS ==="
