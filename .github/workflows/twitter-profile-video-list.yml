@@ -1,4 +1,4 @@
-name: X/Twitter Profile → Video Links List → Google Drive (RSSHub - No Auth)
+name: X/Twitter Profile → Video Links List → Google Drive (RSSHub Robust)
 
 on:
   workflow_dispatch:
@@ -26,14 +26,12 @@ env:
   SMTP_SERVER: "smtp.gmail.com"
   SMTP_PORT: "587"
   EMAIL_USER: "p0556722432@gmail.com"
-  # הגדרות RSSHub
-  RSSHUB_BASE: "https://rsshub.app"
   USER_AGENT: "Mozilla/5.0 (compatible; GitHub Actions RSSHub Client)"
 
 jobs:
   list_videos:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     permissions:
       contents: read
       actions: read
@@ -48,7 +46,7 @@ jobs:
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           echo "LOG_FILE=$LOG_FILE" >> $GITHUB_ENV
           {
-            echo "=== X/Twitter Profile Video Lister (RSSHub) ==="
+            echo "=== X/Twitter Profile Video Lister (RSSHub Robust) ==="
             echo "Run ID: ${{ github.run_id }}"
             echo "Run Number: ${{ github.run_number }}"
             echo "Repo: ${{ github.repository }}"
@@ -57,12 +55,12 @@ jobs:
             echo "Profile: ${{ github.event.inputs.profile_url }}"
             echo "Days back: ${{ github.event.inputs.days }}"
             echo "Folder: ${{ github.event.inputs.folder }}"
-            echo "=================================================="
+            echo "========================================================"
             echo ""
           } > "$LOG_FILE"
 
       # ==============================================================
-      # 1️⃣  התקנת תלויות (jq, xq, rclone, msmtp)
+      # 1️⃣  התקנת תלויות (jq, yq, rclone, msmtp, curl)
       # ==============================================================
       - name: Install dependencies
         continue-on-error: true
@@ -75,8 +73,11 @@ jobs:
           # rclone
           curl -fsSL https://rclone.org/install.sh | sudo bash
           
-          # jq, xq (xml->json), msmtp, xmlstarlet (לגיבוי)
+          # jq, yq (v4+ תומך XML), msmtp, xmlstarlet (לגיבוי)
           sudo apt-get update -qq && sudo apt-get install -y -qq jq yq msmtp msmtp-mta xmlstarlet
+          
+          # בדיקת גרסת yq (צריך v4+ ל-XML)
+          yq --version
           
           echo "✅ Dependencies installed"
 
@@ -103,9 +104,9 @@ jobs:
           echo "✅ rclone configured"
 
       # ==============================================================
-      # 3️⃣  שליפת רשימת ציוצי וידאו דרך RSSHub (ללא Cookies!)
+      # 3️⃣  שליפת רשימת ציוצי וידאו דרך RSSHub (עם Fallbacks)
       # ==============================================================
-      - name: Fetch video tweets via RSSHub
+      - name: Fetch video tweets via RSSHub (with fallbacks)
         continue-on-error: true
         id: fetch_rss
         shell: bash
@@ -116,7 +117,7 @@ jobs:
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "🚀 [$(date -u +"%H:%M:%S")] Fetching via RSSHub..."
+          echo "🚀 [$(date -u +"%H:%M:%S")] Fetching via RSSHub (trying multiple instances)..."
           set -e
           set -o pipefail
 
@@ -137,48 +138,78 @@ jobs:
           echo "   Cutoff: $(date -u -d @${CUTOFF_TS}) (TS: $CUTOFF_TS)"
           echo "   Output: ${OUT_BASE}.txt"
 
-          # ---- בקשה ל-RSSHub ----
-          # מסלול: /twitter/user/:username
-          RSS_URL="${RSSHUB_BASE}/twitter/user/${USERNAME}"
-          echo "   Requesting: $RSS_URL"
+          # ---- רשימת מופעי RSSHub ציבוריים (נכון ל-2026) ----
+          # סדר: הכי יציב ראשון
+          RSSHUB_INSTANCES=(
+            "https://rsshub.app"
+            "https://rsshub.rssforever.com"
+            "https://rss.dandy.eu.org"
+            "https://rsshub.vercel.app"
+            "https://rsshub.zeabur.app"
+          )
 
-          # הורדת ה-RSS (XML) עם timeout ו-retry
-          RSS_XML=$(curl -sL --retry 3 --retry-delay 5 \
-            -H "User-Agent: ${USER_AGENT}" \
-            -H "Accept: application/xml, application/rss+xml" \
-            "$RSS_URL" --max-time 30)
+          # הנתיב הנכון ל-X/Twitter ב-RSSHub המודרני: /x/user/:username
+          RSS_PATH="/x/user/${USERNAME}"
+          
+          RSS_XML=""
+          SUCCESS_INSTANCE=""
 
-          # בדיקה שקיבלנו XML תקין
-          if ! echo "$RSS_XML" | grep -q "<rss\|<feed"; then
-            echo "❌ RSSHub returned invalid/empty response:"
-            echo "$RSS_XML" | head -c 500
+          for INSTANCE in "${RSSHUB_INSTANCES[@]}"; do
+            URL="${INSTANCE}${RSS_PATH}"
+            echo "   🔄 Trying: $URL"
+            
+            # בקשה עם timeout, retry, user-agent
+            RESPONSE=$(curl -sL --retry 2 --retry-delay 3 \
+              -H "User-Agent: ${USER_AGENT}" \
+              -H "Accept: application/xml, application/rss+xml, text/xml" \
+              "$URL" --max-time 20 --connect-timeout 10)
+            
+            # בדיקה: האם קיבלנו XML תקין (RSS 2.0 או Atom)
+            if echo "$RESPONSE" | grep -qE "^<\?xml|^<rss|^<feed"; then
+              RSS_XML="$RESPONSE"
+              SUCCESS_INSTANCE="$INSTANCE"
+              echo "   ✅ Success with: $INSTANCE"
+              break
+            else
+              echo "   ⚠️ Failed/Empty: $INSTANCE (first 100 chars: $(echo "$RESPONSE" | head -c 100))"
+            fi
+          done
+
+          if [[ -z "$RSS_XML" ]]; then
+            echo "❌ All RSSHub instances failed or blocked."
             echo "STATUS=failed" >> $GITHUB_OUTPUT
             rm -rf "$TMP_DIR"
             exit 0
           fi
 
-          # ---- פירסור XML + סינון ----
-          # נשתמש ב-yq (תומך XML) או xmlstarlet
-          # yq v4+ תומך XML ישירות: yq -x '.rss.channel.item[]'
-          # נמיר ל-JSON ונפענח עם jq
-          
+          echo "   Using instance: $SUCCESS_INSTANCE"
+
+          # ---- פירסור XML + סינון וידאו + תאריך ----
+          # yq v4+ ממיר XML ל-JSON, ואז jq מסנן
           echo "$RSS_XML" | yq -o=json '.' | jq -r --argjson cutoff "$CUTOFF_TS" '
-            # תומך גם ב-RSS 2.0 (.rss.channel.item) וגם ב-Atom (.feed.entry)
+            # תמיכה ב-RSS 2.0 (.rss.channel.item) וגם Atom (.feed.entry)
+            def parse_date:
+              # מנסה לפרסר מגוון פורמטי תאריך RFC822 / ISO8601
+              . as $d
+              | ($d | sub("(?<wkday>\\w+), (?<day>\\d+) (?<mon>\\w+) (?<year>\\d+) (?<time>\\d+:\\d+:\\d+) (?<tz>\\S+)"; "\(.day) \(.mon) \(.year) \(.time) \(.tz)") | strptime("%d %b %Y %H:%M:%S %Z") | mktime)
+              // ($d | fromdateiso8601? // 0)
+              ;
+            
             ( .rss.channel.item // .feed.entry // [] ) 
             | .[] 
-            | select(.pubDate or .published) 
-            | .pubDate_str = (.pubDate // .published)
-            | .pubDate_ts = (.pubDate_str | sub("(?<wkday>\\w+), (?<day>\\d+) (?<mon>\\w+) (?<year>\\d+) (?<time>\\d+:\\d+:\\d+) (?<tz>\\S+)"; "\(.day) \(.mon) \(.year) \(.time) \(.tz)") | strptime("%d %b %Y %H:%M:%S %Z") | mktime)
+            | select(.pubDate or .published or .updated)
+            | .pubDate_str = (.pubDate // .published // .updated)
+            | .pubDate_ts = (.pubDate_str | parse_date)
             | select(.pubDate_ts >= $cutoff)
             | .link_href = (.link // .link.href // .link["@href"] // "")
-            | .description_text = (.description // .content // .summary // "")
+            | .description_text = (.description // .content // .summary // .title // "")
             | select(.link_href | startswith("https://twitter.com") or startswith("https://x.com"))
-            | select(.description_text | test("video|Video|VIDEO|\\.mp4|\\.m3u8|enclosure.*video"; "i"))
+            | select(.description_text | test("video|Video|VIDEO|\\.mp4|\\.m3u8|enclosure.*video|type=.video"; "i"))
             | .link_href
             | sub("https://twitter.com"; "https://x.com")
           ' > "$OUT_TXT"
 
-          # הסרת כפילויות (לפעמים יש כפילויות ב-RSS)
+          # הסרת כפילויות
           if [[ -s "$OUT_TXT" ]]; then
             sort -u "$OUT_TXT" -o "$OUT_TXT"
           fi
@@ -189,7 +220,7 @@ jobs:
             COUNT=0
           else
             COUNT=$(wc -l < "$OUT_TXT")
-            echo "✅ Found $COUNT video tweet(s) via RSSHub."
+            echo "✅ Found $COUNT video tweet(s) via RSSHub ($SUCCESS_INSTANCE)."
           fi
 
           # ---- העלאה ל-Drive ----
@@ -249,7 +280,7 @@ jobs:
             BODY="הסריקה הושלמה בהצלחה (דרך RSSHub - ללא התחברות).\n\n"
             BODY+="📁 קובץ: $FILE_NAME\n"
             BODY+="🔗 ציוצי וידאו שנמצאו: ${TWEET_COUNT:-0}\n"
-            BODY+="🛠️ שיטה: RSSHub Public API (ללא Cookies)\n"
+            BODY+="🛠️ שיטה: RSSHub Public API (Multiple Instances Fallback)\n"
             BODY+="📂 תיקייה: ${{ github.event.inputs.folder }}\n"
             BODY+="👤 פרופיל: ${{ github.event.inputs.profile_url }}\n"
             BODY+="📅 טווח: ${{ github.event.inputs.days }} ימים אחורה\n"
@@ -263,8 +294,8 @@ jobs:
             BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
           fi
 
-          BODY+="\n--- Last 50 lines of log ---\n"
-          BODY+=$(tail -50 "$LOG_FILE")
+          BODY+="\n--- Last 60 lines of log ---\n"
+          BODY+=$(tail -60 "$LOG_FILE")
 
           echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
           echo "✅ Email sent to $EMAIL_TO"
