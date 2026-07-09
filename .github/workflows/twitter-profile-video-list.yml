@@ -41,7 +41,7 @@ jobs:
 
     steps:
       # --------------------------------------------------------------
-      # 1️⃣  התקנת תלויות + לוג
+      # 1️⃣  התקנת תלויות + לוג (gallery-dl בינארי רשמי!)
       # --------------------------------------------------------------
       - name: Install dependencies & Init log
         continue-on-error: true
@@ -49,18 +49,27 @@ jobs:
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "=== X/Twitter Profile Video Lister (gallery-dl) ==="
+          echo "=== X/Twitter Profile Video Lister (gallery-dl binary) ==="
           echo "Run ID: ${{ github.run_id }}"
           echo "Profile: ${{ github.event.inputs.profile_url }}"
           echo "Days back: ${{ github.event.inputs.days }}"
           echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-          echo "=================================================="
+          echo "========================================================="
           echo ""
           
-          echo "🔧 [$(date -u +"%H:%M:%S")] Installing gallery-dl, rclone, msmtp..."
+          echo "🔧 [$(date -u +"%H:%M:%S")] Installing gallery-dl (binary), rclone, msmtp..."
+          # rclone
           curl -fsSL https://rclone.org/install.sh | sudo bash
+          # msmtp
           sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta
-          pip install -q -U gallery-dl
+          
+          # gallery-dl: הורדת בינארי רשמי אחרון (כולל --dateafter, --filter video)
+          echo "   Downloading gallery-dl binary..."
+          sudo curl -L "https://github.com/mikf/gallery-dl/releases/latest/download/gallery-dl" -o /usr/local/bin/gallery-dl
+          sudo chmod +x /usr/local/bin/gallery-dl
+          # בדיקה
+          gallery-dl --version
+          
           echo "✅ Dependencies installed"
 
       # --------------------------------------------------------------
@@ -86,7 +95,7 @@ jobs:
           echo "✅ rclone configured"
 
       # --------------------------------------------------------------
-      # 3️⃣  שליפת רשימת ציוצים עם gallery-dl + סינון תאריך/וידאו ב-bash
+      # 3️⃣  שליפת רשימת ציוצים עם gallery-dl (בינארי מעודכן)
       # --------------------------------------------------------------
       - name: Generate video links list (gallery-dl)
         continue-on-error: true
@@ -100,17 +109,13 @@ jobs:
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "🚀 [$(date -u +"%H:%M:%S")] Scraping profile with gallery-dl..."
+          echo "🚀 [$(date -u +"%H:%M:%S")] Scraping profile with gallery-dl (binary)..."
           set -e
           set -o pipefail
 
           TMP_DIR=$(mktemp -d)
           COOKIE_FILE=""
           [[ -n "$COOKIES" ]] && { COOKIE_FILE="${TMP_DIR}/cookies.txt"; echo "$COOKIES" > "$COOKIE_FILE"; echo "   Cookies loaded"; }
-
-          # חישוב timestamp cutoff (לפני N ימים)
-          CUTOFF_TS=$(date -u -d "-${DAYS} days" +%s)
-          echo "   Cutoff date: $(date -u -d @${CUTOFF_TS}) (timestamp: ${CUTOFF_TS})"
 
           # קביעת שם קובץ פלט
           if [[ -n "$USER_FILENAME" ]]; then
@@ -124,13 +129,13 @@ jobs:
 
           echo "   Output file: ${OUT_BASE}.txt"
           echo "   Remote path: ${REMOTE_PATH}"
+          echo "   Date filter: now-${DAYS}days"
 
-          # ---- הרצת gallery-dl ----
+          # ---- הרצת gallery-dl (בינארי) ----
           # -q: quiet
-          # -g: print URLs only (tweet URLs)
-          # --dateafter: gallery-dl תומך בפורמט יחסי "now-30days"
-          # --filter "video": רק פריטים עם וידאו (מובנה בגלריה)
-          # --cookies: אם צריך
+          # -g: print URLs only
+          # --dateafter "now-30days": פילטר תאריך יחסי (נתמך בגרסה החדשה)
+          # --filter "video": רק פריטים עם וידאו (מובנה)
           GALLERY_ARGS=(
             -q
             -g
@@ -141,14 +146,11 @@ jobs:
           GALLERY_ARGS+=("$PROFILE_URL")
 
           echo "🔍 [$(date -u +"%H:%M:%S")] Running gallery-dl..."
-          # שומר פלט לקובץ וסופר שורות
           gallery-dl "${GALLERY_ARGS[@]}" | tee "$OUT_TXT" | wc -l | read COUNT
           
-          # אם gallery-dl נכשל (קוד יציאה לא 0) - נופלים
           GALLERY_EXIT=${PIPESTATUS[0]}
           [[ $GALLERY_EXIT -ne 0 ]] && { echo "❌ gallery-dl exit: $GALLERY_EXIT"; exit $GALLERY_EXIT; }
 
-          # בדיקה אם הקובץ ריק (לא נמצאו ציוצים)
           if [[ ! -s "$OUT_TXT" ]]; then
             echo "⚠️ No video tweets found in the last ${DAYS} days."
             echo "# No video tweets found for ${PROFILE_URL} in last ${DAYS} days (as of $(date -u))" > "$OUT_TXT"
@@ -166,7 +168,6 @@ jobs:
           rm -rf "$TMP_DIR"
           echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
 
-          # פלטים לאימייל
           echo "STATUS=success" >> $GITHUB_OUTPUT
           echo "FILE_NAME=${OUT_BASE}.txt" >> $GITHUB_OUTPUT
           echo "TWEET_COUNT=$COUNT" >> $GITHUB_OUTPUT
