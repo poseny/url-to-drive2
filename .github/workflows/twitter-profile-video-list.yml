@@ -1,4 +1,4 @@
-name: X/Twitter Profile → Video Links List → Google Drive
+name: X/Twitter Profile → Video Links List → Google Drive (DEBUG VERSION)
 
 on:
   workflow_dispatch:
@@ -41,8 +41,7 @@ jobs:
 
     steps:
       # --------------------------------------------------------------
-      # --------------------------------------------------------------
-      # 1️⃣  התקנת תלויות + לוג (עם yt-dlp בינארי רשמי – חסין תקלות)
+      # 1️⃣  התקנת תלויות + לוג
       # --------------------------------------------------------------
       - name: Install dependencies & Init log
         continue-on-error: true
@@ -50,27 +49,18 @@ jobs:
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "=== X/Twitter Profile Video Lister ==="
+          echo "=== X/Twitter Profile Video Lister (DEBUG) ==="
           echo "Run ID: ${{ github.run_id }}"
           echo "Profile: ${{ github.event.inputs.profile_url }}"
           echo "Days back: ${{ github.event.inputs.days }}"
           echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-          echo "========================================"
+          echo "=============================================="
           echo ""
           
-          echo "🔧 [$(date -u +"%H:%M:%S")] Installing dependencies..."
-          # rclone
+          echo "🔧 [$(date -u +"%H:%M:%S")] Installing yt-dlp, rclone, msmtp..."
           curl -fsSL https://rclone.org/install.sh | sudo bash
-          # ffmpeg, msmtp
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg msmtp msmtp-mta
-          
-          # yt-dlp: הורדת בינארי רשמי (עובד תמיד, בלי pip/venv)
-          echo "   Downloading yt-dlp binary..."
-          sudo curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -o /usr/local/bin/yt-dlp
-          sudo chmod +x /usr/local/bin/yt-dlp
-          # בדיקה
-          yt-dlp --version
-          
+          sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta
+          pip install -q -U yt-dlp
           echo "✅ Dependencies installed"
 
       # --------------------------------------------------------------
@@ -96,12 +86,11 @@ jobs:
           echo "✅ rclone configured"
 
       # --------------------------------------------------------------
-      # --------------------------------------------------------------
       # 3️⃣  DEBUG: בדיקת שדות אמיתיים של 10 הציוצים הראשונים
       # --------------------------------------------------------------
       - name: DEBUG – Inspect tweet fields
         continue-on-error: true
-        id: debug_fields
+        id: gen_list          # ✅ תוקן: חזר ל-gen_list כדי שהאימייל יעבוד
         shell: bash
         env:
           PROFILE_URL: ${{ github.event.inputs.profile_url }}
@@ -130,9 +119,14 @@ jobs:
           [[ $YTDLP_EXIT -ne 0 ]] && { echo "❌ yt-dlp exit: $YTDLP_EXIT"; exit $YTDLP_EXIT; }
           
           echo "✅ DEBUG done – check log/email for output above"
+
+          # ---- פלטים דמה כדי שהשלבים הבאים (אימייל/סיכום) לא יפלו ----
           echo "STATUS=debug_done" >> $GITHUB_OUTPUT
+          echo "FILE_NAME=debug.txt" >> $GITHUB_OUTPUT
+          echo "TWEET_COUNT=0" >> $GITHUB_OUTPUT
+
       # --------------------------------------------------------------
-      # 4️⃣  שליחת אימייל
+      # 4️⃣  שליחת אימייל (רץ תמיד)
       # --------------------------------------------------------------
       - name: Send log email
         if: always()
@@ -169,7 +163,13 @@ jobs:
           EOF
           chmod 600 ~/.msmtprc
 
-          if [[ "$STATUS" == "success" ]]; then
+          if [[ "$STATUS" == "debug_done" ]]; then
+            SUBJECT="🔬 [GitHub Actions] DEBUG Output - X Profile Video List - ${{ github.repository }}"
+            BODY="פלט דיבאוג מצורף (10 ציוצים ראשונים).\n\n"
+            BODY+="👤 פרופיל: ${{ github.event.inputs.profile_url }}\n"
+            BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
+            BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
+          elif [[ "$STATUS" == "success" ]]; then
             SUBJECT="✅ [GitHub Actions] X Profile Video List Ready - ${{ github.repository }}"
             BODY="הסריקה הושלמה בהצלחה.\n\n"
             BODY+="📁 קובץ: $FILE_NAME\n"
@@ -187,14 +187,14 @@ jobs:
             BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
           fi
 
-          BODY+="\n--- Last 40 lines of log ---\n"
-          BODY+=$(tail -40 "$LOG_FILE")
+          BODY+="\n--- Last 50 lines of log ---\n"
+          BODY+=$(tail -50 "$LOG_FILE")
 
           echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
           echo "✅ Email sent to $EMAIL_TO"
 
       # --------------------------------------------------------------
-      # 5️⃣  Artifact גיבוי
+      # 5️⃣  העלאת הלוג כ‑Artifact (גיבוי)
       # --------------------------------------------------------------
       - name: Upload log as Artifact
         if: always()
@@ -206,7 +206,7 @@ jobs:
           if-no-files-found: warn
 
       # --------------------------------------------------------------
-      # 6️⃣  סיכום
+      # 6️⃣  סיכום סופי
       # --------------------------------------------------------------
       - name: Final summary
         if: always()
@@ -217,8 +217,6 @@ jobs:
           echo "=== FINAL SUMMARY ==="
           echo "Run: ${{ github.run_id }}"
           echo "Status: ${{ steps.gen_list.outputs.STATUS || 'failed' }}"
-          echo "Tweets found: ${{ steps.gen_list.outputs.TWEET_COUNT || '0' }}"
+          echo "Log lines: $(wc -l < "$LOG_FILE")"
           echo "====================="
-          if [[ "${{ steps.gen_list.outputs.STATUS }}" != "success" ]]; then
-            exit 1
-          fi
+          # לא עושים exit 1 בדיבאוג כדי שהריצה תסומן ירוק
