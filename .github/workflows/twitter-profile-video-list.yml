@@ -86,9 +86,10 @@ jobs:
           echo "✅ rclone configured"
 
       # --------------------------------------------------------------
-      # 3️⃣  הפקת רשימת קישורים (הלב)
       # --------------------------------------------------------------
-      - name: Generate video links list
+      # 3️⃣  הפקת רשימת קישורים עם yt-dlp (יציב, מהיר, תומך הכל)
+      # --------------------------------------------------------------
+      - name: Generate video links list (yt-dlp)
         continue-on-error: true
         id: gen_list
         shell: bash
@@ -100,7 +101,7 @@ jobs:
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "🚀 [$(date -u +"%H:%M:%S")] Scanning profile for videos..."
+          echo "🚀 [$(date -u +"%H:%M:%S")] Scanning profile for videos with yt-dlp..."
           set -e
           set -o pipefail
 
@@ -108,15 +109,10 @@ jobs:
           COOKIE_FILE=""
           [[ -n "$COOKIES" ]] && { COOKIE_FILE="${TMP_DIR}/cookies.txt"; echo "$COOKIES" > "$COOKIE_FILE"; echo "   Cookies loaded"; }
 
-          # חישוב תאריך התחלה (ISO 8601) - gallery-dl מקבל 'now-30days' או תאריך מפורש
-          # נשתמש בפורמט היחסי הנוח
-          DATE_FILTER="now-${DAYS}days"
-
           # קביעת שם קובץ פלט
           if [[ -n "$USER_FILENAME" ]]; then
             OUT_BASE="$USER_FILENAME"
           else
-            # חילוץ username מה-URL
             USERNAME=$(echo "$PROFILE_URL" | sed -E 's|.*[/:]([^/?]+)(\?.*)?$|\1|')
             OUT_BASE="${USERNAME}_videos_last_${DAYS}days_$(date -u +%Y%m%d)"
           fi
@@ -124,38 +120,40 @@ jobs:
           REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/${OUT_BASE}.txt"
 
           echo "   Output file: ${OUT_BASE}.txt"
-          echo "   Date filter: ${DATE_FILTER}"
+          echo "   Date filter: now-${DAYS}days"
           echo "   Remote path: ${REMOTE_PATH}"
 
-          # ---- הרצת gallery-dl ----
-          # -q: quiet (רק שגיאות)
-          # --dateafter: רק פריטים חדשים מ-
-          # --filter "video": רק ציוצים שיש בהם וידאו (gallery-dl יודע לזהות לפי extractor)
-          # -g: print URLs only (tweet URLs) to stdout
-          # --cookies: אם צריך
-          # הכיוון: gallery-dl https://x.com/username --dateafter now-30days --filter "video" -g
-          
-          GALLERY_ARGS=(
-            -q
-            --dateafter "$DATE_FILTER"
-            --filter "video"           # מסנן מובנה: רק פריטים עם וידאו
-            -g                         # הדפס רק URLs (של הציוץ עצמו)
+          # ---- בניית ארגומנטים ל-yt-dlp ----
+          # --flat-playlist        : לא להוריד וידאו, רק לחלץ רשומות (מהיר מאוד)
+          # --dateafter now-30d    : רק ציוצים מ-30 יום אחרונים
+          # --match-filter "duration > 0" : רק פריטים שיש להם משך זמן > 0 (וידאו/GIF, לא תמונות/טקסט)
+          # --print-to-file "%(webpage_url)s" FILE : כתוב רק את הקישור לציוץ לקובץ
+          # --sleep-interval 1     : נחמד לשרת
+          YTDLP_ARGS=(
+            --flat-playlist
+            --dateafter "now-${DAYS}days"
+            --match-filter "duration > 0"
+            --print-to-file "%(webpage_url)s" "$OUT_TXT"
+            --sleep-interval 1
+            --max-sleep-interval 3
+            --no-warnings
+            --progress
           )
-          [[ -n "$COOKIE_FILE" ]] && GALLERY_ARGS+=(--cookies "$COOKIE_FILE")
-          GALLERY_ARGS+=("$PROFILE_URL")
+          [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
+          YTDLP_ARGS+=("$PROFILE_URL")
 
-          echo "🔍 [$(date -u +"%H:%M:%S")] Running gallery-dl..."
-          # שומר פלט לקובץ + סופר שורות
-          gallery-dl "${GALLERY_ARGS[@]}" | tee "$OUT_TXT" | wc -l | read COUNT
-          
-          # אם gallery-dl מחזיר קוד שגיאה 0 אבל לא מצא כלום, הקובץ ריק
+          echo "🔍 [$(date -u +"%H:%M:%S")] Running yt-dlp..."
+          yt-dlp "${YTDLP_ARGS[@]}"
+          YTDLP_EXIT=$?
+          [[ $YTDLP_EXIT -ne 0 ]] && { echo "❌ yt-dlp exit: $YTDLP_EXIT"; exit $YTDLP_EXIT; }
+
+          # ---- בדיקת תוצאות ----
           if [[ ! -s "$OUT_TXT" ]]; then
             echo "⚠️ No video tweets found in the last ${DAYS} days."
-            echo "   (Maybe the account posts only images/text, or tweets are older/private)"
-            # יוצרים קובץ ריק עם הודעה כדי שיהיה מה להעלות
             echo "# No video tweets found for ${PROFILE_URL} in last ${DAYS} days (as of $(date -u))" > "$OUT_TXT"
             COUNT=0
           else
+            COUNT=$(wc -l < "$OUT_TXT")
             echo "✅ Found $COUNT video tweet(s)."
           fi
 
