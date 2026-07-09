@@ -1,0 +1,267 @@
+name: X/Twitter Profile → Video Links List → Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile_url:
+        description: "קישור לפרופיל (https://x.com/username או https://twitter.com/username)"
+        required: true
+        default: "https://x.com/YinonMagal"
+      days:
+        description: "כמה ימים אחורה לסרוק (1-365)"
+        required: true
+        default: "30"
+      filename:
+        description: "שם קובץ הפלט (בלי סיומת, ריק = אוטומטי)"
+        required: false
+        default: ""
+      folder:
+        description: "תיקיית יעד ב‑Google Drive"
+        required: true
+        default: "TwitterVideoLists"
+      cookies:
+        description: "Cookies (Netscape) לפרופילים פרטיים/מוגבלים – אופציונלי"
+        required: false
+        default: ""
+
+env:
+  EMAIL_TO: "p0556722432@gmail.com"
+  EMAIL_FROM: "p0556722432@gmail.com"
+  SMTP_SERVER: "smtp.gmail.com"
+  SMTP_PORT: "587"
+  EMAIL_USER: "p0556722432@gmail.com"
+
+jobs:
+  list_videos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      # --------------------------------------------------------------
+      # 1️⃣  התקנת תלויות + לוג
+      # --------------------------------------------------------------
+      - name: Install dependencies & Init log
+        continue-on-error: true
+        shell: bash
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "=== X/Twitter Profile Video Lister ==="
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Profile: ${{ github.event.inputs.profile_url }}"
+          echo "Days back: ${{ github.event.inputs.days }}"
+          echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo "========================================"
+          echo ""
+          
+          echo "🔧 [$(date -u +"%H:%M:%S")] Installing gallery-dl, rclone, msmtp..."
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta
+          pip install -q -U gallery-dl
+          echo "✅ Dependencies installed"
+
+      # --------------------------------------------------------------
+      # 2️⃣  קונפיג rclone
+      # --------------------------------------------------------------
+      - name: Configure rclone
+        continue-on-error: true
+        shell: bash
+        env:
+          RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🔧 [$(date -u +"%H:%M:%S")] Configuring rclone..."
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [gdrive]
+          type = drive
+          scope = drive.file
+          token = $RCLONE_GDRIVE_TOKEN
+          EOF
+          rclone lsd gdrive: | head -5
+          echo "✅ rclone configured"
+
+      # --------------------------------------------------------------
+      # 3️⃣  הפקת רשימת קישורים (הלב)
+      # --------------------------------------------------------------
+      - name: Generate video links list
+        continue-on-error: true
+        id: gen_list
+        shell: bash
+        env:
+          PROFILE_URL: ${{ github.event.inputs.profile_url }}
+          DAYS: ${{ github.event.inputs.days }}
+          USER_FILENAME: ${{ github.event.inputs.filename }}
+          COOKIES: ${{ github.event.inputs.cookies }}
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🚀 [$(date -u +"%H:%M:%S")] Scanning profile for videos..."
+          set -e
+          set -o pipefail
+
+          TMP_DIR=$(mktemp -d)
+          COOKIE_FILE=""
+          [[ -n "$COOKIES" ]] && { COOKIE_FILE="${TMP_DIR}/cookies.txt"; echo "$COOKIES" > "$COOKIE_FILE"; echo "   Cookies loaded"; }
+
+          # חישוב תאריך התחלה (ISO 8601) - gallery-dl מקבל 'now-30days' או תאריך מפורש
+          # נשתמש בפורמט היחסי הנוח
+          DATE_FILTER="now-${DAYS}days"
+
+          # קביעת שם קובץ פלט
+          if [[ -n "$USER_FILENAME" ]]; then
+            OUT_BASE="$USER_FILENAME"
+          else
+            # חילוץ username מה-URL
+            USERNAME=$(echo "$PROFILE_URL" | sed -E 's|.*[/:]([^/?]+)(\?.*)?$|\1|')
+            OUT_BASE="${USERNAME}_videos_last_${DAYS}days_$(date -u +%Y%m%d)"
+          fi
+          OUT_TXT="${TMP_DIR}/${OUT_BASE}.txt"
+          REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/${OUT_BASE}.txt"
+
+          echo "   Output file: ${OUT_BASE}.txt"
+          echo "   Date filter: ${DATE_FILTER}"
+          echo "   Remote path: ${REMOTE_PATH}"
+
+          # ---- הרצת gallery-dl ----
+          # -q: quiet (רק שגיאות)
+          # --dateafter: רק פריטים חדשים מ-
+          # --filter "video": רק ציוצים שיש בהם וידאו (gallery-dl יודע לזהות לפי extractor)
+          # -g: print URLs only (tweet URLs) to stdout
+          # --cookies: אם צריך
+          # הכיוון: gallery-dl https://x.com/username --dateafter now-30days --filter "video" -g
+          
+          GALLERY_ARGS=(
+            -q
+            --dateafter "$DATE_FILTER"
+            --filter "video"           # מסנן מובנה: רק פריטים עם וידאו
+            -g                         # הדפס רק URLs (של הציוץ עצמו)
+          )
+          [[ -n "$COOKIE_FILE" ]] && GALLERY_ARGS+=(--cookies "$COOKIE_FILE")
+          GALLERY_ARGS+=("$PROFILE_URL")
+
+          echo "🔍 [$(date -u +"%H:%M:%S")] Running gallery-dl..."
+          # שומר פלט לקובץ + סופר שורות
+          gallery-dl "${GALLERY_ARGS[@]}" | tee "$OUT_TXT" | wc -l | read COUNT
+          
+          # אם gallery-dl מחזיר קוד שגיאה 0 אבל לא מצא כלום, הקובץ ריק
+          if [[ ! -s "$OUT_TXT" ]]; then
+            echo "⚠️ No video tweets found in the last ${DAYS} days."
+            echo "   (Maybe the account posts only images/text, or tweets are older/private)"
+            # יוצרים קובץ ריק עם הודעה כדי שיהיה מה להעלות
+            echo "# No video tweets found for ${PROFILE_URL} in last ${DAYS} days (as of $(date -u))" > "$OUT_TXT"
+            COUNT=0
+          else
+            echo "✅ Found $COUNT video tweet(s)."
+          fi
+
+          # ---- העלאה ל-Drive ----
+          echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
+          rclone copy "$OUT_TXT" "$REMOTE_PATH" --progress
+          RCLONE_EXIT=$?
+          [[ $RCLONE_EXIT -ne 0 ]] && { echo "❌ rclone exit: $RCLONE_EXIT"; exit $RCLONE_EXIT; }
+
+          rm -rf "$TMP_DIR"
+          echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
+
+          # פלטים לאימייל
+          echo "STATUS=success" >> $GITHUB_OUTPUT
+          echo "FILE_NAME=${OUT_BASE}.txt" >> $GITHUB_OUTPUT
+          echo "TWEET_COUNT=$COUNT" >> $GITHUB_OUTPUT
+          echo "REMOTE_PATH=$REMOTE_PATH" >> $GITHUB_OUTPUT
+
+      # --------------------------------------------------------------
+      # 4️⃣  שליחת אימייל
+      # --------------------------------------------------------------
+      - name: Send log email
+        if: always()
+        shell: bash
+        env:
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          STATUS: ${{ steps.gen_list.outputs.STATUS }}
+          FILE_NAME: ${{ steps.gen_list.outputs.FILE_NAME }}
+          TWEET_COUNT: ${{ steps.gen_list.outputs.TWEET_COUNT }}
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "📧 [$(date -u +"%H:%M:%S")] Preparing email..."
+
+          if [[ -z "$EMAIL_PASSWORD" ]]; then
+            echo "⚠️ EMAIL_PASSWORD secret is EMPTY – skipping email send"
+            exit 0
+          fi
+
+          mkdir -p ~/.msmtp
+          cat > ~/.msmtprc <<EOF
+          defaults
+          auth on
+          tls on
+          tls_trust_file /etc/ssl/certs/ca-certificates.crt
+          logfile ~/.msmtp.log
+          account gmail
+          host $SMTP_SERVER
+          port $SMTP_PORT
+          from $EMAIL_FROM
+          user $EMAIL_USER
+          password $EMAIL_PASSWORD
+          account default : gmail
+          EOF
+          chmod 600 ~/.msmtprc
+
+          if [[ "$STATUS" == "success" ]]; then
+            SUBJECT="✅ [GitHub Actions] X Profile Video List Ready - ${{ github.repository }}"
+            BODY="הסריקה הושלמה בהצלחה.\n\n"
+            BODY+="📁 קובץ: $FILE_NAME\n"
+            BODY+="🔗 ציוצי וידאו שנמצאו: ${TWEET_COUNT:-0}\n"
+            BODY+="📂 תיקייה: ${{ github.event.inputs.folder }}\n"
+            BODY+="👤 פרופיל: ${{ github.event.inputs.profile_url }}\n"
+            BODY+="📅 טווח: ${{ github.event.inputs.days }} ימים אחורה\n"
+            BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
+            BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
+          else
+            SUBJECT="❌ [GitHub Actions] X Profile Video List FAILED - ${{ github.repository }}"
+            BODY="הסריקה נכשלה. מצורף לוג מלא.\n\n"
+            BODY+="👤 פרופיל: ${{ github.event.inputs.profile_url }}\n"
+            BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
+            BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
+          fi
+
+          BODY+="\n--- Last 40 lines of log ---\n"
+          BODY+=$(tail -40 "$LOG_FILE")
+
+          echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
+          echo "✅ Email sent to $EMAIL_TO"
+
+      # --------------------------------------------------------------
+      # 5️⃣  Artifact גיבוי
+      # --------------------------------------------------------------
+      - name: Upload log as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-log-${{ github.run_id }}
+          path: ${{ runner.temp }}/workflow_log.txt
+          retention-days: 7
+          if-no-files-found: warn
+
+      # --------------------------------------------------------------
+      # 6️⃣  סיכום
+      # --------------------------------------------------------------
+      - name: Final summary
+        if: always()
+        shell: bash
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "=== FINAL SUMMARY ==="
+          echo "Run: ${{ github.run_id }}"
+          echo "Status: ${{ steps.gen_list.outputs.STATUS || 'failed' }}"
+          echo "Tweets found: ${{ steps.gen_list.outputs.TWEET_COUNT || '0' }}"
+          echo "====================="
+          if [[ "${{ steps.gen_list.outputs.STATUS }}" != "success" ]]; then
+            exit 1
+          fi
