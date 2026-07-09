@@ -133,14 +133,14 @@ jobs:
           echo "   Date filter: now-${DAYS}days"
           echo "   Remote path: ${REMOTE_PATH}"
 
-          # ---- בניית ארגומנטים ל-yt-dlp ----
-          # --flat-playlist        : לא להוריד וידאו, רק לחלץ רשומות (מהיר מאוד)
-          # --dateafter now-30d    : רק ציוצים מ-30 יום אחרונים
-          # --match-filter "duration > 0" : רק פריטים שיש להם משך זמן > 0 (וידאו/GIF, לא תמונות/טקסט)
-          # --print-to-file "%(webpage_url)s" FILE : כתוב רק את הקישור לציוץ לקובץ
-          # --sleep-interval 1     : נחמד לשרת
+          # ---- בניית ארגומנטים ל-yt-dlp (מתוקן) ----
+          # --skip-download       : לא להוריד קבצי וידאו/אודיו (רק מטא-דאטה)
+          # --dateafter now-30d   : רק ציוצים מ-30 יום אחרונים
+          # --match-filter "duration > 0" : רק פריטים עם משך זמן > 0 (וידאו/GIF אמיתיים)
+          # --print-to-file "%(webpage_url)s" FILE : כתוב רק את הקישור לציוץ
+          # --sleep-interval 1    : נחמד לשרת
           YTDLP_ARGS=(
-            --flat-playlist
+            --skip-download
             --dateafter "now-${DAYS}days"
             --match-filter "duration > 0"
             --print-to-file "%(webpage_url)s" "$OUT_TXT"
@@ -151,7 +151,6 @@ jobs:
           )
           [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
           YTDLP_ARGS+=("$PROFILE_URL")
-
           echo "🔍 [$(date -u +"%H:%M:%S")] Running yt-dlp..."
           yt-dlp "${YTDLP_ARGS[@]}"
           YTDLP_EXIT=$?
