@@ -1,4 +1,4 @@
-name: X/Twitter Profile → Video Links List → Google Drive (Dual Strategy)
+name: X/Twitter Profile → Video Links List → Google Drive (RSSHub - No Auth)
 
 on:
   workflow_dispatch:
@@ -19,10 +19,6 @@ on:
         description: "תיקיית יעד ב‑Google Drive"
         required: true
         default: "TwitterVideoLists"
-      cookies_input:
-        description: "Cookies (Netscape) – אופציונלי, עדיף לשים ב-Secret TWITTER_COOKIES"
-        required: false
-        default: ""
 
 env:
   EMAIL_TO: "p0556722432@gmail.com"
@@ -30,18 +26,21 @@ env:
   SMTP_SERVER: "smtp.gmail.com"
   SMTP_PORT: "587"
   EMAIL_USER: "p0556722432@gmail.com"
+  # הגדרות RSSHub
+  RSSHUB_BASE: "https://rsshub.app"
+  USER_AGENT: "Mozilla/5.0 (compatible; GitHub Actions RSSHub Client)"
 
 jobs:
   list_videos:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     permissions:
       contents: read
       actions: read
 
     steps:
       # ==============================================================
-      # 0️⃣  אתחול לוג משותף
+      # 0️⃣  אתחול לוג
       # ==============================================================
       - name: Init log
         shell: bash
@@ -49,7 +48,7 @@ jobs:
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           echo "LOG_FILE=$LOG_FILE" >> $GITHUB_ENV
           {
-            echo "=== X/Twitter Profile Video Lister (Dual Strategy) ==="
+            echo "=== X/Twitter Profile Video Lister (RSSHub) ==="
             echo "Run ID: ${{ github.run_id }}"
             echo "Run Number: ${{ github.run_number }}"
             echo "Repo: ${{ github.repository }}"
@@ -58,14 +57,12 @@ jobs:
             echo "Profile: ${{ github.event.inputs.profile_url }}"
             echo "Days back: ${{ github.event.inputs.days }}"
             echo "Folder: ${{ github.event.inputs.folder }}"
-            echo "Has Cookies Input: ${{ github.event.inputs.cookies_input != '' && 'YES' || 'NO' }}"
-            echo "Has Cookies Secret: ${{ secrets.TWITTER_COOKIES != '' && 'YES' || 'NO' }}"
-            echo "============================================================"
+            echo "=================================================="
             echo ""
           } > "$LOG_FILE"
 
       # ==============================================================
-      # 1️⃣  התקנת תלויות (yt-dlp binary, jq, rclone, msmtp)
+      # 1️⃣  התקנת תלויות (jq, xq, rclone, msmtp)
       # ==============================================================
       - name: Install dependencies
         continue-on-error: true
@@ -78,14 +75,8 @@ jobs:
           # rclone
           curl -fsSL https://rclone.org/install.sh | sudo bash
           
-          # jq, msmtp, ca-certificates
-          sudo apt-get update -qq && sudo apt-get install -y -qq jq msmtp msmtp-mta ca-certificates
-          
-          # yt-dlp binary (official, static)
-          echo "   Downloading yt-dlp binary..."
-          sudo curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -o /usr/local/bin/yt-dlp
-          sudo chmod +x /usr/local/bin/yt-dlp
-          yt-dlp --version
+          # jq, xq (xml->json), msmtp, xmlstarlet (לגיבוי)
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq yq msmtp msmtp-mta xmlstarlet
           
           echo "✅ Dependencies installed"
 
@@ -112,107 +103,11 @@ jobs:
           echo "✅ rclone configured"
 
       # ==============================================================
-      # 3️⃣  אסטרטגיה א׳: yt-dlp עם Cookies (הפתרון המלא)
+      # 3️⃣  שליפת רשימת ציוצי וידאו דרך RSSHub (ללא Cookies!)
       # ==============================================================
-      - name: Strategy A – yt-dlp with Cookies
+      - name: Fetch video tweets via RSSHub
         continue-on-error: true
-        id: strategy_a
-        shell: bash
-        env:
-          PROFILE_URL: ${{ github.event.inputs.profile_url }}
-          DAYS: ${{ github.event.inputs.days }}
-          USER_FILENAME: ${{ github.event.inputs.filename }}
-          COOKIES_SECRET: ${{ secrets.TWITTER_COOKIES }}
-          COOKIES_INPUT: ${{ github.event.inputs.cookies_input }}
-        run: |
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          exec >> "$LOG_FILE" 2>&1
-          echo "🥇 [$(date -u +"%H:%M:%S")] Strategy A: yt-dlp with Cookies..."
-          set -e
-          set -o pipefail
-
-          # קביעת Cookies – סדר עדיפות: Input ידני > Secret
-          COOKIES="${COOKIES_INPUT:-$COOKIES_SECRET}"
-          if [[ -z "$COOKIES" ]]; then
-            echo "⚠️ No cookies provided – skipping Strategy A."
-            echo "SKIPPED=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          TMP_DIR=$(mktemp -d)
-          COOKIE_FILE="${TMP_DIR}/cookies.txt"
-          echo "$COOKIES" > "$COOKIE_FILE"
-          echo "   Cookies loaded ($(wc -l < "$COOKIE_FILE") lines)"
-
-          # המרת x.com → twitter.com עבור extractor
-          TWITTER_URL=$(echo "$PROFILE_URL" | sed 's|https://x\.com|https://twitter.com|')
-          echo "   Using URL: $TWITTER_URL"
-
-          # שם קובץ פלט
-          if [[ -n "$USER_FILENAME" ]]; then
-            OUT_BASE="$USER_FILENAME"
-          else
-            USERNAME=$(echo "$TWITTER_URL" | sed -E 's|.*[/:]([^/?]+)(\?.*)?$|\1|')
-            OUT_BASE="${USERNAME}_videos_last_${DAYS}days_$(date -u +%Y%m%d)"
-          fi
-          OUT_TXT="${TMP_DIR}/${OUT_BASE}.txt"
-          REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/${OUT_BASE}.txt"
-
-          echo "   Output: ${OUT_BASE}.txt"
-          echo "   Date filter: now-${DAYS}days"
-
-          # ---- הרצת yt-dlp ----
-          YTDLP_ARGS=(
-            --skip-download
-            --dateafter "now-${DAYS}days"
-            --match-filter "duration > 0"
-            --print-to-file "%(webpage_url)s" "$OUT_TXT"
-            --sleep-interval 1
-            --max-sleep-interval 3
-            --no-warnings
-            --progress
-            --cookies "$COOKIE_FILE"
-            --extractor-args "twitter:api=syndication"  # לפעמים עוזר לעקוף הגבלות
-          )
-          YTDLP_ARGS+=("$TWITTER_URL")
-
-          echo "🔍 [$(date -u +"%H:%M:%S")] Running yt-dlp..."
-          yt-dlp "${YTDLP_ARGS[@]}"
-          YTDLP_EXIT=$?
-          [[ $YTDLP_EXIT -ne 0 ]] && { echo "❌ yt-dlp exit: $YTDLP_EXIT"; exit $YTDLP_EXIT; }
-
-          if [[ ! -s "$OUT_TXT" ]]; then
-            echo "⚠️ yt-dlp found 0 video tweets."
-            echo "# No video tweets found via yt-dlp (Strategy A) for ${PROFILE_URL} in last ${DAYS} days (as of $(date -u))" > "$OUT_TXT"
-            COUNT=0
-          else
-            COUNT=$(wc -l < "$OUT_TXT")
-            echo "✅ Strategy A found $COUNT video tweet(s)."
-          fi
-
-          # העלאה ל-Drive
-          echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
-          rclone copy "$OUT_TXT" "$REMOTE_PATH" --progress
-          RCLONE_EXIT=$?
-          [[ $RCLONE_EXIT -ne 0 ]] && { echo "❌ rclone exit: $RCLONE_EXIT"; exit $RCLONE_EXIT; }
-
-          rm -rf "$TMP_DIR"
-          echo "✅ [$(date -u +"%H:%M:%S")] Strategy A SUCCESS"
-
-          # פלטים לשלבים הבאים
-          echo "STATUS=success" >> $GITHUB_OUTPUT
-          echo "FILE_NAME=${OUT_BASE}.txt" >> $GITHUB_OUTPUT
-          echo "TWEET_COUNT=$COUNT" >> $GITHUB_OUTPUT
-          echo "REMOTE_PATH=$REMOTE_PATH" >> $GITHUB_OUTPUT
-          echo "STRATEGY=A (yt-dlp + Cookies)" >> $GITHUB_OUTPUT
-
-      # ==============================================================
-      # 4️⃣  אסטרטגיה ב׳: Syndication API (Fallback – ללא Cookies)
-      # ==============================================================
-      - name: Strategy B – Syndication API (Fallback)
-        if: steps.strategy_a.outputs.SKIPPED == 'true' || steps.strategy_a.outputs.STATUS != 'success'
-        continue-on-error: true
-        id: strategy_b
+        id: fetch_rss
         shell: bash
         env:
           PROFILE_URL: ${{ github.event.inputs.profile_url }}
@@ -221,7 +116,7 @@ jobs:
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "🥈 [$(date -u +"%H:%M:%S")] Strategy B: Syndication API (no auth)..."
+          echo "🚀 [$(date -u +"%H:%M:%S")] Fetching via RSSHub..."
           set -e
           set -o pipefail
 
@@ -239,99 +134,89 @@ jobs:
           REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/${OUT_BASE}.txt"
 
           echo "   Username: $USERNAME"
-          echo "   Cutoff TS: $CUTOFF_TS ($(date -u -d @${CUTOFF_TS}))"
+          echo "   Cutoff: $(date -u -d @${CUTOFF_TS}) (TS: $CUTOFF_TS)"
           echo "   Output: ${OUT_BASE}.txt"
 
-          # בקשה ל-API הציבורי
-          RESPONSE=$(curl -sL -H "User-Agent: Mozilla/5.0 (compatible; GitHub Actions)" \
-            "https://cdn.syndication.twimg.com/timeline/profile?screen_name=${USERNAME}&count=50&tweet_mode=extended")
+          # ---- בקשה ל-RSSHub ----
+          # מסלול: /twitter/user/:username
+          RSS_URL="${RSSHUB_BASE}/twitter/user/${USERNAME}"
+          echo "   Requesting: $RSS_URL"
 
-          # בדיקה שקיבלנו JSON מערך
-          if ! echo "$RESPONSE" | jq -e 'type=="array"' >/dev/null 2>&1; then
-            echo "❌ Syndication API failed or blocked:"
-            echo "$RESPONSE" | head -c 500
+          # הורדת ה-RSS (XML) עם timeout ו-retry
+          RSS_XML=$(curl -sL --retry 3 --retry-delay 5 \
+            -H "User-Agent: ${USER_AGENT}" \
+            -H "Accept: application/xml, application/rss+xml" \
+            "$RSS_URL" --max-time 30)
+
+          # בדיקה שקיבלנו XML תקין
+          if ! echo "$RSS_XML" | grep -q "<rss\|<feed"; then
+            echo "❌ RSSHub returned invalid/empty response:"
+            echo "$RSS_XML" | head -c 500
             echo "STATUS=failed" >> $GITHUB_OUTPUT
             rm -rf "$TMP_DIR"
-            exit 0  # לא נכשל את ה-job, רק מדווח
+            exit 0
           fi
 
-          # פילטור: וידאו + תאריך
-          echo "$RESPONSE" | jq -r --argjson cutoff "$CUTOFF_TS" '
-            .[] 
-            | select(.entities.media? // empty | any(.type == "video" or .type == "animated_gif")) 
-            | select((.created_at | sub(" \\+0000$"; "Z") | fromdateiso8601) >= $cutoff)
-            | "https://x.com/\(.user.screen_name)/status/\(.id_str)"
+          # ---- פירסור XML + סינון ----
+          # נשתמש ב-yq (תומך XML) או xmlstarlet
+          # yq v4+ תומך XML ישירות: yq -x '.rss.channel.item[]'
+          # נמיר ל-JSON ונפענח עם jq
+          
+          echo "$RSS_XML" | yq -o=json '.' | jq -r --argjson cutoff "$CUTOFF_TS" '
+            # תומך גם ב-RSS 2.0 (.rss.channel.item) וגם ב-Atom (.feed.entry)
+            ( .rss.channel.item // .feed.entry // [] ) 
+            | .[] 
+            | select(.pubDate or .published) 
+            | .pubDate_str = (.pubDate // .published)
+            | .pubDate_ts = (.pubDate_str | sub("(?<wkday>\\w+), (?<day>\\d+) (?<mon>\\w+) (?<year>\\d+) (?<time>\\d+:\\d+:\\d+) (?<tz>\\S+)"; "\(.day) \(.mon) \(.year) \(.time) \(.tz)") | strptime("%d %b %Y %H:%M:%S %Z") | mktime)
+            | select(.pubDate_ts >= $cutoff)
+            | .link_href = (.link // .link.href // .link["@href"] // "")
+            | .description_text = (.description // .content // .summary // "")
+            | select(.link_href | startswith("https://twitter.com") or startswith("https://x.com"))
+            | select(.description_text | test("video|Video|VIDEO|\\.mp4|\\.m3u8|enclosure.*video"; "i"))
+            | .link_href
+            | sub("https://twitter.com"; "https://x.com")
           ' > "$OUT_TXT"
 
+          # הסרת כפילויות (לפעמים יש כפילויות ב-RSS)
+          if [[ -s "$OUT_TXT" ]]; then
+            sort -u "$OUT_TXT" -o "$OUT_TXT"
+          fi
+
           if [[ ! -s "$OUT_TXT" ]]; then
-            echo "⚠️ Syndication API returned 0 video tweets in range."
-            echo "# No video tweets found via Syndication API (Strategy B) for ${PROFILE_URL} in last ${DAYS} days (as of $(date -u))" > "$OUT_TXT"
+            echo "⚠️ No video tweets found in last ${DAYS} days via RSSHub."
+            echo "# No video tweets found via RSSHub for ${PROFILE_URL} in last ${DAYS} days (as of $(date -u))" > "$OUT_TXT"
             COUNT=0
           else
             COUNT=$(wc -l < "$OUT_TXT")
-            echo "✅ Strategy B found $COUNT video tweet(s)."
+            echo "✅ Found $COUNT video tweet(s) via RSSHub."
           fi
 
-          # העלאה ל-Drive
+          # ---- העלאה ל-Drive ----
           echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
           rclone copy "$OUT_TXT" "$REMOTE_PATH" --progress
           RCLONE_EXIT=$?
           [[ $RCLONE_EXIT -ne 0 ]] && { echo "❌ rclone exit: $RCLONE_EXIT"; exit $RCLONE_EXIT; }
 
           rm -rf "$TMP_DIR"
-          echo "✅ [$(date -u +"%H:%M:%S")] Strategy B SUCCESS"
+          echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
 
           echo "STATUS=success" >> $GITHUB_OUTPUT
           echo "FILE_NAME=${OUT_BASE}.txt" >> $GITHUB_OUTPUT
           echo "TWEET_COUNT=$COUNT" >> $GITHUB_OUTPUT
           echo "REMOTE_PATH=$REMOTE_PATH" >> $GITHUB_OUTPUT
-          echo "STRATEGY=B (Syndication API)" >> $GITHUB_OUTPUT
 
       # ==============================================================
-      # 5️⃣  איחוד תוצאות (לוקח את הראשון שהצליח)
-      # ==============================================================
-      - name: Consolidate results
-        id: result
-        shell: bash
-        run: |
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          exec >> "$LOG_FILE" 2>&1
-          
-          # בדיקה מי הצליח
-          if [[ "${{ steps.strategy_a.outputs.STATUS }}" == "success" ]]; then
-            echo "🏆 Using Strategy A result"
-            echo "STATUS=success" >> $GITHUB_OUTPUT
-            echo "FILE_NAME=${{ steps.strategy_a.outputs.FILE_NAME }}" >> $GITHUB_OUTPUT
-            echo "TWEET_COUNT=${{ steps.strategy_a.outputs.TWEET_COUNT }}" >> $GITHUB_OUTPUT
-            echo "REMOTE_PATH=${{ steps.strategy_a.outputs.REMOTE_PATH }}" >> $GITHUB_OUTPUT
-            echo "STRATEGY=${{ steps.strategy_a.outputs.STRATEGY }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ steps.strategy_b.outputs.STATUS }}" == "success" ]]; then
-            echo "🏆 Using Strategy B result"
-            echo "STATUS=success" >> $GITHUB_OUTPUT
-            echo "FILE_NAME=${{ steps.strategy_b.outputs.FILE_NAME }}" >> $GITHUB_OUTPUT
-            echo "TWEET_COUNT=${{ steps.strategy_b.outputs.TWEET_COUNT }}" >> $GITHUB_OUTPUT
-            echo "REMOTE_PATH=${{ steps.strategy_b.outputs.REMOTE_PATH }}" >> $GITHUB_OUTPUT
-            echo "STRATEGY=${{ steps.strategy_b.outputs.STRATEGY }}" >> $GITHUB_OUTPUT
-          else
-            echo "❌ Both strategies failed"
-            echo "STATUS=failed" >> $GITHUB_OUTPUT
-            echo "FILE_NAME=failed.txt" >> $GITHUB_OUTPUT
-            echo "TWEET_COUNT=0" >> $GITHUB_OUTPUT
-            echo "STRATEGY=none" >> $GITHUB_OUTPUT
-          fi
-
-      # ==============================================================
-      # 6️⃣  שליחת אימייל (רץ תמיד)
+      # 4️⃣  שליחת אימייל
       # ==============================================================
       - name: Send log email
         if: always()
         shell: bash
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          STATUS: ${{ steps.result.outputs.STATUS }}
-          FILE_NAME: ${{ steps.result.outputs.FILE_NAME }}
-          TWEET_COUNT: ${{ steps.result.outputs.TWEET_COUNT }}
-          STRATEGY: ${{ steps.result.outputs.STRATEGY }}
+          STATUS: ${{ steps.fetch_rss.outputs.STATUS }}
+          FILE_NAME: ${{ steps.fetch_rss.outputs.FILE_NAME }}
+          TWEET_COUNT: ${{ steps.fetch_rss.outputs.TWEET_COUNT }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
@@ -361,10 +246,10 @@ jobs:
 
           if [[ "$STATUS" == "success" ]]; then
             SUBJECT="✅ [GitHub Actions] X Profile Video List Ready - ${{ github.repository }}"
-            BODY="הסריקה הושלמה בהצלחה.\n\n"
+            BODY="הסריקה הושלמה בהצלחה (דרך RSSHub - ללא התחברות).\n\n"
             BODY+="📁 קובץ: $FILE_NAME\n"
             BODY+="🔗 ציוצי וידאו שנמצאו: ${TWEET_COUNT:-0}\n"
-            BODY+="🛠️ שיטה: $STRATEGY\n"
+            BODY+="🛠️ שיטה: RSSHub Public API (ללא Cookies)\n"
             BODY+="📂 תיקייה: ${{ github.event.inputs.folder }}\n"
             BODY+="👤 פרופיל: ${{ github.event.inputs.profile_url }}\n"
             BODY+="📅 טווח: ${{ github.event.inputs.days }} ימים אחורה\n"
@@ -372,33 +257,32 @@ jobs:
             BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
           else
             SUBJECT="❌ [GitHub Actions] X Profile Video List FAILED - ${{ github.repository }}"
-            BODY="שתי האסטרטגיות נכשלו. מצורף לוג מלא.\n\n"
+            BODY="הסריקה נכשלה. מצורף לוג מלא.\n\n"
             BODY+="👤 פרופיל: ${{ github.event.inputs.profile_url }}\n"
             BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
             BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
           fi
 
-          BODY+="\n--- Last 60 lines of log ---\n"
-          BODY+=$(tail -60 "$LOG_FILE")
+          BODY+="\n--- Last 50 lines of log ---\n"
+          BODY+=$(tail -50 "$LOG_FILE")
 
           echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
           echo "✅ Email sent to $EMAIL_TO"
 
       # ==============================================================
-      # 7️⃣  העלאת לוג כ-Artifact (גיבוי) – תוקן
+      # 5️⃣  העלאת לוג כ-Artifact
       # ==============================================================
       - name: Upload log as Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: workflow-log-${{ github.run_id }}
-          path: ${{ runner.temp }}/workflow_log.txt   # ✅ תוקן: runner.temp זמין סטטית
+          path: ${{ runner.temp }}/workflow_log.txt
           retention-days: 7
           if-no-files-found: warn
 
-
       # ==============================================================
-      # 8️⃣  סיכום סופי (קובע צבע הריצה)
+      # 6️⃣  סיכום סופי
       # ==============================================================
       - name: Final summary
         if: always()
@@ -408,11 +292,10 @@ jobs:
           exec >> "$LOG_FILE" 2>&1
           echo "=== FINAL SUMMARY ==="
           echo "Run: ${{ github.run_id }}"
-          echo "Status: ${{ steps.result.outputs.STATUS }}"
-          echo "Strategy: ${{ steps.result.outputs.STRATEGY }}"
-          echo "Tweets found: ${{ steps.result.outputs.TWEET_COUNT }}"
+          echo "Status: ${{ steps.fetch_rss.outputs.STATUS || 'failed' }}"
+          echo "Tweets found: ${{ steps.fetch_rss.outputs.TWEET_COUNT || '0' }}"
           echo "Log lines: $(wc -l < "$LOG_FILE")"
           echo "====================="
-          if [[ "${{ steps.result.outputs.STATUS }}" != "success" ]]; then
+          if [[ "${{ steps.fetch_rss.outputs.STATUS }}" != "success" ]]; then
             exit 1
           fi
