@@ -1,0 +1,319 @@
+name: הרבה לינקים X/Twitter Batch → Google Drive (Matrix + Summary Email)
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls_file:
+        description: "נתיב לקובץ עם קישורים (שורה אחת לקישור, ריק = urls.txt ב-root)"
+        required: false
+        default: "urls.txt"
+      folder:
+        description: "תיקיית יעד ב‑Google Drive"
+        required: true
+        default: "TwitterDownloads"
+      cookies:
+        description: "Cookies (Netscape format) – אופציונלי"
+        required: false
+        default: ""
+
+env:
+  EMAIL_TO: "p0556722432@gmail.com"
+  EMAIL_FROM: "p0556722432@gmail.com"
+  SMTP_SERVER: "smtp.gmail.com"
+  SMTP_PORT: "587"
+  EMAIL_USER: "p0556722432@gmail.com"
+
+jobs:
+  # --------------------------------------------------------------
+  # 0️⃣  הכנה: קריאת הקובץ ובניית Matrix
+  # --------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      urls: ${{ steps.read_file.outputs.urls_json }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      
+      - name: Read URLs file
+        id: read_file
+        run: |
+          FILE="${{ github.event.inputs.urls_file }}"
+          if [[ ! -f "$FILE" ]]; then
+            echo "❌ File $FILE not found"
+            echo "urls_json=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          mapfile -t URLS < <(grep -E '^https?://' "$FILE" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+          
+          JSON=$(printf '%s\n' "${URLS[@]}" | jq -R . | jq -s .)
+          echo "urls_json=$JSON" >> $GITHUB_OUTPUT
+          echo "📋 Found ${#URLS[@]} URLs to process"
+
+  # --------------------------------------------------------------
+  # 1️⃣  עיבוד כל קישור (רץ במקביל לפי Matrix)
+  # --------------------------------------------------------------
+  upload:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        url: ${{ fromJson(needs.prepare.outputs.urls) }}
+    # משתנים ייחודיים לכל ריצה
+    env:
+      TWEET_URL: ${{ matrix.url }}
+      FOLDER: ${{ github.event.inputs.folder }}
+      COOKIES: ${{ github.event.inputs.cookies }}
+      RUN_ID: ${{ github.run_id }}
+      MATRIX_INDEX: ${{ strategy.job-index }}
+
+    steps:
+      # --------------------------------------------------------------
+      # 1️⃣  התקנת תלויות + לוג (לכל job בנפרד)
+      # --------------------------------------------------------------
+      - name: Install dependencies & Init log
+        continue-on-error: true
+        shell: bash
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "=== X/Twitter Downloader Log ==="
+          echo "Run ID: $RUN_ID"
+          echo "Matrix Index: $MATRIX_INDEX"
+          echo "URL: $TWEET_URL"
+          echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo "========================================"
+          echo ""
+          
+          echo "🔧 [$(date -u +"%H:%M:%S")] Installing dependencies..."
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg msmtp msmtp-mta
+          pip install -q -U yt-dlp
+          echo "✅ Dependencies installed"
+
+      # --------------------------------------------------------------
+      # 2️⃣  קונפיג rclone
+      # --------------------------------------------------------------
+      - name: Configure rclone
+        continue-on-error: true
+        shell: bash
+        env:
+          RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🔧 [$(date -u +"%H:%M:%S")] Configuring rclone..."
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [gdrive]
+          type = drive
+          scope = drive.file
+          token = $RCLONE_GDRIVE_TOKEN
+          EOF
+          rclone lsd gdrive: | head -5
+          echo "✅ rclone configured"
+
+      # --------------------------------------------------------------
+      # 3️⃣  הורדה → Zip → העלאה (הכל בשלב אחד)
+      # --------------------------------------------------------------
+      - name: Download → Zip → Upload
+        continue-on-error: true
+        id: dl_upload
+        shell: bash
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🚀 [$(date -u +"%H:%M:%S")] Starting download/upload..."
+          set -e
+          set -o pipefail
+
+          TMP_DIR=$(mktemp -d)
+          COOKIE_FILE=""
+
+          echo "   Work dir: $TMP_DIR"
+
+          if [[ -n "$COOKIES" ]]; then
+            COOKIE_FILE="${TMP_DIR}/cookies.txt"
+            echo "$COOKIES" > "$COOKIE_FILE"
+            echo "   Cookies file ready"
+          fi
+
+          # ---- הורדה ----
+          echo "⬇️ [$(date -u +"%H:%M:%S")] Downloading with yt-dlp..."
+          YTDLP_ARGS=(
+            --no-warnings --progress --merge-output-format mp4
+            -o "${TMP_DIR}/%(title)s [%(id)s].%(ext)s"
+            --sleep-interval 3 --max-sleep-interval 8
+            --retries 3 --fragment-retries 3 --extractor-retries 3
+          )
+          [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
+
+          yt-dlp "${YTDLP_ARGS[@]}" "$TWEET_URL"
+          YT_DLP_EXIT=$?
+          [[ $YT_DLP_EXIT -ne 0 ]] && { echo "❌ yt-dlp exit: $YT_DLP_EXIT"; exit $YT_DLP_EXIT; }
+
+          # ---- מציאת קבצים ----
+          echo "🔍 [$(date -u +"%H:%M:%S")] Finding downloaded video files..."
+          mapfile -t VIDEO_FILES < <(find "$TMP_DIR" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | sort)
+          
+          if [[ ${#VIDEO_FILES[@]} -eq 0 ]]; then
+            echo "❌ No video files found"
+            ls -la "$TMP_DIR"
+            exit 1
+          fi
+
+          echo "   Found ${#VIDEO_FILES[@]} video file(s):"
+          for f in "${VIDEO_FILES[@]}"; do
+            echo "     - $(basename "$f") ($(numfmt --to=iec $(stat -c%s "$f")))"
+          done
+
+          # ---- שם ZIP (מבוסס על הקובץ הראשון) ----
+          FIRST_FILE=$(basename "${VIDEO_FILES[0]}")
+          BASE_NAME="${FIRST_FILE%.*}"
+          BASE_NAME="${BASE_NAME:0:180}"
+          ZIP_NAME="${BASE_NAME}.zip"
+          REMOTE_PATH="gdrive:${FOLDER}/${ZIP_NAME}"
+          TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
+
+          echo "   ZIP name: $ZIP_NAME"
+
+          # ---- יצירת ZIP ----
+          echo "🗜️ [$(date -u +"%H:%M:%S")] Creating ZIP..."
+          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "${VIDEO_FILES[@]}")
+          
+          [[ ! -s "$TMP_ZIP" ]] && { echo "❌ Zip failed"; exit 1; }
+          ZIP_SIZE=$(stat -c%s "$TMP_ZIP")
+          echo "   ZIP size: $(numfmt --to=iec $ZIP_SIZE)"
+
+          # ---- מחיקת ישן והעלאה ----
+          if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
+            rclone delete "$REMOTE_PATH"
+          fi
+          
+          echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
+          rclone copy "$TMP_ZIP" "$REMOTE_PATH" --progress
+          RCLONE_EXIT=$?
+          [[ $RCLONE_EXIT -ne 0 ]] && { echo "❌ rclone exit: $RCLONE_EXIT"; exit $RCLONE_EXIT; }
+
+          rm -rf "$TMP_DIR"
+          echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
+
+          # פלטים לסיכום
+          echo "STATUS=success" >> $GITHUB_OUTPUT
+          echo "FILE_NAME=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "FILE_SIZE=$ZIP_SIZE" >> $GITHUB_OUTPUT
+          echo "FILE_COUNT=${#VIDEO_FILES[@]}" >> $GITHUB_OUTPUT
+          echo "TWEET_URL=$TWEET_URL" >> $GITHUB_OUTPUT
+
+      # --------------------------------------------------------------
+      # 4️⃣  העלאת לוג כ-Artifact (לכל job)
+      # --------------------------------------------------------------
+      - name: Upload log as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ strategy.job-index }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/workflow_log.txt
+          retention-days: 7
+          if-no-files-found: warn
+
+  # --------------------------------------------------------------
+  # 5️⃣  סיכום סופי + אימייל אחד (רץ אחרי כל ה-jobs)
+  # --------------------------------------------------------------
+  summary:
+    needs: [prepare, upload]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    steps:
+      - name: Collect results & Send summary email
+        shell: bash
+        env:
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          TOTAL_JOBS: ${{ needs.prepare.outputs.urls }}  # JSON array
+        run: |
+          LOG_FILE="$RUNNER_TEMP/summary_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "=== BATCH SUMMARY ==="
+          echo "Run: ${{ github.run_id }}"
+          echo "Time: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo "Folder: ${{ github.event.inputs.folder }}"
+          echo ""
+
+          # ניתוח תוצאות מה-jobs של upload
+          SUCCESS=0
+          FAILED=0
+          TOTAL_SIZE=0
+          DETAILS=""
+
+          # עובר על כל ה-jobs של upload דרך GitHub API (פשוט יותר: קורא מה-needs)
+          # מכיוון שאין גישה ישירה ל-outputs של matrix jobs ב-needs,
+          # נשתמש ב-gitunescape JSON של ה-URLs ונבנה טבלה ידנית מה-context
+          # בפועל הכי פשוט: נשתמש ב-github context של ה-jobs
+          # אבל GitHub לא חושף את זה בקלות ב-needs.
+          # חלופה: נכתוב קובץ סיכום משותף (artifact) או נשתמש ב-job summary.
+          
+          # כאן נשתמש בגישה פשוטה: נדפיס את ה-matrix המקורי ונסמן הצלחה/כישלון לפי תוצאת ה-job
+          # לצורך המייל – נבנה טקסט מה-JSON של ה-URLs ונבדוק סטטוס כל job מ-needs.upload.result
+          
+          # GitHub Actions לא מאפשר גישה קלה ל-outputs של matrix jobs ב-needs.
+          # הפתרון המעשי: נשתמש ב-job summary של GitHub (שמופיע ב-UI) ונשלח במייל את הלינק לריצה.
+          # וגם נכתוב סיכום לקובץ ונעלה כ-artifact.
+
+          echo "📊 Batch completed for ${{ github.repository }}"
+          echo "🔗 Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo ""
+          echo "URLs processed:"
+          echo "${TOTAL_JOBS}" | jq -r '.[]' | nl -w2 -s'. '
+          
+          # שליחת אימייל סיכום
+          if [[ -n "$EMAIL_PASSWORD" ]]; then
+            mkdir -p ~/.msmtp
+            cat > ~/.msmtprc <<EOF
+            defaults
+            auth on
+            tls on
+            tls_trust_file /etc/ssl/certs/ca-certificates.crt
+            logfile ~/.msmtp.log
+            account gmail
+            host $SMTP_SERVER
+            port $SMTP_PORT
+            from $EMAIL_FROM
+            user $EMAIL_USER
+            password $EMAIL_PASSWORD
+            account default : gmail
+            EOF
+            chmod 600 ~/.msmtprc
+
+            SUBJECT="📦 [Batch] X/Twitter Download Summary - ${{ github.repository }} (Run ${{ github.run_id }})"
+            BATCH_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            BODY="סיכום עיבוד אצווה (Batch) הושלם.\n\n"
+            BODY+="🏃 Run: ${{ github.run_id }}\n"
+            BODY+="📂 תיקייה: ${{ github.event.inputs.folder }}\n"
+            BODY+="🔗 צפייה בפרטים: $BATCH_URL\n\n"
+            BODY+="קישורים שעובדו:\n"
+            BODY+=$(echo "$TOTAL_JOBS" | jq -r '.[]' | nl -w2 -s'. ' | sed 's/^/  /')
+            BODY+="\n\nלפירוט מלא (איזה הצליח/נכשל, לוגים) – כנס ללינק הריצה למעלה."
+
+            echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
+            echo "✅ Summary email sent"
+          else
+            echo "⚠️ No EMAIL_PASSWORD secret – skipping email"
+          fi
+
+      - name: Upload summary log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-summary-${{ github.run_id }}
+          path: ${{ runner.temp }}/summary_log.txt
+          retention-days: 7
