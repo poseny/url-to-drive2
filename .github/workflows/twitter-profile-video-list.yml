@@ -1,85 +1,41 @@
-name: X/Twitter Profile → Video Links List → Google Drive (yt-dlp Only - Final Fixed)
+name: X Profile → Video Links List (TXT to Drive)
 
 on:
   workflow_dispatch:
     inputs:
-      profile_url:
-        description: "קישור לפרופיל (https://x.com/username או https://twitter.com/username)"
+      username:
+        description: "שם המשתמש ב‑X ללא @ (למשל YinonMagal)"
         required: true
-        default: "https://x.com/YinonMagal"
+        default: "YinonMagal"
       days:
-        description: "כמה ימים אחורה לסרוק (1-365)"
+        description: "כמה ימים אחורה לסרוק"
         required: true
         default: "30"
-      filename:
-        description: "שם קובץ הפלט (בלי סיומת, ריק = אוטומטי)"
-        required: false
-        default: ""
       folder:
-        description: "תיקיית יעד ב‑Google Drive"
+        description: "תיקיית יעד ב‑Drive"
         required: true
         default: "TwitterVideoLists"
-      cookies:
-        description: "Cookies (Netscape) לפרופילים פרטיים/מוגבלים – אופציונלי"
-        required: false
-        default: ""
-
-env:
-  EMAIL_TO: "p0556722432@gmail.com"
-  EMAIL_FROM: "p0556722432@gmail.com"
-  SMTP_SERVER: "smtp.gmail.com"
-  SMTP_PORT: "587"
-  EMAIL_USER: "p0556722432@gmail.com"
 
 jobs:
-  list_videos:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      actions: read
-
     steps:
-      # --------------------------------------------------------------
-      # 1️⃣  התקנת תלויות + לוג (yt-dlp בינארי רשמי)
-      # --------------------------------------------------------------
-      - name: Install dependencies & Init log
-        continue-on-error: true
-        shell: bash
+      # ----------------------------------------------------------------
+      # 1️⃣  התקנות (curl/zip/rclone/msmtp כבר במערכת או מותקנים)
+      # ----------------------------------------------------------------
+      - name: Install dependencies
         run: |
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          exec >> "$LOG_FILE" 2>&1
-          echo "=== X/Twitter Profile Video Lister (yt-dlp only) ==="
-          echo "Run ID: ${{ github.run_id }}"
-          echo "Profile: ${{ github.event.inputs.profile_url }}"
-          echo "Days back: ${{ github.event.inputs.days }}"
-          echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-          echo "====================================================="
-          echo ""
-          
-          echo "🔧 [$(date -u +"%H:%M:%S")] Installing yt-dlp (binary), rclone, msmtp..."
-          curl -fsSL https://rclone.org/install.sh | sudo bash
-          sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta
-          
-          echo "   Downloading yt-dlp binary..."
-          sudo curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -o /usr/local/bin/yt-dlp
-          sudo chmod +x /usr/local/bin/yt-dlp
-          yt-dlp --version
-          
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl zip rclone msmtp 2>&1 | tail -1
           echo "✅ Dependencies installed"
 
-      # --------------------------------------------------------------
+      # ----------------------------------------------------------------
       # 2️⃣  קונפיג rclone
-      # --------------------------------------------------------------
-      - name: Configure rclone
-        continue-on-error: true
-        shell: bash
+      # ----------------------------------------------------------------
+      - name: Write rclone config
         env:
           RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
         run: |
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          exec >> "$LOG_FILE" 2>&1
-          echo "🔧 [$(date -u +"%H:%M:%S")] Configuring rclone..."
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf <<EOF
           [gdrive]
@@ -87,181 +43,152 @@ jobs:
           scope = drive.file
           token = $RCLONE_GDRIVE_TOKEN
           EOF
-          rclone lsd gdrive: | head -5
           echo "✅ rclone configured"
 
-      # --------------------------------------------------------------
-      # 3️⃣  שליפת רשימת ציוצי וידאו עם yt-dlp (תיקון URL, בלי --extractor)
-      # --------------------------------------------------------------
-      - name: Generate video links list (yt-dlp)
-        continue-on-error: true
+      # ----------------------------------------------------------------
+      # 3️⃣  סריקת הפרופיל (גישת syndication, ללא חשבון)
+      # ----------------------------------------------------------------
+      - name: Scan profile for video tweets
         id: gen_list
-        shell: bash
         env:
-          PROFILE_URL: ${{ github.event.inputs.profile_url }}
+          USERNAME: ${{ github.event.inputs.username }}
           DAYS: ${{ github.event.inputs.days }}
-          USER_FILENAME: ${{ github.event.inputs.filename }}
-          COOKIES: ${{ github.event.inputs.cookies }}
+          FOLDER: ${{ github.event.inputs.folder }}
         run: |
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          exec >> "$LOG_FILE" 2>&1
-          echo "🚀 [$(date -u +"%H:%M:%S")] Scraping profile with yt-dlp..."
           set -e
-          set -o pipefail
+          LOG=/tmp/scan.log
+          # מקליט את הכל (stdout+stderr) גם לקובץ וגם למסך
+          exec > >(tee -a "$LOG") 2>&1
 
-          TMP_DIR=$(mktemp -d)
-          COOKIE_FILE=""
-          [[ -n "$COOKIES" ]] && { COOKIE_FILE="${TMP_DIR}/cookies.txt"; echo "$COOKIES" > "$COOKIE_FILE"; echo "   Cookies loaded"; }
+          DATE=$(date -u +%Y%m%d)
+          OUT="/tmp/${USERNAME}_videos_last_${DAYS}days_${DATE}.txt"
+          REMOTE="gdrive:${FOLDER}/${USERNAME}_videos_last_${DAYS}days_${DATE}.txt"
+          echo "🚀 Scanning @$USERNAME for last $DAYS days"
+          echo "   OUT=$OUT"
+          echo "   REMOTE=$REMOTE"
 
-          # 🎯 הקסם: המרת x.com → twitter.com (ה-extractor מזהה פרופיל רק כך)
-          TWITTER_URL=$(echo "$PROFILE_URL" | sed 's|https://x\.com|https://twitter.com|')
-          echo "   Original URL: $PROFILE_URL"
-          echo "   Using URL:    $TWITTER_URL"
+          set +e
+          python3 - "$USERNAME" "$DAYS" "$OUT" <<'PY'
+          import json, re, sys, urllib.request, urllib.parse, datetime
 
-          # קביעת שם קובץ פלט
-          if [[ -n "$USER_FILENAME" ]]; then
-            OUT_BASE="$USER_FILENAME"
+          screen, days, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+          cutoff = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - days*86400
+          results = []
+          cursor = None
+          for page in range(12):  # עד 12 עמודים כדי לכסות 30 יום
+              url = ("https://cdn.syndication.twitter.com/timeline/profile.json"
+                     "?screen_name=%s&with_replies=false&limit=100" % screen)
+              if cursor:
+                  url += "&max_position=" + urllib.parse.quote(cursor)
+              req = urllib.request.Request(url, headers={
+                  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+                  "Accept": "application/json, text/javascript, */*; q=0.01",
+                  "X-Requested-With": "XMLHttpRequest",
+                  "Referer": "https://x.com/%s" % screen})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      data = json.load(r)
+              except Exception as e:
+                  print("⚠️ fetch error page %d: %s" % (page, e)); break
+              body = data.get("body", "") or ""
+              if not body.strip():
+                  print("⚠️ empty body (login-wall / blocked by X) – anonymous syndication is blocked"); break
+              matches = list(re.finditer(r'data-tweet-id="(\d+)"', body))
+              positions = [m.start() for m in matches]
+              for i, m in enumerate(matches):
+                  tid = m.group(1)
+                  start = m.start()
+                  end = positions[i+1] if i+1 < len(positions) else len(body)
+                  block = body[start:end]
+                  tm = re.search(r'data-time="(\d+)"', block)
+                  ttime = int(tm.group(1)) if tm else 0
+                  is_video = ("PlayableMedia" in block) or ("<video" in block) \
+                             or ('data-card-type="player"' in block) or ("twitter:video" in block)
+                  if is_video and ttime >= cutoff:
+                      results.append((ttime, tid))
+              cursor = data.get("min_position") or data.get("max_position")
+              if (not cursor) or data.get("has_more_items") is False:
+                  break
+
+          seen = set(); final = []
+          for t, tid in sorted(results):
+              if tid in seen:
+                  continue
+              seen.add(tid)
+              final.append("https://x.com/%s/status/%s" % (screen, tid))
+
+          with open(out, "w", encoding="utf-8") as f:
+              if final:
+                  f.write("# Video tweets from @%s (last %d days)\n" % (screen, days))
+                  f.write("\n".join(final) + "\n")
+              else:
+                  f.write("# No video tweets found for @%s in last %d days\n" % (screen, days))
+
+          print("🔢 Found %d video tweet(s) for @%s" % (len(final), screen))
+          PY
+          RC=$?
+          set -e
+          echo "PY_RC=$RC"
+          if [ "$RC" -ne 0 ]; then
+            echo "status=fail" >> "$GITHUB_OUTPUT"
           else
-            USERNAME=$(echo "$TWITTER_URL" | sed -E 's|.*[/:]([^/?]+)(\?.*)?$|\1|')
-            OUT_BASE="${USERNAME}_videos_last_${DAYS}days_$(date -u +%Y%m%d)"
+            echo "status=ok"   >> "$GITHUB_OUTPUT"
           fi
-          OUT_TXT="${TMP_DIR}/${OUT_BASE}.txt"
-          REMOTE_PATH="gdrive:${{ github.event.inputs.folder }}/${OUT_BASE}.txt"
+          echo "out_path=$OUT"        >> "$GITHUB_OUTPUT"
+          echo "remote_path=$REMOTE"  >> "$GITHUB_OUTPUT"
+          echo "file_name=$(basename "$OUT")" >> "$GITHUB_OUTPUT"
+          echo "tweet_count=$(grep -c '^https://x.com' "$OUT" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
 
-          echo "   Output file: ${OUT_BASE}.txt"
-          echo "   Remote path: ${REMOTE_PATH}"
-          echo "   Date filter: now-${DAYS}days"
-
-          # ---- הרצת yt-dlp (ללא --extractor השגוי) ----
-          YTDLP_ARGS=(
-            --skip-download
-            --dateafter "now-${DAYS}days"
-            --match-filter "duration > 0"
-            --print-to-file "%(webpage_url)s" "$OUT_TXT"
-            --sleep-interval 1
-            --max-sleep-interval 3
-            --no-warnings
-            --progress
-          )
-          [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
-          YTDLP_ARGS+=("$TWITTER_URL")
-
-          echo "🔍 [$(date -u +"%H:%M:%S")] Running yt-dlp..."
-          yt-dlp "${YTDLP_ARGS[@]}"
-          YTDLP_EXIT=$?
-          [[ $YTDLP_EXIT -ne 0 ]] && { echo "❌ yt-dlp exit: $YTDLP_EXIT"; exit $YTDLP_EXIT; }
-
-          if [[ ! -s "$OUT_TXT" ]]; then
-            echo "⚠️ No video tweets found in the last ${DAYS} days."
-            echo "# No video tweets found for ${PROFILE_URL} in last ${DAYS} days (as of $(date -u))" > "$OUT_TXT"
-            COUNT=0
+      # ----------------------------------------------------------------
+      # 4️⃣  העלאת ה‑TXT ל‑Drive (copyto = קובץ בודד לנתיב מדויק)
+      # ----------------------------------------------------------------
+      - name: Upload TXT to Drive
+        if: always()
+        env:
+          OUT: ${{ steps.gen_list.outputs.out_path }}
+          REMOTE: ${{ steps.gen_list.outputs.remote_path }}
+        run: |
+          if [ -f "$OUT" ]; then
+            echo "🚀 Uploading $OUT → $REMOTE"
+            rclone copyto "$OUT" "$REMOTE" --progress && echo "✅ Uploaded" || echo "❌ Upload failed"
           else
-            COUNT=$(wc -l < "$OUT_TXT")
-            echo "✅ Found $COUNT video tweet(s)."
+            echo "⚠️ No output file to upload"
           fi
 
-          # ---- העלאה ל-Drive ----
-          echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
-          rclone copy "$OUT_TXT" "$REMOTE_PATH" --progress
-          RCLONE_EXIT=$?
-          [[ $RCLONE_EXIT -ne 0 ]] && { echo "❌ rclone exit: $RCLONE_EXIT"; exit $RCLONE_EXIT; }
-
-          rm -rf "$TMP_DIR"
-          echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
-
-          echo "STATUS=success" >> $GITHUB_OUTPUT
-          echo "FILE_NAME=${OUT_BASE}.txt" >> $GITHUB_OUTPUT
-          echo "TWEET_COUNT=$COUNT" >> $GITHUB_OUTPUT
-          echo "REMOTE_PATH=$REMOTE_PATH" >> $GITHUB_OUTPUT
-
-      # --------------------------------------------------------------
-      # 4️⃣  שליחת אימייל
-      # --------------------------------------------------------------
+      # ----------------------------------------------------------------
+      # 5️⃣  שליחת הלוג במייל (msmtp + סיסמת אפליקציה)
+      # ----------------------------------------------------------------
       - name: Send log email
         if: always()
-        shell: bash
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          STATUS: ${{ steps.gen_list.outputs.STATUS }}
-          FILE_NAME: ${{ steps.gen_list.outputs.FILE_NAME }}
-          TWEET_COUNT: ${{ steps.gen_list.outputs.TWEET_COUNT }}
+          STATUS: ${{ steps.gen_list.outputs.status }}
+          FILE_NAME: ${{ steps.gen_list.outputs.file_name }}
+          TWEET_COUNT: ${{ steps.gen_list.outputs.tweet_count }}
+          USERNAME: ${{ github.event.inputs.username }}
+          DAYS: ${{ github.event.inputs.days }}
         run: |
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          exec >> "$LOG_FILE" 2>&1
-          echo "📧 [$(date -u +"%H:%M:%S")] Preparing email..."
-
-          if [[ -z "$EMAIL_PASSWORD" ]]; then
-            echo "⚠️ EMAIL_PASSWORD secret is EMPTY – skipping email send"
-            exit 0
-          fi
-
-          mkdir -p ~/.msmtp
           cat > ~/.msmtprc <<EOF
           defaults
           auth on
           tls on
+          tls_starttls on
           tls_trust_file /etc/ssl/certs/ca-certificates.crt
-          logfile ~/.msmtp.log
-          account gmail
-          host $SMTP_SERVER
-          port $SMTP_PORT
-          from $EMAIL_FROM
-          user $EMAIL_USER
+          host smtp.gmail.com
+          port 587
+          user p0556722432@gmail.com
           password $EMAIL_PASSWORD
-          account default : gmail
+          from p0556722432@gmail.com
           EOF
           chmod 600 ~/.msmtprc
-
-          if [[ "$STATUS" == "success" ]]; then
-            SUBJECT="✅ [GitHub Actions] X Profile Video List Ready - ${{ github.repository }}"
-            BODY="הסריקה הושלמה בהצלחה.\n\n"
-            BODY+="📁 קובץ: $FILE_NAME\n"
-            BODY+="🔗 ציוצי וידאו שנמצאו: ${TWEET_COUNT:-0}\n"
-            BODY+="📂 תיקייה: ${{ github.event.inputs.folder }}\n"
-            BODY+="👤 פרופיל: ${{ github.event.inputs.profile_url }}\n"
-            BODY+="📅 טווח: ${{ github.event.inputs.days }} ימים אחורה\n"
-            BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
-            BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
-          else
-            SUBJECT="❌ [GitHub Actions] X Profile Video List FAILED - ${{ github.repository }}"
-            BODY="הסריקה נכשלה. מצורף לוג מלא.\n\n"
-            BODY+="👤 פרופיל: ${{ github.event.inputs.profile_url }}\n"
-            BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
-            BODY+="⏱️ זמן: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
-          fi
-
-          BODY+="\n--- Last 50 lines of log ---\n"
-          BODY+=$(tail -50 "$LOG_FILE")
-
-          echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
-          echo "✅ Email sent to $EMAIL_TO"
-
-      # --------------------------------------------------------------
-      # 5️⃣  העלאת הלוג כ‑Artifact (גיבוי)
-      # --------------------------------------------------------------
-      - name: Upload log as Artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: workflow-log-${{ github.run_id }}
-          path: ${{ runner.temp }}/workflow_log.txt
-          retention-days: 7
-          if-no-files-found: warn
-
-      # --------------------------------------------------------------
-      # 6️⃣  סיכום סופי
-      # --------------------------------------------------------------
-      - name: Final summary
-        if: always()
-        shell: bash
-        run: |
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          exec >> "$LOG_FILE" 2>&1
-          echo "=== FINAL SUMMARY ==="
-          echo "Run: ${{ github.run_id }}"
-          echo "Status: ${{ steps.gen_list.outputs.STATUS || 'failed' }}"
-          echo "Tweets found: ${{ steps.gen_list.outputs.TWEET_COUNT || '0' }}"
-          echo "====================="
-          if [[ "${{ steps.gen_list.outputs.STATUS }}" != "success" ]]; then
-            exit 1
-          fi
+          {
+            echo "Subject: X scan - @$USERNAME ($TWEET_COUNT videos, status=$STATUS)"
+            echo "From: p0556722432@gmail.com"
+            echo "To: p0556722432@gmail.com"
+            echo ""
+            echo "👤 Profile: @$USERNAME | days: $DAYS | found: $TWEET_COUNT | status: $STATUS"
+            echo "📁 File: $FILE_NAME"
+            echo "--- LOG ---"
+            cat /tmp/scan.log
+          } | msmtp p0556722432@gmail.com
+          echo "📧 Email sent"
