@@ -1,4 +1,4 @@
-name: X/Twitter Profile → Video Links List → Google Drive (Final Working Version)
+name: X/Twitter Profile → Video Links List → Google Drive (yt-dlp Only - Robust)
 
 on:
   workflow_dispatch:
@@ -41,7 +41,7 @@ jobs:
 
     steps:
       # --------------------------------------------------------------
-      # 1️⃣  התקנת תלויות + לוג (gallery-dl בינארי רשמי!)
+      # 1️⃣  התקנת תלויות + לוג (רק yt-dlp בינארי – מוכח שעובד)
       # --------------------------------------------------------------
       - name: Install dependencies & Init log
         continue-on-error: true
@@ -49,26 +49,25 @@ jobs:
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "=== X/Twitter Profile Video Lister (gallery-dl binary) ==="
+          echo "=== X/Twitter Profile Video Lister (yt-dlp only) ==="
           echo "Run ID: ${{ github.run_id }}"
           echo "Profile: ${{ github.event.inputs.profile_url }}"
           echo "Days back: ${{ github.event.inputs.days }}"
           echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-          echo "========================================================="
+          echo "====================================================="
           echo ""
           
-          echo "🔧 [$(date -u +"%H:%M:%S")] Installing gallery-dl (binary), rclone, msmtp..."
+          echo "🔧 [$(date -u +"%H:%M:%S")] Installing yt-dlp (binary), rclone, msmtp..."
           # rclone
           curl -fsSL https://rclone.org/install.sh | sudo bash
           # msmtp
           sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta
           
-          # gallery-dl: הורדת בינארי רשמי אחרון (כולל --dateafter, --filter video)
-          echo "   Downloading gallery-dl binary..."
-          sudo curl -L "https://github.com/mikf/gallery-dl/releases/latest/download/gallery-dl" -o /usr/local/bin/gallery-dl
-          sudo chmod +x /usr/local/bin/gallery-dl
-          # בדיקה
-          gallery-dl --version
+          # yt-dlp: בינארי רשמי (כמו שעובד לך בהורדת וידאו)
+          echo "   Downloading yt-dlp binary..."
+          sudo curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -o /usr/local/bin/yt-dlp
+          sudo chmod +x /usr/local/bin/yt-dlp
+          yt-dlp --version
           
           echo "✅ Dependencies installed"
 
@@ -95,9 +94,9 @@ jobs:
           echo "✅ rclone configured"
 
       # --------------------------------------------------------------
-      # 3️⃣  שליפת רשימת ציוצים עם gallery-dl (בינארי מעודכן)
+      # 3️⃣  שליפת רשימת ציוצי וידאו עם yt-dlp (תיקון URL קסום)
       # --------------------------------------------------------------
-      - name: Generate video links list (gallery-dl)
+      - name: Generate video links list (yt-dlp)
         continue-on-error: true
         id: gen_list
         shell: bash
@@ -109,7 +108,7 @@ jobs:
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "🚀 [$(date -u +"%H:%M:%S")] Scraping profile with gallery-dl (binary)..."
+          echo "🚀 [$(date -u +"%H:%M:%S")] Scraping profile with yt-dlp..."
           set -e
           set -o pipefail
 
@@ -117,11 +116,16 @@ jobs:
           COOKIE_FILE=""
           [[ -n "$COOKIES" ]] && { COOKIE_FILE="${TMP_DIR}/cookies.txt"; echo "$COOKIES" > "$COOKIE_FILE"; echo "   Cookies loaded"; }
 
+          # 🎯 הקסם: המרת x.com → twitter.com כדי שה-extractor יזהה פרופיל
+          TWITTER_URL=$(echo "$PROFILE_URL" | sed 's|https://x\.com|https://twitter.com|')
+          echo "   Original URL: $PROFILE_URL"
+          echo "   Using URL:    $TWITTER_URL"
+
           # קביעת שם קובץ פלט
           if [[ -n "$USER_FILENAME" ]]; then
             OUT_BASE="$USER_FILENAME"
           else
-            USERNAME=$(echo "$PROFILE_URL" | sed -E 's|.*[/:]([^/?]+)(\?.*)?$|\1|')
+            USERNAME=$(echo "$TWITTER_URL" | sed -E 's|.*[/:]([^/?]+)(\?.*)?$|\1|')
             OUT_BASE="${USERNAME}_videos_last_${DAYS}days_$(date -u +%Y%m%d)"
           fi
           OUT_TXT="${TMP_DIR}/${OUT_BASE}.txt"
@@ -131,31 +135,38 @@ jobs:
           echo "   Remote path: ${REMOTE_PATH}"
           echo "   Date filter: now-${DAYS}days"
 
-          # ---- הרצת gallery-dl (בינארי) ----
-          # -q: quiet
-          # -g: print URLs only
-          # --dateafter "now-30days": פילטר תאריך יחסי (נתמך בגרסה החדשה)
-          # --filter "video": רק פריטים עם וידאו (מובנה)
-          GALLERY_ARGS=(
-            -q
-            -g
+          # ---- הרצת yt-dlp ----
+          # --skip-download       : לא להוריד וידאו, רק מטא-דאטה
+          # --dateafter now-30d   : רק ציוצים מ-30 יום אחרונים
+          # --match-filter "duration > 0" : רק ציוצים עם וידאו (duration > 0)
+          # --print-to-file "%(webpage_url)s" FILE : כתוב רק URL של הציוץ
+          # --sleep-interval 1    : נחמד לשרת
+          # --extractor twitter:user : כפיית extractor (אופציונלי, בטוח)
+          YTDLP_ARGS=(
+            --skip-download
             --dateafter "now-${DAYS}days"
-            --filter "video"
+            --match-filter "duration > 0"
+            --print-to-file "%(webpage_url)s" "$OUT_TXT"
+            --sleep-interval 1
+            --max-sleep-interval 3
+            --no-warnings
+            --progress
+            --extractor "twitter:user"
           )
-          [[ -n "$COOKIE_FILE" ]] && GALLERY_ARGS+=(--cookies "$COOKIE_FILE")
-          GALLERY_ARGS+=("$PROFILE_URL")
+          [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
+          YTDLP_ARGS+=("$TWITTER_URL")
 
-          echo "🔍 [$(date -u +"%H:%M:%S")] Running gallery-dl..."
-          gallery-dl "${GALLERY_ARGS[@]}" | tee "$OUT_TXT" | wc -l | read COUNT
-          
-          GALLERY_EXIT=${PIPESTATUS[0]}
-          [[ $GALLERY_EXIT -ne 0 ]] && { echo "❌ gallery-dl exit: $GALLERY_EXIT"; exit $GALLERY_EXIT; }
+          echo "🔍 [$(date -u +"%H:%M:%S")] Running yt-dlp..."
+          yt-dlp "${YTDLP_ARGS[@]}"
+          YTDLP_EXIT=$?
+          [[ $YTDLP_EXIT -ne 0 ]] && { echo "❌ yt-dlp exit: $YTDLP_EXIT"; exit $YTDLP_EXIT; }
 
           if [[ ! -s "$OUT_TXT" ]]; then
             echo "⚠️ No video tweets found in the last ${DAYS} days."
             echo "# No video tweets found for ${PROFILE_URL} in last ${DAYS} days (as of $(date -u))" > "$OUT_TXT"
             COUNT=0
           else
+            COUNT=$(wc -l < "$OUT_TXT")
             echo "✅ Found $COUNT video tweet(s)."
           fi
 
