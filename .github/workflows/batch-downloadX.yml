@@ -1,4 +1,4 @@
-name: "הרבהX/Twitter Batch Download → Google Drive (Single Job Loop)"
+name: "X/Twitter Batch Download → Google Drive (Debug + Email Errors)"
 
 on:
   workflow_dispatch:
@@ -12,12 +12,11 @@ on:
         required: true
         default: "TwitterDownloads"
       cookies:
-        description: "Cookies בפורמט Netscape (אופציונלי, לרוב לא נדרש)"
+        description: "Cookies בפורמט Netscape (אופציונלי, חובה מעשי ב-GHA)"
         required: false
         default: ""
 
 env:
-  # הגדרות אימייל (ערכים קבועים — סיסמה ב-Secrets)
   EMAIL_TO: "p0556722432@gmail.com"
   EMAIL_FROM: "p0556722432@gmail.com"
   SMTP_SERVER: "smtp.gmail.com"
@@ -40,19 +39,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify URLs file exists
+      - name: Verify URLs file exists & debug
         id: check_file
         run: |
           FILE="${{ github.event.inputs.urls_file }}"
-          if [[ ! -f "$FILE" ]]; then
-            echo "❌ File '$FILE' not found in repository root."
-            echo "   Please add a file named '$FILE' with one URL per line,"
-            echo "   or change the 'urls_file' input to match your filename."
-            exit 1
+          echo "🔍 Looking for file: $FILE"
+          ls -la "$FILE" 2>/dev/null || echo "❌ NOT FOUND in repo root"
+          if [[ -f "$FILE" ]]; then
+            LINES=$(grep -cE '^https?://' "$FILE" || true)
+            echo "📋 Valid URLs in file: $LINES"
+            echo "lines=$LINES" >> $GITHUB_OUTPUT
+            # הצג 3 ראשונים לדיבאג
+            grep -E '^https?://' "$FILE" | head -3 | sed 's/^/   /'
+          else
+            echo "lines=0" >> $GITHUB_OUTPUT
           fi
-          echo "✅ Found $FILE"
-          LINES=$(grep -cE '^https?://' "$FILE" || true)
-          echo "📋 Valid URLs in file: $LINES"
 
       - name: Upload URLs file as artifact
         id: upload_artifact
@@ -63,13 +64,12 @@ jobs:
           retention-days: 2
 
   # ==============================================================
-  # 1️⃣  עיבוד אצווה יחיד (Batch) — לולאה על כל הלינקים
+  # 1️⃣  עיבוד אצווה יחיד — עם לכידת לוג מלא + שליחת שגיאה למייל
   # ==============================================================
   batch_process:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 1440   # 24 שעות מקסימום
-    # 👇 הצהרת outputs ברמת ה-Job — קריטי כדי ש-final_summary יוכל לקרוא אותם
+    timeout-minutes: 1440
     outputs:
       TOTAL: ${{ steps.batch.outputs.TOTAL }}
       SUCCESS: ${{ steps.batch.outputs.SUCCESS }}
@@ -83,7 +83,6 @@ jobs:
       RUN_ID: ${{ github.run_id }}
 
     steps:
-      # ---- 1. Checkout & Dependencies (פעם אחת!) ----
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -98,7 +97,6 @@ jobs:
           pip install -q -U yt-dlp
           echo "✅ Dependencies ready"
 
-      # ---- 2. Configure rclone ----
       - name: Configure rclone
         shell: bash
         run: |
@@ -113,14 +111,12 @@ jobs:
           rclone lsd gdrive: | head -5
           echo "✅ rclone configured"
 
-      # ---- 3. Download URLs artifact ----
       - name: Download URLs artifact
         uses: actions/download-artifact@v4
         with:
           name: urls-txt
           path: /tmp/urls_input
 
-      # ---- 4. Prepare cookies (אם יש) ----
       - name: Prepare cookies file
         id: cookies
         shell: bash
@@ -131,11 +127,13 @@ jobs:
             echo "🍪 Cookies file written"
           else
             echo "COOKIE_FILE=" >> $GITHUB_OUTPUT
-            echo "🚫 No cookies provided (public mode)"
+            echo "🚫 No cookies provided (public mode — will likely fail on X.com)"
           fi
 
-      # ---- 5. 🚀 הלולאה הראשית ----
-      - name: Process all URLs in loop
+      # ----------------------------------------------------------
+      # 🚀 הלולאה הראשית — עם לוג מלא לקובץ + טיפול בשגיאות
+      # ----------------------------------------------------------
+      - name: Process all URLs in loop (with full logging)
         id: batch
         shell: bash
         run: |
@@ -145,22 +143,36 @@ jobs:
           FOLDER="${FOLDER}"
           COOKIE_FILE="${{ steps.cookies.outputs.COOKIE_FILE }}"
           TMP_ROOT=$(mktemp -d)
+          LOG_FILE="${TMP_ROOT}/batch_full.log"
 
-          echo "📁 Work directory: $TMP_ROOT"
-          echo "📄 Reading URLs from: $URLS_FILE"
+          echo "📁 Work dir: $TMP_ROOT"
+          echo "📄 URLs file: $URLS_FILE"
+          echo "📝 Full log: $LOG_FILE"
+          echo "--- START LOG $(date -u) ---" | tee "$LOG_FILE"
 
-          # קריאת URLs תקינים בלבד
+          # ---- דיבאוג: בדיקת קובץ ה-URLs ----
+          echo "=== DEBUG: URLs file check ===" | tee -a "$LOG_FILE"
+          ls -la "$URLS_FILE" 2>&1 | tee -a "$LOG_FILE"
+          echo "--- First 5 lines ---" | tee -a "$LOG_FILE"
+          head -5 "$URLS_FILE" 2>&1 | tee -a "$LOG_FILE"
+          echo "--- Line count ---" | tee -a "$LOG_FILE"
+          wc -l "$URLS_FILE" 2>&1 | tee -a "$LOG_FILE"
+          echo "=== END DEBUG ===" | tee -a "$LOG_FILE"
+
+          # קריאת URLs תקינים
           mapfile -t URLS < <(grep -E '^https?://' "$URLS_FILE" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
           TOTAL=${#URLS[@]}
-          echo "📋 Total valid URLs to process: $TOTAL"
+          echo "📋 Total valid URLs to process: $TOTAL" | tee -a "$LOG_FILE"
 
           if [[ $TOTAL -eq 0 ]]; then
-            echo "⚠️ No valid URLs found. Exiting."
+            echo "⚠️ No valid URLs found. Exiting." | tee -a "$LOG_FILE"
             echo "TOTAL=0" >> $GITHUB_OUTPUT
             echo "SUCCESS=0" >> $GITHUB_OUTPUT
             echo "SKIPPED=0" >> $GITHUB_OUTPUT
             echo "FAILED=0" >> $GITHUB_OUTPUT
             echo "ZIP_COUNT=0" >> $GITHUB_OUTPUT
+            # שלח את הלוג למייל לפני יציאה
+            echo "LOG_FILE=$LOG_FILE" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -169,8 +181,8 @@ jobs:
           FAILED=0
           ZIP_COUNTER=1
           FILES_IN_CURRENT_ZIP=0
-          MAX_FILES_PER_ZIP=50          # כמה קבצי וידאו בכל ZIP
-          MAX_ZIP_SIZE_MB=1900          # מגבלת גודל ZIP (קצת פחות מ-2GB ליתר ביטחון)
+          MAX_FILES_PER_ZIP=50
+          MAX_ZIP_SIZE_MB=1900
 
           CURRENT_ZIP_DIR=$(mktemp -d -p "$TMP_ROOT")
           CURRENT_ZIP_SIZE=0
@@ -178,15 +190,13 @@ jobs:
           for i in "${!URLS[@]}"; do
             URL="${URLS[i]}"
             IDX=$((i+1))
-            echo ""
-            echo "=========================================="
-            echo "[$IDX/$TOTAL] Processing: $URL"
-            echo "=========================================="
+            echo "" | tee -a "$LOG_FILE"
+            echo "==========================================" | tee -a "$LOG_FILE"
+            echo "[$IDX/$TOTAL] Processing: $URL" | tee -a "$LOG_FILE"
+            echo "==========================================" | tee -a "$LOG_FILE"
 
-            # תיקייה זמנית לציוץ זה
             TWEET_TMP=$(mktemp -d -p "$TMP_ROOT")
 
-            # ארגומנטים ל-yt-dlp
             YTDLP_ARGS=(
               --no-warnings
               --progress
@@ -197,37 +207,34 @@ jobs:
               --retries 3
               --fragment-retries 3
               --extractor-retries 3
-              --ignore-errors          # קריטי: לא נופל על ציוץ בלי וידאו
+              --ignore-errors
               --no-playlist
               --socket-timeout 30
             )
             [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
 
-            # הורדה
-            echo "⬇️  [$(date -u +%H:%M:%S)] Downloading..."
-            if yt-dlp "${YTDLP_ARGS[@]}" "$URL"; then
-              # חיפוש קבצי וידאו שנוצרו
+            echo "⬇️  [$(date -u +%H:%M:%S)] Downloading..." | tee -a "$LOG_FILE"
+            # הרצת yt-dlp עם הפניית stderr ל-log
+            if yt-dlp "${YTDLP_ARGS[@]}" "$URL" >> "$LOG_FILE" 2>&1; then
               mapfile -t VIDEOS < <(find "$TWEET_TMP" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | sort)
 
               if [[ ${#VIDEOS[@]} -eq 0 ]]; then
-                echo "⏭️  No video found (skipped)"
+                echo "⏭️  No video found (skipped)" | tee -a "$LOG_FILE"
                 ((SKIPPED++))
               else
-                echo "✅ Found ${#VIDEOS[@]} video file(s)"
-                # העתקה לתיקיית ה-ZIP הנוכחית + בדיקת גודל
+                echo "✅ Found ${#VIDEOS[@]} video file(s)" | tee -a "$LOG_FILE"
                 for v in "${VIDEOS[@]}"; do
                   FSIZE=$(stat -c%s "$v")
-                  # אם ה-ZIP יחרוג מהמגבלה — סגור אותו ופתח חדש
+                  # בדיקת גודל ZIP נוכחי
                   if (( CURRENT_ZIP_SIZE + FSIZE > MAX_ZIP_SIZE_MB * 1024 * 1024 )) || (( FILES_IN_CURRENT_ZIP >= MAX_FILES_PER_ZIP )); then
                     if (( FILES_IN_CURRENT_ZIP > 0 )); then
                       ZIP_NAME="${FOLDER}_part${ZIP_COUNTER}_$(date -u +%Y%m%d_%H%M%S).zip"
-                      echo "🗜️  Creating ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
-                      (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*)
-                      echo "🚀 Uploading to Drive..."
-                      rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress
+                      echo "🗜️  Creating ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))" | tee -a "$LOG_FILE"
+                      (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*) 2>&1 | tee -a "$LOG_FILE"
+                      echo "🚀 Uploading to Drive..." | tee -a "$LOG_FILE"
+                      rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress 2>&1 | tee -a "$LOG_FILE"
                       ((ZIP_COUNTER++))
                     fi
-                    # איפוס ל-ZIP חדש
                     FILES_IN_CURRENT_ZIP=0
                     CURRENT_ZIP_SIZE=0
                     rm -rf "$CURRENT_ZIP_DIR"
@@ -241,48 +248,50 @@ jobs:
                 ((SUCCESS++))
               fi
             else
-              echo "❌ yt-dlp failed (network/extractor error)"
+              YT_DLP_EXIT=$?
+              echo "❌ yt-dlp failed with exit code $YT_DLP_EXIT" | tee -a "$LOG_FILE"
+              echo "--- Last 30 lines of yt-dlp output ---" | tee -a "$LOG_FILE"
+              tail -30 "$LOG_FILE" | tee -a "$LOG_FILE"
               ((FAILED++))
             fi
 
-            # ניקוי תיקיית הציוץ
             rm -rf "$TWEET_TMP"
-
-            # נחמדות בין בקשות
             sleep 2
           done
 
-          # העלאת ZIP אחרון אם נשארו קבצים
+          # ZIP אחרון
           if (( FILES_IN_CURRENT_ZIP > 0 )); then
             ZIP_NAME="${FOLDER}_part${ZIP_COUNTER}_$(date -u +%Y%m%d_%H%M%S).zip"
-            echo "🗜️  Creating final ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
-            (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*)
-            echo "🚀 Uploading final ZIP..."
-            rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress
+            echo "🗜️  Creating final ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))" | tee -a "$LOG_FILE"
+            (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*) 2>&1 | tee -a "$LOG_FILE"
+            echo "🚀 Uploading final ZIP..." | tee -a "$LOG_FILE"
+            rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress 2>&1 | tee -a "$LOG_FILE"
           fi
 
-          # ניקוי סופי
           rm -rf "$TMP_ROOT"
 
-          # פלט סיכום ל-Job הבא
+          # פלט סיכום
           {
             echo "TOTAL=$TOTAL"
             echo "SUCCESS=$SUCCESS"
             echo "SKIPPED=$SKIPPED"
             echo "FAILED=$FAILED"
             echo "ZIP_COUNT=$ZIP_COUNTER"
+            echo "LOG_FILE=$LOG_FILE"
           } >> $GITHUB_OUTPUT
 
-          echo ""
-          echo "🎉 BATCH COMPLETE"
-          echo "   Total:   $TOTAL"
-          echo "   Success: $SUCCESS (has video)"
-          echo "   Skipped: $SKIPPED (no video)"
-          echo "   Failed:  $FAILED (error)"
-          echo "   ZIPs:    $ZIP_COUNTER uploaded to Drive"
+          echo "" | tee -a "$LOG_FILE"
+          echo "🎉 BATCH COMPLETE" | tee -a "$LOG_FILE"
+          echo "   Total:   $TOTAL" | tee -a "$LOG_FILE"
+          echo "   Success: $SUCCESS" | tee -a "$LOG_FILE"
+          echo "   Skipped: $SKIPPED" | tee -a "$LOG_FILE"
+          echo "   Failed:  $FAILED" | tee -a "$LOG_FILE"
+          echo "   ZIPs:    $ZIP_COUNTER" | tee -a "$LOG_FILE"
 
-      # ---- 6. שליחת אימייל סיכום ----
-      - name: Send summary email
+      # ----------------------------------------------------------
+      # 📧 שליחת אימייל — תמיד רץ, כולל הלוג אם יש שגיאות
+      # ----------------------------------------------------------
+      - name: Send summary email (with error log on failure)
         if: always()
         shell: bash
         env:
@@ -292,6 +301,8 @@ jobs:
           SKIPPED: ${{ steps.batch.outputs.SKIPPED }}
           FAILED: ${{ steps.batch.outputs.FAILED }}
           ZIP_COUNT: ${{ steps.batch.outputs.ZIP_COUNT }}
+          LOG_FILE: ${{ steps.batch.outputs.LOG_FILE }}
+          JOB_STATUS: ${{ job.status }}
         run: |
           if [[ -z "$EMAIL_PASSWORD" ]]; then
             echo "⚠️ EMAIL_PASSWORD secret not set — skipping email"
@@ -319,8 +330,8 @@ jobs:
           chmod 600 ~/.msmtprc
 
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          SUBJECT="📦 [Batch Done] X/Twitter Download - ${{ github.repository }} (Run ${{ github.run_id }})"
-          BODY="סיכום עיבוד אצווה הושלם.\n\n"
+          SUBJECT="📦 [Batch ${JOB_STATUS^^}] X/Twitter Download - ${{ github.repository }} (Run ${{ github.run_id }})"
+          BODY="סיכום עיבוד אצווה הושלם בסטטוס: ${JOB_STATUS}.\n\n"
           BODY+="🏃 Run: ${{ github.run_id }}\n"
           BODY+="📂 תיקייה בדרייב: ${{ github.event.inputs.folder }}\n"
           BODY+="🔗 לינק לריצה: $RUN_URL\n\n"
@@ -331,11 +342,18 @@ jobs:
           BODY+="  • ❌ נכשלו (שגיאה): ${FAILED:-0}\n"
           BODY+="  • 📦 קבצי ZIP שנוצרו: ${ZIP_COUNT:-0}\n"
 
+          # אם יש לוג והיו כשלונות — צרף את ה-50 שורות אחרונות
+          if [[ -n "$LOG_FILE" && -f "$LOG_FILE" && "${FAILED:-0}" -gt 0 ]]; then
+            BODY+="\n🚨 שגיאות (זנב הלוג):\n"
+            TAIL_LOG=$(tail -50 "$LOG_FILE" | sed 's/^/  /')
+            BODY+="$TAIL_LOG\n"
+          fi
+
           echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
           echo "✅ Summary email sent"
 
   # ==============================================================
-  # 2️⃣  Job סיכום סופי (אופציונלי) — רץ אחרי כולם
+  # 2️⃣  Job סיכום סופי (אופציונלי)
   # ==============================================================
   final_summary:
     needs: [prepare, batch_process]
