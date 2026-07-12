@@ -1,4 +1,4 @@
-name: "X/Twitter Batch Download → Google Drive (Debug + Email Errors)"
+name: "X/Twitter Batch Download → Google Drive (Crash-Proof + Full Debug Email)"
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
         required: true
         default: "TwitterDownloads"
       cookies:
-        description: "Cookies בפורמט Netscape (אופציונלי, חובה מעשי ב-GHA)"
+        description: "Cookies בפורמט Netscape (אופציונלי)"
         required: false
         default: ""
 
@@ -22,6 +22,8 @@ env:
   SMTP_SERVER: "smtp.gmail.com"
   SMTP_PORT: "587"
   EMAIL_USER: "p0556722432@gmail.com"
+  # נתיב קבוע ללוג — נגיש מכל סטפ באותו ג'וב
+  BATCH_LOG: "/tmp/batch_full.log"
 
 permissions:
   contents: read
@@ -35,6 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       urls_artifact_name: ${{ steps.upload_artifact.outputs.artifact-name }}
+      url_count: ${{ steps.check_file.outputs.lines }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -43,16 +46,23 @@ jobs:
         id: check_file
         run: |
           FILE="${{ github.event.inputs.urls_file }}"
-          echo "🔍 Looking for file: $FILE"
-          ls -la "$FILE" 2>/dev/null || echo "❌ NOT FOUND in repo root"
+          echo "🔍 [PREPARE] Looking for file: $FILE"
+          echo "🔍 [PREPARE] Repo root contents:"
+          ls -la
+          echo "🔍 [PREPARE] File check:"
           if [[ -f "$FILE" ]]; then
-            LINES=$(grep -cE '^https?://' "$FILE" || true)
-            echo "📋 Valid URLs in file: $LINES"
+            LINES=$(grep -cE '^https?://' "$FILE" 2>/dev/null || echo 0)
+            echo "✅ [PREPARE] Found: $FILE ($LINES valid URLs)"
             echo "lines=$LINES" >> $GITHUB_OUTPUT
-            # הצג 3 ראשונים לדיבאג
+            echo "🔍 [PREPARE] First 3 URLs:"
             grep -E '^https?://' "$FILE" | head -3 | sed 's/^/   /'
+            echo "🔍 [PREPARE] File size: $(wc -c < "$FILE") bytes"
+            echo "🔍 [PREPARE] File hex head:"
+            head -c 200 "$FILE" | xxd | head -5
           else
+            echo "❌ [PREPARE] NOT FOUND: $FILE"
             echo "lines=0" >> $GITHUB_OUTPUT
+            exit 1
           fi
 
       - name: Upload URLs file as artifact
@@ -64,18 +74,18 @@ jobs:
           retention-days: 2
 
   # ==============================================================
-  # 1️⃣  עיבוד אצווה יחיד — עם לכידת לוג מלא + שליחת שגיאה למייל
+  # 1️⃣  עיבוד אצווה יחיד — חסין קריסות, לוג מלא לדיסק, אימייל מובטח
   # ==============================================================
   batch_process:
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 1440
     outputs:
-      TOTAL: ${{ steps.batch.outputs.TOTAL }}
-      SUCCESS: ${{ steps.batch.outputs.SUCCESS }}
-      SKIPPED: ${{ steps.batch.outputs.SKIPPED }}
-      FAILED: ${{ steps.batch.outputs.FAILED }}
-      ZIP_COUNT: ${{ steps.batch.outputs.ZIP_COUNT }}
+      TOTAL: ${{ steps.finalize.outputs.TOTAL }}
+      SUCCESS: ${{ steps.finalize.outputs.SUCCESS }}
+      SKIPPED: ${{ steps.finalize.outputs.SKIPPED }}
+      FAILED: ${{ steps.finalize.outputs.FAILED }}
+      ZIP_COUNT: ${{ steps.finalize.outputs.ZIP_COUNT }}
     env:
       FOLDER: ${{ github.event.inputs.folder }}
       COOKIES: ${{ github.event.inputs.cookies }}
@@ -83,23 +93,38 @@ jobs:
       RUN_ID: ${{ github.run_id }}
 
     steps:
+      # ----------------------------------------------------------
+      # 1. התחלה: הגדרת לוג קבוע + התקנות
+      # ----------------------------------------------------------
+      - name: Checkout & Init persistent log
+        shell: bash
+        run: |
+          # אתחול הלוג הקבוע (ימחק ריצות קודמות אם יש)
+          echo "=== BATCH LOG START $(date -u) ===" > "${BATCH_LOG}"
+          echo "Run ID: ${RUN_ID}" >> "${BATCH_LOG}"
+          echo "Repo: ${{ github.repository }}" >> "${BATCH_LOG}"
+          echo "Folder: ${FOLDER}" >> "${BATCH_LOG}"
+          echo "=====================================" >> "${BATCH_LOG}"
+          echo "✅ Persistent log initialized at ${BATCH_LOG}"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install dependencies
         shell: bash
         run: |
-          echo "🔧 Installing system packages..."
-          curl -fsSL https://rclone.org/install.sh | sudo bash
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg msmtp msmtp-mta zip curl jq
-          echo "🐍 Upgrading yt-dlp..."
-          pip install -q -U yt-dlp
-          echo "✅ Dependencies ready"
+          echo "🔧 Installing system packages..." | tee -a "${BATCH_LOG}"
+          curl -fsSL https://rclone.org/install.sh | sudo bash 2>&1 | tee -a "${BATCH_LOG}"
+          sudo apt-get update -qq 2>&1 | tee -a "${BATCH_LOG}"
+          sudo apt-get install -y -qq ffmpeg msmtp msmtp-mta zip curl jq 2>&1 | tee -a "${BATCH_LOG}"
+          echo "🐍 Upgrading yt-dlp..." | tee -a "${BATCH_LOG}"
+          pip install -q -U yt-dlp 2>&1 | tee -a "${BATCH_LOG}"
+          echo "✅ Dependencies ready" | tee -a "${BATCH_LOG}"
 
       - name: Configure rclone
         shell: bash
         run: |
+          echo "🔧 Configuring rclone..." | tee -a "${BATCH_LOG}"
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf <<EOF
           [gdrive]
@@ -107,9 +132,9 @@ jobs:
           scope = drive.file
           token = $RCLONE_GDRIVE_TOKEN
           EOF
-          echo "🔍 Testing rclone connection..."
-          rclone lsd gdrive: | head -5
-          echo "✅ rclone configured"
+          echo "🔍 Testing rclone connection..." | tee -a "${BATCH_LOG}"
+          rclone lsd gdrive: | head -5 2>&1 | tee -a "${BATCH_LOG}"
+          echo "✅ rclone configured" | tee -a "${BATCH_LOG}"
 
       - name: Download URLs artifact
         uses: actions/download-artifact@v4
@@ -124,55 +149,77 @@ jobs:
           if [[ -n "$COOKIES" ]]; then
             echo "$COOKIES" > /tmp/cookies.txt
             echo "COOKIE_FILE=/tmp/cookies.txt" >> $GITHUB_OUTPUT
-            echo "🍪 Cookies file written"
+            echo "🍪 Cookies file written" | tee -a "${BATCH_LOG}"
           else
             echo "COOKIE_FILE=" >> $GITHUB_OUTPUT
-            echo "🚫 No cookies provided (public mode — will likely fail on X.com)"
+            echo "🚫 No cookies provided (public mode)" | tee -a "${BATCH_LOG}"
           fi
 
       # ----------------------------------------------------------
-      # 🚀 הלולאה הראשית — עם לוג מלא לקובץ + טיפול בשגיאות
+      # 2. 🚀 הלולאה הראשית — עם הגנה מלאה על קריסות
       # ----------------------------------------------------------
-      - name: Process all URLs in loop (with full logging)
-        id: batch
+      - name: Process all URLs in loop (crash-proof)
+        id: batch_loop
         shell: bash
         run: |
-          set -euo pipefail
+          # לא יוצאים על שגיאות — אנחנו מטפלים בהכל ידנית
+          set +e
+          set +o pipefail
 
           URLS_FILE="/tmp/urls_input/${{ github.event.inputs.urls_file }}"
           FOLDER="${FOLDER}"
           COOKIE_FILE="${{ steps.cookies.outputs.COOKIE_FILE }}"
           TMP_ROOT=$(mktemp -d)
-          LOG_FILE="${TMP_ROOT}/batch_full.log"
 
-          echo "📁 Work dir: $TMP_ROOT"
-          echo "📄 URLs file: $URLS_FILE"
-          echo "📝 Full log: $LOG_FILE"
-          echo "--- START LOG $(date -u) ---" | tee "$LOG_FILE"
+          log() { echo "$@" | tee -a "${BATCH_LOG}"; }
 
-          # ---- דיבאוג: בדיקת קובץ ה-URLs ----
-          echo "=== DEBUG: URLs file check ===" | tee -a "$LOG_FILE"
-          ls -la "$URLS_FILE" 2>&1 | tee -a "$LOG_FILE"
-          echo "--- First 5 lines ---" | tee -a "$LOG_FILE"
-          head -5 "$URLS_FILE" 2>&1 | tee -a "$LOG_FILE"
-          echo "--- Line count ---" | tee -a "$LOG_FILE"
-          wc -l "$URLS_FILE" 2>&1 | tee -a "$LOG_FILE"
-          echo "=== END DEBUG ===" | tee -a "$LOG_FILE"
+          log ""
+          log "📁 Work dir: $TMP_ROOT"
+          log "📄 URLs file expected at: $URLS_FILE"
+          log "🍪 Cookie file: ${COOKIE_FILE:-none}"
 
-          # קריאת URLs תקינים
-          mapfile -t URLS < <(grep -E '^https?://' "$URLS_FILE" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+          # ---- דיבאוג אגרסיבי: בדיקת קובץ ה-URLs ----
+          log "=== DEBUG: URLs file check ==="
+          if [[ ! -f "$URLS_FILE" ]]; then
+            log "❌ FILE NOT FOUND at $URLS_FILE"
+            log "🔍 Contents of /tmp/urls_input:"
+            ls -la /tmp/urls_input/ 2>&1 | tee -a "${BATCH_LOG}"
+            log "🔍 Find all files:"
+            find /tmp/urls_input -type f 2>&1 | tee -a "${BATCH_LOG}"
+            echo "TOTAL=0" >> $GITHUB_OUTPUT
+            echo "SUCCESS=0" >> $GITHUB_OUTPUT
+            echo "SKIPPED=0" >> $GITHUB_OUTPUT
+            echo "FAILED=1" >> $GITHUB_OUTPUT
+            echo "ZIP_COUNT=0" >> $GITHUB_OUTPUT
+            exit 0  # לא קריסה — סיום מסודר עם outputs
+          fi
+
+          log "✅ File exists: $(ls -la "$URLS_FILE")"
+          log "🔍 File size: $(wc -c < "$URLS_FILE") bytes"
+          log "🔍 First 500 chars:"
+          head -c 500 "$URLS_FILE" | cat -A 2>&1 | tee -a "${BATCH_LOG}"
+          log "🔍 Line count (wc -l): $(wc -l < "$URLS_FILE")"
+          log "=== END DEBUG ==="
+
+          # קריאה בטוחה של URLs — grep לא מפיל את הסקריפט
+          URLS=()
+          while IFS= read -r line; do
+            # ניקוי
+            line=$(echo "$line" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ ^https?:// ]] && URLS+=("$line")
+          done < "$URLS_FILE"
+
           TOTAL=${#URLS[@]}
-          echo "📋 Total valid URLs to process: $TOTAL" | tee -a "$LOG_FILE"
+          log "📋 Total valid URLs parsed: $TOTAL"
 
           if [[ $TOTAL -eq 0 ]]; then
-            echo "⚠️ No valid URLs found. Exiting." | tee -a "$LOG_FILE"
+            log "⚠️ No valid URLs found after parsing. Check file format."
             echo "TOTAL=0" >> $GITHUB_OUTPUT
             echo "SUCCESS=0" >> $GITHUB_OUTPUT
             echo "SKIPPED=0" >> $GITHUB_OUTPUT
             echo "FAILED=0" >> $GITHUB_OUTPUT
             echo "ZIP_COUNT=0" >> $GITHUB_OUTPUT
-            # שלח את הלוג למייל לפני יציאה
-            echo "LOG_FILE=$LOG_FILE" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -190,10 +237,10 @@ jobs:
           for i in "${!URLS[@]}"; do
             URL="${URLS[i]}"
             IDX=$((i+1))
-            echo "" | tee -a "$LOG_FILE"
-            echo "==========================================" | tee -a "$LOG_FILE"
-            echo "[$IDX/$TOTAL] Processing: $URL" | tee -a "$LOG_FILE"
-            echo "==========================================" | tee -a "$LOG_FILE"
+            log ""
+            log "=========================================="
+            log "[$IDX/$TOTAL] Processing: $URL"
+            log "=========================================="
 
             TWEET_TMP=$(mktemp -d -p "$TMP_ROOT")
 
@@ -213,26 +260,29 @@ jobs:
             )
             [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
 
-            echo "⬇️  [$(date -u +%H:%M:%S)] Downloading..." | tee -a "$LOG_FILE"
-            # הרצת yt-dlp עם הפניית stderr ל-log
-            if yt-dlp "${YTDLP_ARGS[@]}" "$URL" >> "$LOG_FILE" 2>&1; then
-              mapfile -t VIDEOS < <(find "$TWEET_TMP" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | sort)
+            log "⬇️  [$(date -u +%H:%M:%S)] Downloading..."
+            # הרצה עם הפניית פלט ללוג — לא קורס על כישלון
+            yt-dlp "${YTDLP_ARGS[@]}" "$URL" >> "${BATCH_LOG}" 2>&1
+            YT_DLP_EXIT=$?
+
+            if [[ $YT_DLP_EXIT -eq 0 ]]; then
+              mapfile -t VIDEOS < <(find "$TWEET_TMP" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) 2>/dev/null | sort)
 
               if [[ ${#VIDEOS[@]} -eq 0 ]]; then
-                echo "⏭️  No video found (skipped)" | tee -a "$LOG_FILE"
+                log "⏭️  No video found (skipped)"
                 ((SKIPPED++))
               else
-                echo "✅ Found ${#VIDEOS[@]} video file(s)" | tee -a "$LOG_FILE"
+                log "✅ Found ${#VIDEOS[@]} video file(s)"
                 for v in "${VIDEOS[@]}"; do
-                  FSIZE=$(stat -c%s "$v")
-                  # בדיקת גודל ZIP נוכחי
+                  FSIZE=$(stat -c%s "$v" 2>/dev/null || echo 0)
+                  # בדיקת מגבלות ZIP
                   if (( CURRENT_ZIP_SIZE + FSIZE > MAX_ZIP_SIZE_MB * 1024 * 1024 )) || (( FILES_IN_CURRENT_ZIP >= MAX_FILES_PER_ZIP )); then
                     if (( FILES_IN_CURRENT_ZIP > 0 )); then
                       ZIP_NAME="${FOLDER}_part${ZIP_COUNTER}_$(date -u +%Y%m%d_%H%M%S).zip"
-                      echo "🗜️  Creating ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))" | tee -a "$LOG_FILE"
-                      (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*) 2>&1 | tee -a "$LOG_FILE"
-                      echo "🚀 Uploading to Drive..." | tee -a "$LOG_FILE"
-                      rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress 2>&1 | tee -a "$LOG_FILE"
+                      log "🗜️  Creating ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
+                      (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*) 2>&1 | tee -a "${BATCH_LOG}"
+                      log "🚀 Uploading to Drive..."
+                      rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress 2>&1 | tee -a "${BATCH_LOG}"
                       ((ZIP_COUNTER++))
                     fi
                     FILES_IN_CURRENT_ZIP=0
@@ -241,17 +291,16 @@ jobs:
                     CURRENT_ZIP_DIR=$(mktemp -d -p "$TMP_ROOT")
                   fi
 
-                  cp "$v" "$CURRENT_ZIP_DIR/"
+                  cp "$v" "$CURRENT_ZIP_DIR/" 2>&1 | tee -a "${BATCH_LOG}"
                   ((FILES_IN_CURRENT_ZIP++))
                   ((CURRENT_ZIP_SIZE+=FSIZE))
                 done
                 ((SUCCESS++))
               fi
             else
-              YT_DLP_EXIT=$?
-              echo "❌ yt-dlp failed with exit code $YT_DLP_EXIT" | tee -a "$LOG_FILE"
-              echo "--- Last 30 lines of yt-dlp output ---" | tee -a "$LOG_FILE"
-              tail -30 "$LOG_FILE" | tee -a "$LOG_FILE"
+              log "❌ yt-dlp failed with exit code $YT_DLP_EXIT"
+              log "--- Last 20 lines of yt-dlp output ---"
+              tail -20 "${BATCH_LOG}" | tee -a "${BATCH_LOG}"
               ((FAILED++))
             fi
 
@@ -262,46 +311,66 @@ jobs:
           # ZIP אחרון
           if (( FILES_IN_CURRENT_ZIP > 0 )); then
             ZIP_NAME="${FOLDER}_part${ZIP_COUNTER}_$(date -u +%Y%m%d_%H%M%S).zip"
-            echo "🗜️  Creating final ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))" | tee -a "$LOG_FILE"
-            (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*) 2>&1 | tee -a "$LOG_FILE"
-            echo "🚀 Uploading final ZIP..." | tee -a "$LOG_FILE"
-            rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress 2>&1 | tee -a "$LOG_FILE"
+            log "🗜️  Creating final ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
+            (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*) 2>&1 | tee -a "${BATCH_LOG}"
+            log "🚀 Uploading final ZIP..."
+            rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress 2>&1 | tee -a "${BATCH_LOG}"
           fi
 
           rm -rf "$TMP_ROOT"
 
-          # פלט סיכום
+          # כתיבת outputs סופיים
           {
             echo "TOTAL=$TOTAL"
             echo "SUCCESS=$SUCCESS"
             echo "SKIPPED=$SKIPPED"
             echo "FAILED=$FAILED"
             echo "ZIP_COUNT=$ZIP_COUNTER"
-            echo "LOG_FILE=$LOG_FILE"
           } >> $GITHUB_OUTPUT
 
-          echo "" | tee -a "$LOG_FILE"
-          echo "🎉 BATCH COMPLETE" | tee -a "$LOG_FILE"
-          echo "   Total:   $TOTAL" | tee -a "$LOG_FILE"
-          echo "   Success: $SUCCESS" | tee -a "$LOG_FILE"
-          echo "   Skipped: $SKIPPED" | tee -a "$LOG_FILE"
-          echo "   Failed:  $FAILED" | tee -a "$LOG_FILE"
-          echo "   ZIPs:    $ZIP_COUNTER" | tee -a "$LOG_FILE"
+          log ""
+          log "🎉 BATCH COMPLETE"
+          log "   Total:   $TOTAL"
+          log "   Success: $SUCCESS"
+          log "   Skipped: $SKIPPED"
+          log "   Failed:  $FAILED"
+          log "   ZIPs:    $ZIP_COUNTER"
 
       # ----------------------------------------------------------
-      # 📧 שליחת אימייל — תמיד רץ, כולל הלוג אם יש שגיאות
+      # 3. שלב סיום: רק מעביר outputs (רץ תמיד)
       # ----------------------------------------------------------
-      - name: Send summary email (with error log on failure)
+      - name: Finalize outputs
+        id: finalize
+        if: always()
+        shell: bash
+        run: |
+          # מעתיק מה-step הקודם אם קיים, אחרת ברירות מחדל
+          TOTAL="${{ steps.batch_loop.outputs.TOTAL }}"
+          SUCCESS="${{ steps.batch_loop.outputs.SUCCESS }}"
+          SKIPPED="${{ steps.batch_loop.outputs.SKIPPED }}"
+          FAILED="${{ steps.batch_loop.outputs.FAILED }}"
+          ZIP_COUNT="${{ steps.batch_loop.outputs.ZIP_COUNT }}"
+          
+          # ברירות מחדל אם לא הוגדרו (למשל אם הסטפ הקודם דילג על כתיבה)
+          echo "TOTAL=${TOTAL:-0}" >> $GITHUB_OUTPUT
+          echo "SUCCESS=${SUCCESS:-0}" >> $GITHUB_OUTPUT
+          echo "SKIPPED=${SKIPPED:-0}" >> $GITHUB_OUTPUT
+          echo "FAILED=${FAILED:-0}" >> $GITHUB_OUTPUT
+          echo "ZIP_COUNT=${ZIP_COUNT:-0}" >> $GITHUB_OUTPUT
+
+      # ----------------------------------------------------------
+      # 4. 📧 שליחת אימייל — קורא את הלוג ישירות מהדיסק (/tmp/batch_full.log)
+      # ----------------------------------------------------------
+      - name: Send summary email (reads log from disk)
         if: always()
         shell: bash
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          TOTAL: ${{ steps.batch.outputs.TOTAL }}
-          SUCCESS: ${{ steps.batch.outputs.SUCCESS }}
-          SKIPPED: ${{ steps.batch.outputs.SKIPPED }}
-          FAILED: ${{ steps.batch.outputs.FAILED }}
-          ZIP_COUNT: ${{ steps.batch.outputs.ZIP_COUNT }}
-          LOG_FILE: ${{ steps.batch.outputs.LOG_FILE }}
+          TOTAL: ${{ steps.finalize.outputs.TOTAL }}
+          SUCCESS: ${{ steps.finalize.outputs.SUCCESS }}
+          SKIPPED: ${{ steps.finalize.outputs.SKIPPED }}
+          FAILED: ${{ steps.finalize.outputs.FAILED }}
+          ZIP_COUNT: ${{ steps.finalize.outputs.ZIP_COUNT }}
           JOB_STATUS: ${{ job.status }}
         run: |
           if [[ -z "$EMAIL_PASSWORD" ]]; then
@@ -309,8 +378,8 @@ jobs:
             exit 0
           fi
 
-          echo "📧 Preparing email..."
-          sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta
+          echo "📧 Preparing email..." | tee -a "${BATCH_LOG}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta 2>&1 | tee -a "${BATCH_LOG}"
 
           mkdir -p ~/.msmtp
           cat > ~/.msmtprc <<EOF
@@ -342,15 +411,17 @@ jobs:
           BODY+="  • ❌ נכשלו (שגיאה): ${FAILED:-0}\n"
           BODY+="  • 📦 קבצי ZIP שנוצרו: ${ZIP_COUNT:-0}\n"
 
-          # אם יש לוג והיו כשלונות — צרף את ה-50 שורות אחרונות
-          if [[ -n "$LOG_FILE" && -f "$LOG_FILE" && "${FAILED:-0}" -gt 0 ]]; then
-            BODY+="\n🚨 שגיאות (זנב הלוג):\n"
-            TAIL_LOG=$(tail -50 "$LOG_FILE" | sed 's/^/  /')
+          # צירוף זנב הלוג המלא (תמיד קיים ב-/tmp/batch_full.log)
+          if [[ -f "${BATCH_LOG}" ]]; then
+            BODY+="\n📋 זנב הלוג המלא (50 שורות אחרונות):\n"
+            TAIL_LOG=$(tail -50 "${BATCH_LOG}" 2>/dev/null | sed 's/^/  /')
             BODY+="$TAIL_LOG\n"
+          else
+            BODY+="\n⚠️ קובץ הלוג לא נמצא בנתיב הצפוי.\n"
           fi
 
-          echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
-          echo "✅ Summary email sent"
+          echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO" 2>&1 | tee -a "${BATCH_LOG}"
+          echo "✅ Summary email sent" | tee -a "${BATCH_LOG}"
 
   # ==============================================================
   # 2️⃣  Job סיכום סופי (אופציונלי)
