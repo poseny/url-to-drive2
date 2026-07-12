@@ -1,0 +1,357 @@
+name: "הרבהX/Twitter Batch Download → Google Drive (Single Job Loop)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls_file:
+        description: "שם הקובץ בריפו שמכיל את הלינקים (ברירת מחדל: urls.txt)"
+        required: false
+        default: "urls.txt"
+      folder:
+        description: "שם תיקיית יעד ב-Google Drive"
+        required: true
+        default: "TwitterDownloads"
+      cookies:
+        description: "Cookies בפורמט Netscape (אופציונלי, לרוב לא נדרש)"
+        required: false
+        default: ""
+
+env:
+  # הגדרות אימייל (ערכים קבועים — סיסמה ב-Secrets)
+  EMAIL_TO: "p0556722432@gmail.com"
+  EMAIL_FROM: "p0556722432@gmail.com"
+  SMTP_SERVER: "smtp.gmail.com"
+  SMTP_PORT: "587"
+  EMAIL_USER: "p0556722432@gmail.com"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  # ==============================================================
+  # 0️⃣  הכנה: מאתר את קובץ ה-URLs ומעביר אותו כ-artifact
+  # ==============================================================
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      urls_artifact_name: ${{ steps.upload_artifact.outputs.artifact-name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify URLs file exists
+        id: check_file
+        run: |
+          FILE="${{ github.event.inputs.urls_file }}"
+          if [[ ! -f "$FILE" ]]; then
+            echo "❌ File '$FILE' not found in repository root."
+            echo "   Please add a file named '$FILE' with one URL per line,"
+            echo "   or change the 'urls_file' input to match your filename."
+            exit 1
+          fi
+          echo "✅ Found $FILE"
+          LINES=$(grep -cE '^https?://' "$FILE" || true)
+          echo "📋 Valid URLs in file: $LINES"
+
+      - name: Upload URLs file as artifact
+        id: upload_artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: urls-txt
+          path: ${{ github.event.inputs.urls_file }}
+          retention-days: 2
+
+  # ==============================================================
+  # 1️⃣  עיבוד אצווה יחיד (Batch) — לולאה על כל הלינקים
+  # ==============================================================
+  batch_process:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440   # 24 שעות מקסימום
+    # 👇 הצהרת outputs ברמת ה-Job — קריטי כדי ש-final_summary יוכל לקרוא אותם
+    outputs:
+      TOTAL: ${{ steps.batch.outputs.TOTAL }}
+      SUCCESS: ${{ steps.batch.outputs.SUCCESS }}
+      SKIPPED: ${{ steps.batch.outputs.SKIPPED }}
+      FAILED: ${{ steps.batch.outputs.FAILED }}
+      ZIP_COUNT: ${{ steps.batch.outputs.ZIP_COUNT }}
+    env:
+      FOLDER: ${{ github.event.inputs.folder }}
+      COOKIES: ${{ github.event.inputs.cookies }}
+      RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
+      RUN_ID: ${{ github.run_id }}
+
+    steps:
+      # ---- 1. Checkout & Dependencies (פעם אחת!) ----
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          echo "🔧 Installing system packages..."
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg msmtp msmtp-mta zip curl jq
+          echo "🐍 Upgrading yt-dlp..."
+          pip install -q -U yt-dlp
+          echo "✅ Dependencies ready"
+
+      # ---- 2. Configure rclone ----
+      - name: Configure rclone
+        shell: bash
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [gdrive]
+          type = drive
+          scope = drive.file
+          token = $RCLONE_GDRIVE_TOKEN
+          EOF
+          echo "🔍 Testing rclone connection..."
+          rclone lsd gdrive: | head -5
+          echo "✅ rclone configured"
+
+      # ---- 3. Download URLs artifact ----
+      - name: Download URLs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: urls-txt
+          path: /tmp/urls_input
+
+      # ---- 4. Prepare cookies (אם יש) ----
+      - name: Prepare cookies file
+        id: cookies
+        shell: bash
+        run: |
+          if [[ -n "$COOKIES" ]]; then
+            echo "$COOKIES" > /tmp/cookies.txt
+            echo "COOKIE_FILE=/tmp/cookies.txt" >> $GITHUB_OUTPUT
+            echo "🍪 Cookies file written"
+          else
+            echo "COOKIE_FILE=" >> $GITHUB_OUTPUT
+            echo "🚫 No cookies provided (public mode)"
+          fi
+
+      # ---- 5. 🚀 הלולאה הראשית ----
+      - name: Process all URLs in loop
+        id: batch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URLS_FILE="/tmp/urls_input/${{ github.event.inputs.urls_file }}"
+          FOLDER="${FOLDER}"
+          COOKIE_FILE="${{ steps.cookies.outputs.COOKIE_FILE }}"
+          TMP_ROOT=$(mktemp -d)
+
+          echo "📁 Work directory: $TMP_ROOT"
+          echo "📄 Reading URLs from: $URLS_FILE"
+
+          # קריאת URLs תקינים בלבד
+          mapfile -t URLS < <(grep -E '^https?://' "$URLS_FILE" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+          TOTAL=${#URLS[@]}
+          echo "📋 Total valid URLs to process: $TOTAL"
+
+          if [[ $TOTAL -eq 0 ]]; then
+            echo "⚠️ No valid URLs found. Exiting."
+            echo "TOTAL=0" >> $GITHUB_OUTPUT
+            echo "SUCCESS=0" >> $GITHUB_OUTPUT
+            echo "SKIPPED=0" >> $GITHUB_OUTPUT
+            echo "FAILED=0" >> $GITHUB_OUTPUT
+            echo "ZIP_COUNT=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          SUCCESS=0
+          SKIPPED=0
+          FAILED=0
+          ZIP_COUNTER=1
+          FILES_IN_CURRENT_ZIP=0
+          MAX_FILES_PER_ZIP=50          # כמה קבצי וידאו בכל ZIP
+          MAX_ZIP_SIZE_MB=1900          # מגבלת גודל ZIP (קצת פחות מ-2GB ליתר ביטחון)
+
+          CURRENT_ZIP_DIR=$(mktemp -d -p "$TMP_ROOT")
+          CURRENT_ZIP_SIZE=0
+
+          for i in "${!URLS[@]}"; do
+            URL="${URLS[i]}"
+            IDX=$((i+1))
+            echo ""
+            echo "=========================================="
+            echo "[$IDX/$TOTAL] Processing: $URL"
+            echo "=========================================="
+
+            # תיקייה זמנית לציוץ זה
+            TWEET_TMP=$(mktemp -d -p "$TMP_ROOT")
+
+            # ארגומנטים ל-yt-dlp
+            YTDLP_ARGS=(
+              --no-warnings
+              --progress
+              --merge-output-format mp4
+              -o "${TWEET_TMP}/%(title)s [%(id)s].%(ext)s"
+              --sleep-interval 3
+              --max-sleep-interval 8
+              --retries 3
+              --fragment-retries 3
+              --extractor-retries 3
+              --ignore-errors          # קריטי: לא נופל על ציוץ בלי וידאו
+              --no-playlist
+              --socket-timeout 30
+            )
+            [[ -n "$COOKIE_FILE" ]] && YTDLP_ARGS+=(--cookies "$COOKIE_FILE")
+
+            # הורדה
+            echo "⬇️  [$(date -u +%H:%M:%S)] Downloading..."
+            if yt-dlp "${YTDLP_ARGS[@]}" "$URL"; then
+              # חיפוש קבצי וידאו שנוצרו
+              mapfile -t VIDEOS < <(find "$TWEET_TMP" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | sort)
+
+              if [[ ${#VIDEOS[@]} -eq 0 ]]; then
+                echo "⏭️  No video found (skipped)"
+                ((SKIPPED++))
+              else
+                echo "✅ Found ${#VIDEOS[@]} video file(s)"
+                # העתקה לתיקיית ה-ZIP הנוכחית + בדיקת גודל
+                for v in "${VIDEOS[@]}"; do
+                  FSIZE=$(stat -c%s "$v")
+                  # אם ה-ZIP יחרוג מהמגבלה — סגור אותו ופתח חדש
+                  if (( CURRENT_ZIP_SIZE + FSIZE > MAX_ZIP_SIZE_MB * 1024 * 1024 )) || (( FILES_IN_CURRENT_ZIP >= MAX_FILES_PER_ZIP )); then
+                    if (( FILES_IN_CURRENT_ZIP > 0 )); then
+                      ZIP_NAME="${FOLDER}_part${ZIP_COUNTER}_$(date -u +%Y%m%d_%H%M%S).zip"
+                      echo "🗜️  Creating ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
+                      (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*)
+                      echo "🚀 Uploading to Drive..."
+                      rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress
+                      ((ZIP_COUNTER++))
+                    fi
+                    # איפוס ל-ZIP חדש
+                    FILES_IN_CURRENT_ZIP=0
+                    CURRENT_ZIP_SIZE=0
+                    rm -rf "$CURRENT_ZIP_DIR"
+                    CURRENT_ZIP_DIR=$(mktemp -d -p "$TMP_ROOT")
+                  fi
+
+                  cp "$v" "$CURRENT_ZIP_DIR/"
+                  ((FILES_IN_CURRENT_ZIP++))
+                  ((CURRENT_ZIP_SIZE+=FSIZE))
+                done
+                ((SUCCESS++))
+              fi
+            else
+              echo "❌ yt-dlp failed (network/extractor error)"
+              ((FAILED++))
+            fi
+
+            # ניקוי תיקיית הציוץ
+            rm -rf "$TWEET_TMP"
+
+            # נחמדות בין בקשות
+            sleep 2
+          done
+
+          # העלאת ZIP אחרון אם נשארו קבצים
+          if (( FILES_IN_CURRENT_ZIP > 0 )); then
+            ZIP_NAME="${FOLDER}_part${ZIP_COUNTER}_$(date -u +%Y%m%d_%H%M%S).zip"
+            echo "🗜️  Creating final ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
+            (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*)
+            echo "🚀 Uploading final ZIP..."
+            rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress
+          fi
+
+          # ניקוי סופי
+          rm -rf "$TMP_ROOT"
+
+          # פלט סיכום ל-Job הבא
+          {
+            echo "TOTAL=$TOTAL"
+            echo "SUCCESS=$SUCCESS"
+            echo "SKIPPED=$SKIPPED"
+            echo "FAILED=$FAILED"
+            echo "ZIP_COUNT=$ZIP_COUNTER"
+          } >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "🎉 BATCH COMPLETE"
+          echo "   Total:   $TOTAL"
+          echo "   Success: $SUCCESS (has video)"
+          echo "   Skipped: $SKIPPED (no video)"
+          echo "   Failed:  $FAILED (error)"
+          echo "   ZIPs:    $ZIP_COUNTER uploaded to Drive"
+
+      # ---- 6. שליחת אימייל סיכום ----
+      - name: Send summary email
+        if: always()
+        shell: bash
+        env:
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          TOTAL: ${{ steps.batch.outputs.TOTAL }}
+          SUCCESS: ${{ steps.batch.outputs.SUCCESS }}
+          SKIPPED: ${{ steps.batch.outputs.SKIPPED }}
+          FAILED: ${{ steps.batch.outputs.FAILED }}
+          ZIP_COUNT: ${{ steps.batch.outputs.ZIP_COUNT }}
+        run: |
+          if [[ -z "$EMAIL_PASSWORD" ]]; then
+            echo "⚠️ EMAIL_PASSWORD secret not set — skipping email"
+            exit 0
+          fi
+
+          echo "📧 Preparing email..."
+          sudo apt-get update -qq && sudo apt-get install -y -qq msmtp msmtp-mta
+
+          mkdir -p ~/.msmtp
+          cat > ~/.msmtprc <<EOF
+          defaults
+          auth on
+          tls on
+          tls_trust_file /etc/ssl/certs/ca-certificates.crt
+          logfile ~/.msmtp.log
+          account gmail
+          host $SMTP_SERVER
+          port $SMTP_PORT
+          from $EMAIL_FROM
+          user $EMAIL_USER
+          password $EMAIL_PASSWORD
+          account default : gmail
+          EOF
+          chmod 600 ~/.msmtprc
+
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SUBJECT="📦 [Batch Done] X/Twitter Download - ${{ github.repository }} (Run ${{ github.run_id }})"
+          BODY="סיכום עיבוד אצווה הושלם.\n\n"
+          BODY+="🏃 Run: ${{ github.run_id }}\n"
+          BODY+="📂 תיקייה בדרייב: ${{ github.event.inputs.folder }}\n"
+          BODY+="🔗 לינק לריצה: $RUN_URL\n\n"
+          BODY+="📊 סטטיסטיקות:\n"
+          BODY+="  • סה\"כ לינקים: ${TOTAL:-0}\n"
+          BODY+="  • ✅ הצליחו (יש וידאו): ${SUCCESS:-0}\n"
+          BODY+="  • ⏭️ דולגו (אין וידאו): ${SKIPPED:-0}\n"
+          BODY+="  • ❌ נכשלו (שגיאה): ${FAILED:-0}\n"
+          BODY+="  • 📦 קבצי ZIP שנוצרו: ${ZIP_COUNT:-0}\n"
+
+          echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
+          echo "✅ Summary email sent"
+
+  # ==============================================================
+  # 2️⃣  Job סיכום סופי (אופציונלי) — רץ אחרי כולם
+  # ==============================================================
+  final_summary:
+    needs: [prepare, batch_process]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Print final stats
+        run: |
+          echo "=== FINAL BATCH SUMMARY ==="
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Folder: ${{ github.event.inputs.folder }}"
+          echo "Total URLs: ${{ needs.batch_process.outputs.TOTAL }}"
+          echo "Success:    ${{ needs.batch_process.outputs.SUCCESS }}"
+          echo "Skipped:    ${{ needs.batch_process.outputs.SKIPPED }}"
+          echo "Failed:     ${{ needs.batch_process.outputs.FAILED }}"
+          echo "ZIPs:       ${{ needs.batch_process.outputs.ZIP_COUNT }}"
+          echo "============================="
