@@ -1,4 +1,4 @@
-name: "X/Twitter Batch Download → Google Drive (Crash-Proof + Full Debug Email)"
+name: "הרבה לינקים מעודכןX/Twitter Batch Download → Google Drive (Crash-Proof + Full Debug Email)"
 
 on:
   workflow_dispatch:
