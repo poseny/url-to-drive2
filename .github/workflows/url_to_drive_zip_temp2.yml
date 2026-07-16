@@ -1,4 +1,4 @@
-name: Upload URL → Google Drive (Zip via temporary file)
+name: הורדת קבציםUpload URL → Google Drive (Zip via temporary file)
 
 # מאפשר הרצה ידנית
 on:
