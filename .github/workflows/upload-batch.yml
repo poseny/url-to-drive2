@@ -9,8 +9,8 @@ on:
         default: "single"
         type: choice
         options:
-          - single      # URL בודד (כמו הקוד המקורי)
-          - batch       # קובץ URLs מהריפו (כמו הפרויקט השני)
+          - single
+          - batch
       url:
         description: "כתובת URL של הקובץ להורדה (מצב single)"
         required: false
@@ -91,10 +91,10 @@ jobs:
           retention-days: 2
 
   # ==============================================================
-  # 1️⃣  עיבוד ראשי — תומך בשני המצבים
+  # 1️⃣  עיבוד ראשי — רץ בשני המצבים, תלוי ב-prepare רק ב-batch
   # ==============================================================
   process:
-    needs: [prepare]
+    needs: ${{ github.event.inputs.mode == 'batch' && 'prepare' || '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 1440
     outputs:
@@ -110,6 +110,7 @@ jobs:
       MODE: ${{ github.event.inputs.mode }}
       SINGLE_URL: ${{ github.event.inputs.url }}
       USER_FILENAME: ${{ github.event.inputs.filename }}
+      URLS_FILE_INPUT: ${{ github.event.inputs.urls_file }}
 
     steps:
       # ----------------------------------------------------------
@@ -168,22 +169,39 @@ jobs:
           
           if [[ "$MODE" == "single" ]]; then
             echo "📝 Single URL mode"
+            if [[ -z "${SINGLE_URL}" ]]; then
+              echo "❌ No URL provided for single mode"
+              echo "TOTAL=0" >> $GITHUB_OUTPUT
+              exit 1
+            fi
             echo "${SINGLE_URL}" > "$URLS_FILE"
             echo "TOTAL=1" >> $GITHUB_OUTPUT
           else
             echo "📝 Batch mode - downloading URLs artifact"
             # הורדת ה-artifact מה-job הקודם
-            # (ה-artifact כבר יורד אוטומטית כי ה-job תלוי ב-prepare)
-            # אבל נוודא שהוא קיים
-            ARTIFACT_PATH="/tmp/urls_input/${{ github.event.inputs.urls_file }}"
+            ARTIFACT_PATH="/tmp/urls_input/${URLS_FILE_INPUT}"
+            
+            # הורדת artifact
+            echo "📥 Downloading artifact..." | tee -a "${BATCH_LOG}"
+            
+            # בדיקה שהקובץ קיים
             if [[ -f "$ARTIFACT_PATH" ]]; then
+              echo "✅ Artifact found at $ARTIFACT_PATH" | tee -a "${BATCH_LOG}"
               # סינון שורות ריקות והערות
               grep -E '^https?://' "$ARTIFACT_PATH" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > "$URLS_FILE"
               TOTAL=$(wc -l < "$URLS_FILE")
-              echo "📋 Total valid URLs parsed: $TOTAL"
+              echo "📋 Total valid URLs parsed: $TOTAL" | tee -a "${BATCH_LOG}"
               echo "TOTAL=$TOTAL" >> $GITHUB_OUTPUT
+              
+              if [[ $TOTAL -eq 0 ]]; then
+                echo "⚠️ No valid URLs found in file!" | tee -a "${BATCH_LOG}"
+                echo "🔍 File content:" | tee -a "${BATCH_LOG}"
+                cat "$ARTIFACT_PATH" | tee -a "${BATCH_LOG}"
+              fi
             else
-              echo "❌ URLs artifact not found at $ARTIFACT_PATH"
+              echo "❌ URLs artifact not found at $ARTIFACT_PATH" | tee -a "${BATCH_LOG}"
+              echo "🔍 Contents of /tmp/urls_input:" | tee -a "${BATCH_LOG}"
+              ls -la /tmp/urls_input/ 2>&1 | tee -a "${BATCH_LOG}"
               echo "TOTAL=0" >> $GITHUB_OUTPUT
             fi
           fi
@@ -262,8 +280,7 @@ jobs:
 
             TWEET_TMP=$(mktemp -d -p "$TMP_ROOT")
 
-            # ---- 1️⃣ הורדה עם curl (גנרי, לא yt-dlp) ----
-            # חישוב שם הקובץ מה-URL (לוגיקה מהפרויקט הראשון)
+            # ---- 1️⃣ הורדה עם curl (גנרי, כמו הקוד הראשון) ----
             raw_name=$(basename "$URL")
             raw_name=${raw_name%%\?*}
             decoded_name=$(printf '%b' "$(echo -e "${raw_name//%/\\x}")")
@@ -271,9 +288,7 @@ jobs:
 
             # שם הקובץ הפנימי ב-ZIP
             if [[ -n "$USER_FILENAME" && "$MODE" == "single" ]]; then
-              # במצב single עם שם מותאם אישית
               internal_name="${USER_FILENAME}"
-              # אם אין סיומת, ניקח מהקובץ המקורי
               if [[ "$internal_name" != *.* && "$decoded_name" == *.* ]]; then
                 internal_name="${internal_name}.${decoded_name##*.}"
               fi
@@ -285,12 +300,10 @@ jobs:
             DOWNLOAD_PATH="${TWEET_TMP}/${internal_name}"
             
             log "⬇️  [$(date -u +%H:%M:%S)] Downloading with curl..."
-            # הורדה עם curl - תומך ב-redirects, שקט, עם timeout
             curl -L -s --max-time 300 --retry 3 --retry-delay 5 -o "$DOWNLOAD_PATH" "$URL" >> "${BATCH_LOG}" 2>&1
             CURL_EXIT=$?
 
             if [[ $CURL_EXIT -eq 0 ]]; then
-              # בדיקה שהקובץ לא ריק
               if [[ ! -s "$DOWNLOAD_PATH" ]]; then
                 log "❌ Downloaded file is empty"
                 ((FAILED++))
@@ -314,7 +327,6 @@ jobs:
                   CURRENT_ZIP_DIR=$(mktemp -d -p "$TMP_ROOT")
                 fi
 
-                # העתקת הקובץ לתיקיית ה-ZIP הנוכחית
                 cp "$DOWNLOAD_PATH" "$CURRENT_ZIP_DIR/${internal_name}" 2>&1 | tee -a "${BATCH_LOG}"
                 ((FILES_IN_CURRENT_ZIP++))
                 ((CURRENT_ZIP_SIZE+=FSIZE))
@@ -380,7 +392,7 @@ jobs:
           echo "ZIP_COUNT=${ZIP_COUNT:-0}" >> $GITHUB_OUTPUT
 
       # ----------------------------------------------------------
-      # 5. 📧 שליחת אימייל סיכום (אופציונלי - דורש EMAIL_PASSWORD secret)
+      # 5. 📧 שליחת אימייל סיכום (אופציונלי)
       # ----------------------------------------------------------
       - name: Send summary email
         if: always() && env.EMAIL_PASSWORD != ''
@@ -442,7 +454,7 @@ jobs:
           echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO" 2>&1 | tee -a "${BATCH_LOG}"
           echo "✅ Summary email sent" | tee -a "${BATCH_LOG}"
 
-  # ==============================================================
+# ==============================================================
   # 3️⃣  Job סיכום סופי
   # ==============================================================
   final_summary:
