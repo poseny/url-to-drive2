@@ -47,7 +47,7 @@ permissions:
 
 jobs:
   # ==============================================================
-  # 0️⃣  הכנה: מאתר את קובץ ה-URLs (רק במצב batch)
+  # 0️⃣  הכנה: מאתר את קובץ ה-URLs (רץ רק במצב batch)
   # ==============================================================
   prepare:
     if: github.event.inputs.mode == 'batch'
@@ -91,10 +91,10 @@ jobs:
           retention-days: 2
 
   # ==============================================================
-  # 1️⃣  עיבוד ראשי — רץ בשני המצבים, תלוי ב-prepare רק ב-batch
+  # 1️⃣  עיבוד ראשי — תמיד תלוי ב-prepare (שמדולג אוטומטית ב-single)
   # ==============================================================
   process:
-    needs: ${{ github.event.inputs.mode == 'batch' && 'prepare' || '' }}
+    needs: [prepare]
     runs-on: ubuntu-latest
     timeout-minutes: 1440
     outputs:
@@ -178,16 +178,12 @@ jobs:
             echo "TOTAL=1" >> $GITHUB_OUTPUT
           else
             echo "📝 Batch mode - downloading URLs artifact"
-            # הורדת ה-artifact מה-job הקודם
             ARTIFACT_PATH="/tmp/urls_input/${URLS_FILE_INPUT}"
             
-            # הורדת artifact
             echo "📥 Downloading artifact..." | tee -a "${BATCH_LOG}"
             
-            # בדיקה שהקובץ קיים
             if [[ -f "$ARTIFACT_PATH" ]]; then
               echo "✅ Artifact found at $ARTIFACT_PATH" | tee -a "${BATCH_LOG}"
-              # סינון שורות ריקות והערות
               grep -E '^https?://' "$ARTIFACT_PATH" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > "$URLS_FILE"
               TOTAL=$(wc -l < "$URLS_FILE")
               echo "📋 Total valid URLs parsed: $TOTAL" | tee -a "${BATCH_LOG}"
@@ -238,7 +234,6 @@ jobs:
           log "📄 URLs file: $URLS_FILE"
           log "🔧 Mode: $MODE"
 
-          # קריאה בטוחה של URLs
           URLS=()
           while IFS= read -r line; do
             line=$(echo "$line" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -280,13 +275,11 @@ jobs:
 
             TWEET_TMP=$(mktemp -d -p "$TMP_ROOT")
 
-            # ---- 1️⃣ הורדה עם curl (גנרי, כמו הקוד הראשון) ----
             raw_name=$(basename "$URL")
             raw_name=${raw_name%%\?*}
             decoded_name=$(printf '%b' "$(echo -e "${raw_name//%/\\x}")")
             log "🔤 Decoded filename from URL = $decoded_name"
 
-            # שם הקובץ הפנימי ב-ZIP
             if [[ -n "$USER_FILENAME" && "$MODE" == "single" ]]; then
               internal_name="${USER_FILENAME}"
               if [[ "$internal_name" != *.* && "$decoded_name" == *.* ]]; then
@@ -311,7 +304,6 @@ jobs:
                 FSIZE=$(stat -c%s "$DOWNLOAD_PATH" 2>/dev/null || echo 0)
                 log "✅ Downloaded: $internal_name ($(numfmt --to=iec $FSIZE))"
                 
-                # ---- 2️⃣ בדיקת מגבלות ZIP ----
                 if (( CURRENT_ZIP_SIZE + FSIZE > MAX_ZIP_SIZE_MB * 1024 * 1024 )) || (( FILES_IN_CURRENT_ZIP >= MAX_FILES_PER_ZIP )); then
                   if (( FILES_IN_CURRENT_ZIP > 0 )); then
                     ZIP_NAME="${FOLDER}_part${ZIP_COUNTER}_$(date -u +%Y%m%d_%H%M%S).zip"
@@ -343,7 +335,6 @@ jobs:
             sleep 1
           done
 
-          # ZIP אחרון
           if (( FILES_IN_CURRENT_ZIP > 0 )); then
             ZIP_NAME="${FOLDER}_part${ZIP_COUNTER}_$(date -u +%Y%m%d_%H%M%S).zip"
             log "🗜️  Creating final ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
@@ -354,7 +345,6 @@ jobs:
 
           rm -rf "$TMP_ROOT"
 
-          # כתיבת outputs סופיים
           {
             echo "TOTAL=$TOTAL"
             echo "SUCCESS=$SUCCESS"
@@ -454,7 +444,7 @@ jobs:
           echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO" 2>&1 | tee -a "${BATCH_LOG}"
           echo "✅ Summary email sent" | tee -a "${BATCH_LOG}"
 
-# ==============================================================
+  # ==============================================================
   # 3️⃣  Job סיכום סופי
   # ==============================================================
   final_summary:
