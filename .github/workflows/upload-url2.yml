@@ -1,5 +1,5 @@
 # .github/workflows/upload-url-to-drive.yml
-name: Upload URL → Google Drive (Zip via temporary file)
+name: דפי אינטרנט מלאים מעודכןUpload URL → Google Drive (Zip via temporary file)
 
 on:
   workflow_dispatch:
