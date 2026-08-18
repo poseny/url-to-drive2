@@ -266,7 +266,11 @@ jobs:
             YT_DLP_EXIT=$?
 
             if [[ $YT_DLP_EXIT -eq 0 ]]; then
-              mapfile -t VIDEOS < <(find "$TWEET_TMP" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) 2>/dev/null | sort)
+              mapfile -t VIDEOS < <(find "$TWEET_TMP" -type f \( \
+                -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.webm" -o -iname "*.m4v" \
+                -o -iname "*.ogv" -o -iname "*.ogg" -o -iname "*.mov" -o -iname "*.avi" \
+                -o -iname "*.flv" -o -iname "*.3gp" -o -iname "*.ts" -o -iname "*.mts" \
+                \) 2>/dev/null | sort)
 
               if [[ ${#VIDEOS[@]} -eq 0 ]]; then
                 log "⏭️  No video found (skipped)"
