@@ -143,7 +143,11 @@ jobs:
 
           # ---- מציאת כל קבצי הוידאו שהורדו ----
           echo "🔍 [$(date -u +"%H:%M:%S")] Finding downloaded video files..."
-          mapfile -t VIDEO_FILES < <(find "$TMP_DIR" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | sort)
+          mapfile -t VIDEO_FILES < <(find "$TMP_DIR" -type f \( \
+            -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.webm" -o -iname "*.m4v" \
+            -o -iname "*.ogv" -o -iname "*.ogg" -o -iname "*.mov" -o -iname "*.avi" \
+            -o -iname "*.flv" -o -iname "*.3gp" -o -iname "*.ts" -o -iname "*.mts" \
+            \) | sort)
           
           if [[ ${#VIDEO_FILES[@]} -eq 0 ]]; then
             echo "❌ No video files found in $TMP_DIR"
