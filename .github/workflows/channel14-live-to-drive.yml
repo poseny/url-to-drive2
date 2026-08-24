@@ -23,11 +23,11 @@ on:
         default: ""
 
 env:
-  EMAIL_TO: ""
-  EMAIL_FROM: ""
+  EMAIL_TO: "p0556722432@gmail.com"
+  EMAIL_FROM: "p0556722432@gmail.com"
   SMTP_SERVER: "smtp.gmail.com"
   SMTP_PORT: "587"
-  EMAIL_USER: ""
+  EMAIL_USER: "p0556722432@gmail.com"
   # HLS URL של ערוץ 14 — Akamai CDN (ללא Cloudflare)
   CH14_HLS_URL: "https://ch14-channel14-content.akamaized.net/hls/live/2104807/CH14_CHANNEL14/master.m3u8"
   # Fallbacks: כתובות חלופיות (מקורות IPTV ציבוריים)
@@ -41,7 +41,7 @@ env:
   # חפיפה של 30 שניות בין הרצות cron — מונע פערים
   BATCH_DURATION_SECONDS: "330"
   SEGMENT_SECONDS: "60"
-  # ‏שמירת דקות אחרונות ב-Drive (ברירת מחדל: 4 שעות)
+  # שמירת דקות אחרונות ב-Drive (ברירת מחדל: 4 שעות)
   RETENTION_MINUTES: "240"
   # Cookies (Netscape format) — אופציונלי, עוקף Cloudflare
   CH14_COOKIES: ""
@@ -49,7 +49,7 @@ env:
 jobs:
   extract-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
@@ -78,7 +78,7 @@ jobs:
 
           echo "🔧 [$(date -u +"%H:%M:%S")] Installing dependencies..."
           curl -fsSL https://rclone.org/install.sh | sudo bash
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg msmtp msmtp-mta
           pip install -q -U yt-dlp streamlink
           echo "✅ Dependencies installed"
 
@@ -116,7 +116,7 @@ jobs:
           echo "✅ rclone configured"
 
       # ================================================================
-      # 3️⃣ חילוץ דקה + ZIP + העלאה ל-Drive
+      # 3️⃣ חילוץ דקה + ZIP + העלאה ל-Drive (לולאה רציפה)
       # ================================================================
       - name: Extract → Zip → Upload (continuous loop)
         continue-on-error: true
@@ -143,18 +143,15 @@ jobs:
           SEGMENT_COUNT=0
           UPLOADED_COUNT=0
 
-          # ================================================================
-          # חילוץ HLS URL דינמי (עוקף Cloudflare / הגנות אחרות)
-          # ================================================================
-
+          # Build headers file for ffmpeg
           HEADERS_FILE="${TMP_DIR}/ffmpeg_headers.txt"
           echo -e "${FFMPEG_HEADERS}" > "$HEADERS_FILE"
 
+          # Resolve HLS URL
           RESOLVED_HLS_URL=""
           echo "🔍 [$(date -u +"%H:%M:%S")] Resolving live HLS URL..."
 
-          if JSON_INFO=$(yt-dlp --dump-json --no-download --flat-playlist \
-              "$CH14_WEBSITE_URL" 2>/dev/null); then
+          if JSON_INFO=$(yt-dlp --dump-json --no-download --flat-playlist "$CH14_WEBSITE_URL" 2>/dev/null); then
             RESOLVED_HLS_URL=$(echo "$JSON_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
             [ -n "$RESOLVED_HLS_URL" ] && echo "   ✅ yt-dlp resolved: $RESOLVED_HLS_URL"
           fi
@@ -168,9 +165,7 @@ jobs:
           if [ -z "$RESOLVED_HLS_URL" ] && [ -n "$CH14_COOKIES" ]; then
             echo "   🔄 Trying yt-dlp with user cookies..."
             echo "$CH14_COOKIES" > "${TMP_DIR}/cookies.txt"
-            if JSON_INFO=$(yt-dlp --dump-json --no-download \
-                --cookies "${TMP_DIR}/cookies.txt" \
-                "$CH14_WEBSITE_URL" 2>/dev/null); then
+            if JSON_INFO=$(yt-dlp --dump-json --no-download --cookies "${TMP_DIR}/cookies.txt" "$CH14_WEBSITE_URL" 2>/dev/null); then
               RESOLVED_HLS_URL=$(echo "$JSON_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
             fi
           fi
@@ -182,9 +177,7 @@ jobs:
           [ -n "$FALLBACK_HLS_URL_2" ] && HLS_URLS+=("$FALLBACK_HLS_URL_2")
           echo "   📋 ${#HLS_URLS[@]} HLS URL(s) queued"
 
-          # ================================================================
-          # פונקציית חילוץ — מנסה URL-ים וכלי חילוץ עד הצלחה
-          # ================================================================
+          # Extract one segment (tries all URLs)
           extract_segment() {
             local seg_file="$1"
             for HLS_URL in "${HLS_URLS[@]}"; do
@@ -207,15 +200,12 @@ jobs:
 
                 if [ $attempt -ge 2 ]; then
                   echo "      🔄 yt-dlp fallback..."
-                  yt-dlp --downloader ffmpeg \
-                    --downloader-args "ffmpeg:-t ${SEGMENT_SEC}" \
-                    -o "$seg_file" "$HLS_URL" 2>&1 | tail -3
+                  yt-dlp --downloader ffmpeg --downloader-args "ffmpeg:-t ${SEGMENT_SEC}" -o "$seg_file" "$HLS_URL" 2>&1 | tail -3
                   if [ -s "$seg_file" ]; then
                     echo "      ✅ $(numfmt --to=iec $(stat -c%s "$seg_file")) via yt-dlp"
                     return 0
                   fi
                 fi
-
                 attempt=$((attempt + 1))
                 sleep 2
               done
@@ -223,16 +213,13 @@ jobs:
             return 1
           }
 
-          # ================================================================
-          # פונקציית Zip + Upload (ללא חסימה — רץ ברקע)
-          # ================================================================
+          # Zip + upload (runs in background)
           zip_and_upload() {
             local seg_file="$1"
             local ts="$2"
             local zip_name="channel14_${ts}.zip"
             local zip_path="${TMP_DIR}/${zip_name}"
 
-            # Skip if too small
             local seg_size=$(stat -c%s "$seg_file" 2>/dev/null || echo 0)
             if [ "$seg_size" -lt 524288 ]; then
               echo "      ⏭️  Too small (${seg_size}B), skipping"
@@ -249,10 +236,8 @@ jobs:
               return
             fi
 
-            # Upload (with retries, but don't block next segment)
             for up in 1 2 3; do
-              if rclone copy "$zip_path" "gdrive:${FOLDER}/${zip_name}" \
-                  --retries 2 --low-level-retries 2 --timeout 40s > /dev/null 2>&1; then
+              if rclone copy "$zip_path" "gdrive:${FOLDER}/${zip_name}" --retries 2 --low-level-retries 2 --timeout 40s > /dev/null 2>&1; then
                 echo "      📤 Uploaded → ${FOLDER}/${zip_name}"
                 rm -f "$zip_path"
                 return 0
@@ -264,9 +249,7 @@ jobs:
             return 1
           }
 
-          # ================================================================
-          # לולאה ראשית — מחלץ דקה, מעלה, ממשיך — עד סוף הבאץ'
-          # ================================================================
+          # Main loop: extract minute by minute until batch time runs out
           echo ""
           echo "   ⏱️  Batch: $(date -u -d @${BATCH_START} '+%H:%M:%S') → $(date -u -d @${BATCH_END} '+%H:%M:%S') UTC"
           echo ""
@@ -279,17 +262,16 @@ jobs:
             echo "   🎬 Segment #${SEGMENT_COUNT} [${NOW_TS}] ─ capturing ${SEGMENT_SEC}s..."
 
             if extract_segment "$SEG_FILE"; then
-              # Upload in background (don't block next capture)
               zip_and_upload "$SEG_FILE" "$NOW_TS" &
               UPLOADED_COUNT=$((UPLOADED_COUNT + 1))
             else
-              echo "   ⚠️ Segment #${SEGMENT_COUNT} failed, retrying with next URL..."
+              echo "   ⚠️ Segment #${SEGMENT_COUNT} failed, continuing..."
               rm -f "$SEG_FILE"
               sleep 3
             fi
           done
 
-          # Wait for background uploads to finish
+          # Wait for background uploads
           echo ""
           echo "   ⏳ Waiting for remaining uploads..."
           wait
@@ -325,9 +307,7 @@ jobs:
 
           echo "   Retention: ${RETENTION_MINUTES} minutes (before $CUTOFF)"
 
-          # List files and delete old ones based on filename timestamp
           rclone lsf --files-only "$REMOTE_DIR" 2>/dev/null | while read -r fname; do
-            # Extract timestamp from filename: channel14_YYYYMMDD_HHMM.zip
             if [[ "$fname" =~ channel14_([0-9]{8}_[0-9]{4})\.zip ]]; then
               fts="${BASH_REMATCH[1]}"
               if [[ "$fts" < "$CUTOFF" ]]; then
@@ -340,18 +320,25 @@ jobs:
           echo "✅ Cleanup complete"
 
       # ================================================================
-      # 5️⃣ שליחת אימייל על כשל (אופציונלי)
+      # 5️⃣ שליחת אימיול (תמיד — גם בהצלחה וגם בכשל)
       # ================================================================
-      - name: Send failure email
-        if: failure() && env.EMAIL_PASSWORD != ''
+      - name: Send log email
+        if: always()
         shell: bash
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           STATUS: ${{ steps.extract_upload.outputs.STATUS || 'failed' }}
+          SEGMENT_COUNT: ${{ steps.extract_upload.outputs.SEGMENT_COUNT || '0' }}
+          UPLOADED_COUNT: ${{ steps.extract_upload.outputs.UPLOADED_COUNT || '0' }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "📧 [$(date -u +"%H:%M:%S")] Sending failure notification..."
+          echo "📧 [$(date -u +"%H:%M:%S")] Preparing email..."
+
+          if [[ -z "$EMAIL_PASSWORD" ]]; then
+            echo "⚠️ EMAIL_PASSWORD secret is EMPTY – skipping email send"
+            exit 0
+          fi
 
           mkdir -p ~/.msmtp
           cat > ~/.msmtprc <<MSMTPEOF
@@ -370,16 +357,24 @@ jobs:
           MSMTPEOF
           chmod 600 ~/.msmtprc
 
-          SUBJECT="❌ [CH14 Live] Extraction FAILED - Run ${{ github.run_id }}"
-          BODY="Channel 14 extraction failed.\n\n"
-          BODY+="Status: ${STATUS}\n"
-          BODY+="Run: ${{ github.run_id }} (#${{ github.run_number }})\n"
-          BODY+="Time: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n\n"
-          BODY+="--- Last 40 lines of log ---\n"
-          BODY+=$(tail -40 "$LOG_FILE")
+          if [[ "$STATUS" == "success" ]]; then
+            SUBJECT="✅ [CH14 Live] Batch SUCCESS — ${UPLOADED_COUNT} segments"
+            PREFIX="הבאץ' הושלם בהצלחה."
+          else
+            SUBJECT="❌ [CH14 Live] Batch FAILED — Run ${{ github.run_id }}"
+            PREFIX="הבאץ' נכשל!"
+          fi
 
-          echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO" 2>/dev/null || true
-          echo "✅ Email sent (or skipped)"
+          BODY="${PREFIX}\n\n"
+          BODY+="📊 Segments: ${UPLOADED_COUNT}/${SEGMENT_COUNT} uploaded\n"
+          BODY+="📂 Folder: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}\n"
+          BODY+="🏃 Run: ${{ github.run_id }} (#${{ github.run_number }})\n"
+          BODY+="⏱️ Time: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n"
+          BODY+="\n--- Last 80 lines of log ---\n"
+          BODY+=$(tail -80 "$LOG_FILE")
+
+          echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO"
+          echo "✅ Email sent to $EMAIL_TO"
 
       # ================================================================
       # 6️⃣ העלאת לוג כ-Artifact
@@ -406,6 +401,6 @@ jobs:
           echo "=== FINAL SUMMARY ==="
           echo "Run: ${{ github.run_id }} (#${{ github.run_number }})"
           echo "Status: ${{ steps.extract_upload.outputs.STATUS || 'failed' }}"
-          echo "File: ${{ steps.extract_upload.outputs.SEGMENT_COUNT || '0' }} segments (${{ steps.extract_upload.outputs.UPLOADED_COUNT || '0' }} uploaded)"
+          echo "Segments: ${{ steps.extract_upload.outputs.SEGMENT_COUNT || '0' }} total, ${{ steps.extract_upload.outputs.UPLOADED_COUNT || '0' }} uploaded"
           echo "Log entries: $(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)"
           echo "====================="
