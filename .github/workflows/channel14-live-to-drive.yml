@@ -1,0 +1,425 @@
+name: Channel 14 Live → Google Drive (Per Minute)
+
+on:
+  schedule:
+    - cron: '* * * * *'  # כל דקה
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "כמה שניות לחלץ (ברירת מחדל: 60 = דקה)"
+        required: false
+        default: "60"
+      drive_folder:
+        description: "תיקיית יעד ב-Google Drive"
+        required: true
+        default: "Channel14Live"
+      retries:
+        description: "מספר נסיונות במקרה של כשל"
+        required: false
+        default: "2"
+      cookies:
+        description: "עוגיות (Netscape format) — אופציונלי, עוקף Cloudflare אם ה-HLS חסום"
+        required: false
+        default: ""
+
+env:
+  EMAIL_TO: ""
+  EMAIL_FROM: ""
+  SMTP_SERVER: "smtp.gmail.com"
+  SMTP_PORT: "587"
+  EMAIL_USER: ""
+  # HLS URL של ערוץ 14 — Akamai CDN (ללא Cloudflare)
+  CH14_HLS_URL: "https://ch14-channel14-content.akamaized.net/hls/live/2104807/CH14_CHANNEL14/master.m3u8"
+  # Fallbacks: כתובות חלופיות (מקורות IPTV ציבוריים)
+  FALLBACK_HLS_URL_1: "https://ch14-channel14-content.akamaized.net/hls/live/2104807/CH14_CHANNEL14/master.m3u8"
+  # Redge Media CDN (מקור IPTV ציבורי — גיבוי)
+  FALLBACK_HLS_URL_2: "https://r.il.cdn-redge.media/livehls/oil/ch14/live/ch14/live.livx/playlist.m3u8"
+  # אתר ערוץ 14 (לחילוץ HLS URL דינמי דרך yt-dlp / streamlink)
+  CH14_WEBSITE_URL: "https://www.now14.co.il/live"
+  # Headers לשליחה ל-ffmpeg (Referer עוזר לעקוף חסימות CDN)
+  FFMPEG_HEADERS: "Referer: https://www.now14.co.il/\r\nOrigin: https://www.now14.co.il"
+  # שמירת דקות אחרונות ב-Drive (ברירת מחדל: 4 שעות)
+  RETENTION_MINUTES: "240"
+  # Cookies (Netscape format) — אופציונלי, עוקף Cloudflare
+  CH14_COOKIES: ""
+
+jobs:
+  extract-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      # ================================================================
+      # 1️⃣ התקנת תלויות + אתחול לוג
+      # ================================================================
+      - name: Install dependencies & Init log
+        continue-on-error: true
+        shell: bash
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "=== Channel 14 Live Extractor Log ==="
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run Number: ${{ github.run_number }}"
+          echo "Repo: ${{ github.repository }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo "Duration: ${{ github.event.inputs.duration_seconds || '60' }}s"
+          echo "Drive Folder: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}"
+          echo "HLS URL: $CH14_HLS_URL"
+          echo "========================================"
+          echo ""
+
+          echo "🔧 [$(date -u +"%H:%M:%S")] Installing dependencies..."
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -q -U yt-dlp streamlink
+          echo "✅ Dependencies installed"
+
+      # ================================================================
+      # 2️⃣ קונפיג rclone
+      # ================================================================
+      - name: Configure rclone
+        continue-on-error: true
+        shell: bash
+        env:
+          RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🔧 [$(date -u +"%H:%M:%S")] Configuring rclone..."
+
+          if [[ -z "$RCLONE_GDRIVE_TOKEN" ]]; then
+            echo "❌ RCLONE_GDRIVE_TOKEN secret is EMPTY!"
+            exit 1
+          fi
+
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<'RCLONEEOF'
+          [gdrive]
+          type = drive
+          scope = drive.file
+          token = RCLONE_GDRIVE_TOKEN_PLACEHOLDER
+          RCLONEEOF
+          # Replace placeholder with actual token
+          sed -i "s|RCLONE_GDRIVE_TOKEN_PLACEHOLDER|$RCLONE_GDRIVE_TOKEN|g" ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+
+          echo "🔍 Testing rclone connection..."
+          rclone lsd gdrive: 2>&1 | head -5 || echo "⚠️ rclone lsd had issues (may be normal)"
+          echo "✅ rclone configured"
+
+      # ================================================================
+      # 3️⃣ חילוץ דקה + ZIP + העלאה ל-Drive
+      # ================================================================
+      - name: Extract → Zip → Upload
+        continue-on-error: true
+        id: extract_upload
+        shell: bash
+        env:
+          FOLDER: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}
+          DURATION: ${{ github.event.inputs.duration_seconds || '60' }}
+          MAX_RETRIES: ${{ github.event.inputs.retries || '2' }}
+          CH14_COOKIES: ${{ github.event.inputs.cookies || env.CH14_COOKIES }}
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🚀 [$(date -u +"%H:%M:%S")] Starting extraction..."
+
+          set -e
+          set -o pipefail
+
+          TMP_DIR=$(mktemp -d)
+          TIMESTAMP=$(date -u +"%Y%m%d_%H%M")
+          SEGMENT_FILE="${TMP_DIR}/channel14_${TIMESTAMP}.ts"
+          ZIP_NAME="channel14_${TIMESTAMP}.zip"
+          ZIP_PATH="${TMP_DIR}/${ZIP_NAME}"
+          REMOTE_PATH="gdrive:${FOLDER}/${ZIP_NAME}"
+
+          echo "   Timestamp: $TIMESTAMP"
+          echo "   Segment: $SEGMENT_FILE"
+          echo "   ZIP: $ZIP_NAME"
+          echo "   Remote: $REMOTE_PATH"
+
+          # ================================================================
+          # חילוץ HLS URL דינמי (עוקף Cloudflare / הגנות אחרות)
+          # ================================================================
+
+          # Build headers file for ffmpeg
+          HEADERS_FILE="${TMP_DIR}/ffmpeg_headers.txt"
+          echo -e "${FFMPEG_HEADERS}" > "$HEADERS_FILE"
+
+          # --- שלב 1: נסה לחלץ HLS URL אמיתי דרך yt-dlp ---
+          RESOLVED_HLS_URL=""
+          echo "🔍 [$(date -u +"%H:%M:%S")] Resolving live HLS URL..."
+
+          # yt-dlp --dump-json (בלי להוריד) — מקבל מטה-דאטה + URL
+          if JSON_INFO=$(yt-dlp --dump-json --no-download --flat-playlist \
+              "$CH14_WEBSITE_URL" 2>/dev/null); then
+            RESOLVED_HLS_URL=$(echo "$JSON_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
+            if [ -n "$RESOLVED_HLS_URL" ]; then
+              echo "   ✅ yt-dlp resolved: $RESOLVED_HLS_URL"
+            fi
+          fi
+
+          # --- שלב 2: streamlink כגיבוי לחילוץ URL ---
+          if [ -z "$RESOLVED_HLS_URL" ]; then
+            echo "   🔄 Trying streamlink..."
+            RESOLVED_HLS_URL=$(streamlink --stream-url "$CH14_WEBSITE_URL" best 2>/dev/null || echo "")
+            if [ -n "$RESOLVED_HLS_URL" ]; then
+              echo "   ✅ streamlink resolved: $RESOLVED_HLS_URL"
+            fi
+          fi
+
+          # --- שלב 3: אם yt-dlp/streamlink נכשלו, נסה yt-dlp עם cookies ---
+          if [ -z "$RESOLVED_HLS_URL" ] && [ -n "$CH14_COOKIES" ]; then
+            echo "   🔄 Trying yt-dlp with user cookies..."
+            echo "$CH14_COOKIES" > "${TMP_DIR}/cookies.txt"
+            if JSON_INFO=$(yt-dlp --dump-json --no-download \
+                --cookies "${TMP_DIR}/cookies.txt" \
+                "$CH14_WEBSITE_URL" 2>/dev/null); then
+              RESOLVED_HLS_URL=$(echo "$JSON_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
+            fi
+          fi
+
+          # --- שלב 4: הרכב רשימת URL-ים לניסיון ---
+          HLS_URLS=()
+          [ -n "$RESOLVED_HLS_URL" ] && HLS_URLS+=("$RESOLVED_HLS_URL")
+          [ -n "$CH14_HLS_URL" ] && HLS_URLS+=("$CH14_HLS_URL")
+          [ -n "$FALLBACK_HLS_URL_1" ] && HLS_URLS+=("$FALLBACK_HLS_URL_1")
+          [ -n "$FALLBACK_HLS_URL_2" ] && HLS_URLS+=("$FALLBACK_HLS_URL_2")
+
+          echo "   📋 Will try ${#HLS_URLS[@]} HLS URL(s)"
+
+          # --- חילוץ עם ffmpeg (עם retries × URLs) ---
+          extract_with_retry() {
+            for HLS_URL in "${HLS_URLS[@]}"; do
+              local attempt=1
+              local max_attempts=2
+              echo ""
+              echo "   🔗 Trying: $HLS_URL"
+
+              while [ $attempt -le $max_attempts ]; do
+                echo "   ⬇️ ffmpeg attempt $attempt/$max_attempts..."
+
+                # Strategy A: ffmpeg with headers
+                ffmpeg -y \
+                  -headers "$(cat "$HEADERS_FILE")" \
+                  -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 \
+                  -i "$HLS_URL" \
+                  -t "$DURATION" \
+                  -c copy \
+                  -f mpegts \
+                  "$SEGMENT_FILE" \
+                  2>&1 | tail -20
+
+                local ffmpeg_exit=${PIPESTATUS[0]}
+
+                if [ $ffmpeg_exit -eq 0 ] && [ -s "$SEGMENT_FILE" ]; then
+                  local seg_size=$(stat -c%s "$SEGMENT_FILE")
+                  echo "   ✅ ffmpeg success! Segment: $(numfmt --to=iec $seg_size)"
+                  return 0
+                fi
+
+                echo "   ⚠️ ffmpeg exit: $ffmpeg_exit"
+
+                # Strategy B: yt-dlp direct download (last attempt)
+                if [ $attempt -eq $max_attempts ]; then
+                  echo "   🔄 yt-dlp fallback: downloading ${DURATION}s directly..."
+                  yt-dlp \
+                    --downloader ffmpeg \
+                    --downloader-args "ffmpeg:-t ${DURATION}" \
+                    -o "$SEGMENT_FILE" \
+                    "$HLS_URL" 2>&1 | tail -10
+
+                  if [ -s "$SEGMENT_FILE" ]; then
+                    local seg_size=$(stat -c%s "$SEGMENT_FILE")
+                    echo "   ✅ yt-dlp success! Segment: $(numfmt --to=iec $seg_size)"
+                    return 0
+                  fi
+                fi
+
+                attempt=$((attempt + 1))
+                sleep 3
+              done
+            done
+
+            echo "❌ All extraction methods failed!"
+            return 1
+          }
+
+          if ! extract_with_retry; then
+            echo "STATUS=failed_extract" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          # --- בדיקת גודל מינימלי (לפחות 1MB) ---
+          SEG_SIZE=$(stat -c%s "$SEGMENT_FILE")
+          if [ "$SEG_SIZE" -lt 1048576 ]; then
+            echo "⚠️ Segment too small (${SEG_SIZE} bytes) – possibly no content. Skipping upload."
+            echo "STATUS=segment_too_small" >> $GITHUB_OUTPUT
+            rm -rf "$TMP_DIR"
+            exit 0
+          fi
+
+          # --- ZIP ---
+          echo "🗜️ [$(date -u +"%H:%M:%S")] Creating ZIP..."
+          (cd "$(dirname "$SEGMENT_FILE")" && zip -j -q "$ZIP_PATH" "$(basename "$SEGMENT_FILE")")
+          
+          if [ ! -s "$ZIP_PATH" ]; then
+            echo "❌ Zip creation failed"
+            echo "STATUS=failed_zip" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          ZIP_SIZE=$(stat -c%s "$ZIP_PATH")
+          echo "   ZIP created: $ZIP_NAME ($(numfmt --to=iec $ZIP_SIZE))"
+
+          # --- העלאה ל-Drive ---
+          echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
+
+          upload_with_retry() {
+            local attempt=1
+            local max_attempts=3
+            while [ $attempt -le $max_attempts ]; do
+              echo "   Upload attempt $attempt/$max_attempts..."
+              rclone copy "$ZIP_PATH" "$REMOTE_PATH" \
+                --progress \
+                --retries 3 \
+                --low-level-retries 3 \
+                --timeout 60s
+
+              if [ $? -eq 0 ]; then
+                echo "   ✅ Upload success!"
+                return 0
+              fi
+              echo "   ⚠️ Upload attempt $attempt failed"
+              attempt=$((attempt + 1))
+              sleep 5
+            done
+            return 1
+          }
+
+          if ! upload_with_retry; then
+            echo "❌ All upload attempts failed"
+            echo "STATUS=failed_upload" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          rm -rf "$TMP_DIR"
+          echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
+
+          echo "STATUS=success" >> $GITHUB_OUTPUT
+          echo "FILE_NAME=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "FILE_SIZE=$ZIP_SIZE" >> $GITHUB_OUTPUT
+
+      # ================================================================
+      # 4️⃣ ניקוי ZIPים ישנים מ-Drive
+      # ================================================================
+      - name: Cleanup old ZIPs from Drive
+        continue-on-error: true
+        shell: bash
+        env:
+          FOLDER: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🧹 [$(date -u +"%H:%M:%S")] Cleaning old ZIPs from Drive..."
+
+          REMOTE_DIR="gdrive:${FOLDER}"
+          CUTOFF=$(date -u -d "${RETENTION_MINUTES} minutes ago" +"%Y%m%d_%H%M" 2>/dev/null || echo "")
+
+          if [ -z "$CUTOFF" ]; then
+            echo "⚠️ Could not compute cutoff time. Skipping cleanup."
+            exit 0
+          fi
+
+          echo "   Retention: ${RETENTION_MINUTES} minutes (before $CUTOFF)"
+
+          # List files and delete old ones based on filename timestamp
+          rclone lsf --files-only "$REMOTE_DIR" 2>/dev/null | while read -r fname; do
+            # Extract timestamp from filename: channel14_YYYYMMDD_HHMM.zip
+            if [[ "$fname" =~ channel14_([0-9]{8}_[0-9]{4})\.zip ]]; then
+              fts="${BASH_REMATCH[1]}"
+              if [[ "$fts" < "$CUTOFF" ]]; then
+                echo "   🗑️ Deleting: $fname (timestamp: $fts)"
+                rclone delete "${REMOTE_DIR}/${fname}" 2>/dev/null || true
+              fi
+            fi
+          done
+
+          echo "✅ Cleanup complete"
+
+      # ================================================================
+      # 5️⃣ שליחת אימייל על כשל (אופציונלי)
+      # ================================================================
+      - name: Send failure email
+        if: failure() && env.EMAIL_PASSWORD != ''
+        shell: bash
+        env:
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          STATUS: ${{ steps.extract_upload.outputs.STATUS || 'failed' }}
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "📧 [$(date -u +"%H:%M:%S")] Sending failure notification..."
+
+          mkdir -p ~/.msmtp
+          cat > ~/.msmtprc <<MSMTPEOF
+          defaults
+          auth on
+          tls on
+          tls_trust_file /etc/ssl/certs/ca-certificates.crt
+          logfile ~/.msmtp.log
+          account gmail
+          host $SMTP_SERVER
+          port $SMTP_PORT
+          from $EMAIL_FROM
+          user $EMAIL_USER
+          password $EMAIL_PASSWORD
+          account default : gmail
+          MSMTPEOF
+          chmod 600 ~/.msmtprc
+
+          SUBJECT="❌ [CH14 Live] Extraction FAILED - Run ${{ github.run_id }}"
+          BODY="Channel 14 extraction failed.\n\n"
+          BODY+="Status: ${STATUS}\n"
+          BODY+="Run: ${{ github.run_id }} (#${{ github.run_number }})\n"
+          BODY+="Time: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n\n"
+          BODY+="--- Last 40 lines of log ---\n"
+          BODY+=$(tail -40 "$LOG_FILE")
+
+          echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO" 2>/dev/null || true
+          echo "✅ Email sent (or skipped)"
+
+      # ================================================================
+      # 6️⃣ העלאת לוג כ-Artifact
+      # ================================================================
+      - name: Upload log as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ch14-live-log-${{ github.run_id }}
+          path: ${{ runner.temp }}/workflow_log.txt
+          retention-days: 3
+          if-no-files-found: warn
+
+      # ================================================================
+      # 7️⃣ סיכום
+      # ================================================================
+      - name: Final summary
+        if: always()
+        shell: bash
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo ""
+          echo "=== FINAL SUMMARY ==="
+          echo "Run: ${{ github.run_id }} (#${{ github.run_number }})"
+          echo "Status: ${{ steps.extract_upload.outputs.STATUS || 'failed' }}"
+          echo "File: ${{ steps.extract_upload.outputs.FILE_NAME || 'N/A' }}"
+          echo "Log entries: $(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)"
+          echo "====================="
