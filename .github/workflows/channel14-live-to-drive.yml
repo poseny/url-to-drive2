@@ -2,13 +2,13 @@ name: Channel 14 Live → Google Drive (Per Minute)
 
 on:
   schedule:
-    - cron: '* * * * *'  # כל דקה
+    - cron: '*/5 * * * *'  # כל 5 דקות — כל הרצה תופסת 5.5 דקות (30s חפיפה)
   workflow_dispatch:
     inputs:
-      duration_seconds:
-        description: "כמה שניות לחלץ (ברירת מחדל: 60 = דקה)"
+      batch_duration_seconds:
+        description: "כמה שניות של סטרימינג לתפוס בהרצה אחת (ברירת מחדל: 330 = 5.5 דקות, ל-hands-free)"
         required: false
-        default: "60"
+        default: "330"
       drive_folder:
         description: "תיקיית יעד ב-Google Drive"
         required: true
@@ -38,7 +38,10 @@ env:
   CH14_WEBSITE_URL: "https://www.now14.co.il/live"
   # Headers לשליחה ל-ffmpeg (Referer עוזר לעקוף חסימות CDN)
   FFMPEG_HEADERS: "Referer: https://www.now14.co.il/\r\nOrigin: https://www.now14.co.il"
-  # שמירת דקות אחרונות ב-Drive (ברירת מחדל: 4 שעות)
+  # חפיפה של 30 שניות בין הרצות cron — מונע פערים
+  BATCH_DURATION_SECONDS: "330"
+  SEGMENT_SECONDS: "60"
+  # ‏שמירת דקות אחרונות ב-Drive (ברירת מחדל: 4 שעות)
   RETENTION_MINUTES: "240"
   # Cookies (Netscape format) — אופציונלי, עוקף Cloudflare
   CH14_COOKIES: ""
@@ -67,7 +70,7 @@ jobs:
           echo "Repo: ${{ github.repository }}"
           echo "Actor: ${{ github.actor }}"
           echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-          echo "Duration: ${{ github.event.inputs.duration_seconds || '60' }}s"
+          echo "Duration: ${{ github.event.inputs.batch_duration_seconds || env.BATCH_DURATION_SECONDS || '330' }}s"
           echo "Drive Folder: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}"
           echo "HLS URL: $CH14_HLS_URL"
           echo "========================================"
@@ -115,66 +118,53 @@ jobs:
       # ================================================================
       # 3️⃣ חילוץ דקה + ZIP + העלאה ל-Drive
       # ================================================================
-      - name: Extract → Zip → Upload
+      - name: Extract → Zip → Upload (continuous loop)
         continue-on-error: true
         id: extract_upload
         shell: bash
         env:
           FOLDER: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}
-          DURATION: ${{ github.event.inputs.duration_seconds || '60' }}
+          BATCH_DURATION: ${{ github.event.inputs.batch_duration_seconds || env.BATCH_DURATION_SECONDS || '330' }}
+          SEGMENT_SEC: ${{ env.SEGMENT_SECONDS || '60' }}
           MAX_RETRIES: ${{ github.event.inputs.retries || '2' }}
           CH14_COOKIES: ${{ github.event.inputs.cookies || env.CH14_COOKIES }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo "🚀 [$(date -u +"%H:%M:%S")] Starting extraction..."
+          echo "🚀 [$(date -u +"%H:%M:%S")] Starting CONTINUOUS extraction (batch: ${BATCH_DURATION}s, segments: ${SEGMENT_SEC}s)"
+          echo "   Cron overlap: 30s — no gaps between batches"
 
           set -e
           set -o pipefail
 
           TMP_DIR=$(mktemp -d)
-          TIMESTAMP=$(date -u +"%Y%m%d_%H%M")
-          SEGMENT_FILE="${TMP_DIR}/channel14_${TIMESTAMP}.ts"
-          ZIP_NAME="channel14_${TIMESTAMP}.zip"
-          ZIP_PATH="${TMP_DIR}/${ZIP_NAME}"
-          REMOTE_PATH="gdrive:${FOLDER}/${ZIP_NAME}"
-
-          echo "   Timestamp: $TIMESTAMP"
-          echo "   Segment: $SEGMENT_FILE"
-          echo "   ZIP: $ZIP_NAME"
-          echo "   Remote: $REMOTE_PATH"
+          BATCH_START=$(date -u +%s)
+          BATCH_END=$((BATCH_START + BATCH_DURATION))
+          SEGMENT_COUNT=0
+          UPLOADED_COUNT=0
 
           # ================================================================
           # חילוץ HLS URL דינמי (עוקף Cloudflare / הגנות אחרות)
           # ================================================================
 
-          # Build headers file for ffmpeg
           HEADERS_FILE="${TMP_DIR}/ffmpeg_headers.txt"
           echo -e "${FFMPEG_HEADERS}" > "$HEADERS_FILE"
 
-          # --- שלב 1: נסה לחלץ HLS URL אמיתי דרך yt-dlp ---
           RESOLVED_HLS_URL=""
           echo "🔍 [$(date -u +"%H:%M:%S")] Resolving live HLS URL..."
 
-          # yt-dlp --dump-json (בלי להוריד) — מקבל מטה-דאטה + URL
           if JSON_INFO=$(yt-dlp --dump-json --no-download --flat-playlist \
               "$CH14_WEBSITE_URL" 2>/dev/null); then
             RESOLVED_HLS_URL=$(echo "$JSON_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
-            if [ -n "$RESOLVED_HLS_URL" ]; then
-              echo "   ✅ yt-dlp resolved: $RESOLVED_HLS_URL"
-            fi
+            [ -n "$RESOLVED_HLS_URL" ] && echo "   ✅ yt-dlp resolved: $RESOLVED_HLS_URL"
           fi
 
-          # --- שלב 2: streamlink כגיבוי לחילוץ URL ---
           if [ -z "$RESOLVED_HLS_URL" ]; then
             echo "   🔄 Trying streamlink..."
             RESOLVED_HLS_URL=$(streamlink --stream-url "$CH14_WEBSITE_URL" best 2>/dev/null || echo "")
-            if [ -n "$RESOLVED_HLS_URL" ]; then
-              echo "   ✅ streamlink resolved: $RESOLVED_HLS_URL"
-            fi
+            [ -n "$RESOLVED_HLS_URL" ] && echo "   ✅ streamlink resolved: $RESOLVED_HLS_URL"
           fi
 
-          # --- שלב 3: אם yt-dlp/streamlink נכשלו, נסה yt-dlp עם cookies ---
           if [ -z "$RESOLVED_HLS_URL" ] && [ -n "$CH14_COOKIES" ]; then
             echo "   🔄 Trying yt-dlp with user cookies..."
             echo "$CH14_COOKIES" > "${TMP_DIR}/cookies.txt"
@@ -185,136 +175,132 @@ jobs:
             fi
           fi
 
-          # --- שלב 4: הרכב רשימת URL-ים לניסיון ---
           HLS_URLS=()
           [ -n "$RESOLVED_HLS_URL" ] && HLS_URLS+=("$RESOLVED_HLS_URL")
           [ -n "$CH14_HLS_URL" ] && HLS_URLS+=("$CH14_HLS_URL")
           [ -n "$FALLBACK_HLS_URL_1" ] && HLS_URLS+=("$FALLBACK_HLS_URL_1")
           [ -n "$FALLBACK_HLS_URL_2" ] && HLS_URLS+=("$FALLBACK_HLS_URL_2")
+          echo "   📋 ${#HLS_URLS[@]} HLS URL(s) queued"
 
-          echo "   📋 Will try ${#HLS_URLS[@]} HLS URL(s)"
-
-          # --- חילוץ עם ffmpeg (עם retries × URLs) ---
-          extract_with_retry() {
+          # ================================================================
+          # פונקציית חילוץ — מנסה URL-ים וכלי חילוץ עד הצלחה
+          # ================================================================
+          extract_segment() {
+            local seg_file="$1"
             for HLS_URL in "${HLS_URLS[@]}"; do
               local attempt=1
-              local max_attempts=2
-              echo ""
-              echo "   🔗 Trying: $HLS_URL"
-
-              while [ $attempt -le $max_attempts ]; do
-                echo "   ⬇️ ffmpeg attempt $attempt/$max_attempts..."
-
-                # Strategy A: ffmpeg with headers
+              while [ $attempt -le 2 ]; do
                 ffmpeg -y \
                   -headers "$(cat "$HEADERS_FILE")" \
                   -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 \
                   -i "$HLS_URL" \
-                  -t "$DURATION" \
+                  -t "$SEGMENT_SEC" \
                   -c copy \
                   -f mpegts \
-                  "$SEGMENT_FILE" \
-                  2>&1 | tail -20
+                  "$seg_file" \
+                  2>&1 | tail -5
 
-                local ffmpeg_exit=${PIPESTATUS[0]}
-
-                if [ $ffmpeg_exit -eq 0 ] && [ -s "$SEGMENT_FILE" ]; then
-                  local seg_size=$(stat -c%s "$SEGMENT_FILE")
-                  echo "   ✅ ffmpeg success! Segment: $(numfmt --to=iec $seg_size)"
+                if [ ${PIPESTATUS[0]} -eq 0 ] && [ -s "$seg_file" ]; then
+                  echo "      ✅ $(numfmt --to=iec $(stat -c%s "$seg_file")) from $HLS_URL"
                   return 0
                 fi
 
-                echo "   ⚠️ ffmpeg exit: $ffmpeg_exit"
-
-                # Strategy B: yt-dlp direct download (last attempt)
-                if [ $attempt -eq $max_attempts ]; then
-                  echo "   🔄 yt-dlp fallback: downloading ${DURATION}s directly..."
-                  yt-dlp \
-                    --downloader ffmpeg \
-                    --downloader-args "ffmpeg:-t ${DURATION}" \
-                    -o "$SEGMENT_FILE" \
-                    "$HLS_URL" 2>&1 | tail -10
-
-                  if [ -s "$SEGMENT_FILE" ]; then
-                    local seg_size=$(stat -c%s "$SEGMENT_FILE")
-                    echo "   ✅ yt-dlp success! Segment: $(numfmt --to=iec $seg_size)"
+                if [ $attempt -ge 2 ]; then
+                  echo "      🔄 yt-dlp fallback..."
+                  yt-dlp --downloader ffmpeg \
+                    --downloader-args "ffmpeg:-t ${SEGMENT_SEC}" \
+                    -o "$seg_file" "$HLS_URL" 2>&1 | tail -3
+                  if [ -s "$seg_file" ]; then
+                    echo "      ✅ $(numfmt --to=iec $(stat -c%s "$seg_file")) via yt-dlp"
                     return 0
                   fi
                 fi
 
                 attempt=$((attempt + 1))
-                sleep 3
+                sleep 2
               done
             done
-
-            echo "❌ All extraction methods failed!"
             return 1
           }
 
-          if ! extract_with_retry; then
-            echo "STATUS=failed_extract" >> $GITHUB_OUTPUT
-            exit 1
-          fi
+          # ================================================================
+          # פונקציית Zip + Upload (ללא חסימה — רץ ברקע)
+          # ================================================================
+          zip_and_upload() {
+            local seg_file="$1"
+            local ts="$2"
+            local zip_name="channel14_${ts}.zip"
+            local zip_path="${TMP_DIR}/${zip_name}"
 
-          # --- בדיקת גודל מינימלי (לפחות 1MB) ---
-          SEG_SIZE=$(stat -c%s "$SEGMENT_FILE")
-          if [ "$SEG_SIZE" -lt 1048576 ]; then
-            echo "⚠️ Segment too small (${SEG_SIZE} bytes) – possibly no content. Skipping upload."
-            echo "STATUS=segment_too_small" >> $GITHUB_OUTPUT
-            rm -rf "$TMP_DIR"
-            exit 0
-          fi
+            # Skip if too small
+            local seg_size=$(stat -c%s "$seg_file" 2>/dev/null || echo 0)
+            if [ "$seg_size" -lt 524288 ]; then
+              echo "      ⏭️  Too small (${seg_size}B), skipping"
+              rm -f "$seg_file"
+              return
+            fi
 
-          # --- ZIP ---
-          echo "🗜️ [$(date -u +"%H:%M:%S")] Creating ZIP..."
-          (cd "$(dirname "$SEGMENT_FILE")" && zip -j -q "$ZIP_PATH" "$(basename "$SEGMENT_FILE")")
-          
-          if [ ! -s "$ZIP_PATH" ]; then
-            echo "❌ Zip creation failed"
-            echo "STATUS=failed_zip" >> $GITHUB_OUTPUT
-            exit 1
-          fi
+            echo "      🗜️  ${zip_name} ($(numfmt --to=iec $seg_size))"
+            (cd "$(dirname "$seg_file")" && zip -j -q "$zip_path" "$(basename "$seg_file")")
+            rm -f "$seg_file"
 
-          ZIP_SIZE=$(stat -c%s "$ZIP_PATH")
-          echo "   ZIP created: $ZIP_NAME ($(numfmt --to=iec $ZIP_SIZE))"
+            if [ ! -s "$zip_path" ]; then
+              echo "      ❌ Zip failed"
+              return
+            fi
 
-          # --- העלאה ל-Drive ---
-          echo "🚀 [$(date -u +"%H:%M:%S")] Uploading to Drive..."
-
-          upload_with_retry() {
-            local attempt=1
-            local max_attempts=3
-            while [ $attempt -le $max_attempts ]; do
-              echo "   Upload attempt $attempt/$max_attempts..."
-              rclone copy "$ZIP_PATH" "$REMOTE_PATH" \
-                --progress \
-                --retries 3 \
-                --low-level-retries 3 \
-                --timeout 60s
-
-              if [ $? -eq 0 ]; then
-                echo "   ✅ Upload success!"
+            # Upload (with retries, but don't block next segment)
+            for up in 1 2 3; do
+              if rclone copy "$zip_path" "gdrive:${FOLDER}/${zip_name}" \
+                  --retries 2 --low-level-retries 2 --timeout 40s > /dev/null 2>&1; then
+                echo "      📤 Uploaded → ${FOLDER}/${zip_name}"
+                rm -f "$zip_path"
                 return 0
               fi
-              echo "   ⚠️ Upload attempt $attempt failed"
-              attempt=$((attempt + 1))
               sleep 5
             done
+            echo "      ⚠️ Upload failed after retries"
+            rm -f "$zip_path"
             return 1
           }
 
-          if ! upload_with_retry; then
-            echo "❌ All upload attempts failed"
-            echo "STATUS=failed_upload" >> $GITHUB_OUTPUT
-            exit 1
-          fi
+          # ================================================================
+          # לולאה ראשית — מחלץ דקה, מעלה, ממשיך — עד סוף הבאץ'
+          # ================================================================
+          echo ""
+          echo "   ⏱️  Batch: $(date -u -d @${BATCH_START} '+%H:%M:%S') → $(date -u -d @${BATCH_END} '+%H:%M:%S') UTC"
+          echo ""
+
+          while [ $(date -u +%s) -lt $BATCH_END ]; do
+            SEGMENT_COUNT=$((SEGMENT_COUNT + 1))
+            NOW_TS=$(date -u +"%Y%m%d_%H%M")
+            SEG_FILE="${TMP_DIR}/ch14_${NOW_TS}.ts"
+
+            echo "   🎬 Segment #${SEGMENT_COUNT} [${NOW_TS}] ─ capturing ${SEGMENT_SEC}s..."
+
+            if extract_segment "$SEG_FILE"; then
+              # Upload in background (don't block next capture)
+              zip_and_upload "$SEG_FILE" "$NOW_TS" &
+              UPLOADED_COUNT=$((UPLOADED_COUNT + 1))
+            else
+              echo "   ⚠️ Segment #${SEGMENT_COUNT} failed, retrying with next URL..."
+              rm -f "$SEG_FILE"
+              sleep 3
+            fi
+          done
+
+          # Wait for background uploads to finish
+          echo ""
+          echo "   ⏳ Waiting for remaining uploads..."
+          wait
+
+          echo ""
+          echo "   ✅ BATCH COMPLETE: ${UPLOADED_COUNT}/${SEGMENT_COUNT} segments uploaded"
+          echo "STATUS=success" >> $GITHUB_OUTPUT
+          echo "SEGMENT_COUNT=${SEGMENT_COUNT}" >> $GITHUB_OUTPUT
+          echo "UPLOADED_COUNT=${UPLOADED_COUNT}" >> $GITHUB_OUTPUT
 
           rm -rf "$TMP_DIR"
-          echo "✅ [$(date -u +"%H:%M:%S")] SUCCESS"
-
-          echo "STATUS=success" >> $GITHUB_OUTPUT
-          echo "FILE_NAME=$ZIP_NAME" >> $GITHUB_OUTPUT
-          echo "FILE_SIZE=$ZIP_SIZE" >> $GITHUB_OUTPUT
 
       # ================================================================
       # 4️⃣ ניקוי ZIPים ישנים מ-Drive
@@ -420,6 +406,6 @@ jobs:
           echo "=== FINAL SUMMARY ==="
           echo "Run: ${{ github.run_id }} (#${{ github.run_number }})"
           echo "Status: ${{ steps.extract_upload.outputs.STATUS || 'failed' }}"
-          echo "File: ${{ steps.extract_upload.outputs.FILE_NAME || 'N/A' }}"
+          echo "File: ${{ steps.extract_upload.outputs.SEGMENT_COUNT || '0' }} segments (${{ steps.extract_upload.outputs.UPLOADED_COUNT || '0' }} uploaded)"
           echo "Log entries: $(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)"
           echo "====================="
