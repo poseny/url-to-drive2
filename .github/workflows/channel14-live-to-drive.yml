@@ -28,16 +28,16 @@ env:
   SMTP_SERVER: "smtp.gmail.com"
   SMTP_PORT: "587"
   EMAIL_USER: "p0556722432@gmail.com"
-  # HLS URL של ערוץ 14 — Akamai CDN (ללא Cloudflare)
-  CH14_HLS_URL: "https://ch14-channel14-content.akamaized.net/hls/live/2104807/CH14_CHANNEL14/master.m3u8"
-  # Fallbacks: כתובות חלופיות (מקורות IPTV ציבוריים)
+  # HLS URL — Redge Media (עובד יציב, 2024-2026)
+  CH14_HLS_URL: "https://r.il.cdn-redge.media/livehls/oil/ch14/live/ch14/live.livx/playlist.m3u8"
+  # Fallback: Akamai CDN (עשוי לדרוש טוקן מתחלף)
   FALLBACK_HLS_URL_1: "https://ch14-channel14-content.akamaized.net/hls/live/2104807/CH14_CHANNEL14/master.m3u8"
-  # Redge Media CDN (מקור IPTV ציבורי — גיבוי)
-  FALLBACK_HLS_URL_2: "https://r.il.cdn-redge.media/livehls/oil/ch14/live/ch14/live.livx/playlist.m3u8"
+  # Fallback 2: ריק (מולא דינמית מ-yt-dlp/streamlink)
+  FALLBACK_HLS_URL_2: ""
   # אתר ערוץ 14 (לחילוץ HLS URL דינמי דרך yt-dlp / streamlink)
   CH14_WEBSITE_URL: "https://www.now14.co.il/live"
-  # Headers לשליחה ל-ffmpeg (Referer עוזר לעקוף חסימות CDN)
-  FFMPEG_HEADERS: "Referer: https://www.now14.co.il/\r\nOrigin: https://www.now14.co.il"
+  # Headers — ריק כברירת מחדל (Redge לא דורש, Akamai דוחה עם headers)
+  FFMPEG_HEADERS: ""
   # חפיפה של 30 שניות בין הרצות cron — מונע פערים
   BATCH_DURATION_SECONDS: "330"
   SEGMENT_SECONDS: "60"
@@ -143,30 +143,49 @@ jobs:
           SEGMENT_COUNT=0
           UPLOADED_COUNT=0
 
-          # Build headers file for ffmpeg
+          # Build headers file for ffmpeg (only if headers are configured)
           HEADERS_FILE="${TMP_DIR}/ffmpeg_headers.txt"
-          echo -e "${FFMPEG_HEADERS}" > "$HEADERS_FILE"
+          if [ -n "${FFMPEG_HEADERS}" ]; then
+            echo -e "${FFMPEG_HEADERS}" > "$HEADERS_FILE"
+          fi
 
-          # Resolve HLS URL
+          # Resolve HLS URL (validate output — yt-dlp can leak errors into stdout)
           RESOLVED_HLS_URL=""
           echo "🔍 [$(date -u +"%H:%M:%S")] Resolving live HLS URL..."
 
+          # Helper: only accept URLs that start with http
+          is_valid_url() {
+            [[ "$1" =~ ^https?:// ]]
+          }
+
           if JSON_INFO=$(yt-dlp --dump-json --no-download --flat-playlist "$CH14_WEBSITE_URL" 2>/dev/null); then
-            RESOLVED_HLS_URL=$(echo "$JSON_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
-            [ -n "$RESOLVED_HLS_URL" ] && echo "   ✅ yt-dlp resolved: $RESOLVED_HLS_URL"
+            CANDIDATE=$(echo "$JSON_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
+            if is_valid_url "$CANDIDATE"; then
+              RESOLVED_HLS_URL="$CANDIDATE"
+              echo "   ✅ yt-dlp resolved: $RESOLVED_HLS_URL"
+            else
+              echo "   ⚠️ yt-dlp returned non-URL: ${CANDIDATE:0:80}"
+            fi
           fi
 
           if [ -z "$RESOLVED_HLS_URL" ]; then
             echo "   🔄 Trying streamlink..."
-            RESOLVED_HLS_URL=$(streamlink --stream-url "$CH14_WEBSITE_URL" best 2>/dev/null || echo "")
-            [ -n "$RESOLVED_HLS_URL" ] && echo "   ✅ streamlink resolved: $RESOLVED_HLS_URL"
+            CANDIDATE=$(streamlink --stream-url "$CH14_WEBSITE_URL" best 2>/dev/null || echo "")
+            if is_valid_url "$CANDIDATE"; then
+              RESOLVED_HLS_URL="$CANDIDATE"
+              echo "   ✅ streamlink resolved: $RESOLVED_HLS_URL"
+            fi
           fi
 
           if [ -z "$RESOLVED_HLS_URL" ] && [ -n "$CH14_COOKIES" ]; then
             echo "   🔄 Trying yt-dlp with user cookies..."
             echo "$CH14_COOKIES" > "${TMP_DIR}/cookies.txt"
             if JSON_INFO=$(yt-dlp --dump-json --no-download --cookies "${TMP_DIR}/cookies.txt" "$CH14_WEBSITE_URL" 2>/dev/null); then
-              RESOLVED_HLS_URL=$(echo "$JSON_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
+              CANDIDATE=$(echo "$JSON_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
+              if is_valid_url "$CANDIDATE"; then
+                RESOLVED_HLS_URL="$CANDIDATE"
+                echo "   ✅ yt-dlp+cookies resolved: $RESOLVED_HLS_URL"
+              fi
             fi
           fi
 
@@ -183,8 +202,12 @@ jobs:
             for HLS_URL in "${HLS_URLS[@]}"; do
               local attempt=1
               while [ $attempt -le 2 ]; do
+                local hdr_arg=""
+                if [ -s "$HEADERS_FILE" ]; then
+                  hdr_arg="-headers $(cat "$HEADERS_FILE")"
+                fi
                 ffmpeg -y \
-                  -headers "$(cat "$HEADERS_FILE")" \
+                  $hdr_arg \
                   -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 \
                   -i "$HLS_URL" \
                   -t "$SEGMENT_SEC" \
