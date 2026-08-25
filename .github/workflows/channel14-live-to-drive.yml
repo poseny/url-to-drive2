@@ -218,9 +218,27 @@ jobs:
           HLS_URLS=("$CH14_HLS_URL")
           echo "   📋 Primary URL: ${CH14_HLS_URL:0:70}..."
 
+          # ---- Pre-flight checks: diagnose failures in the FIRST minute, not at the end ----
+          echo "   🔍 Pre-flight: checking HLS playlist..."
+          if curl -fsS --max-time 15 -o /dev/null "$CH14_HLS_URL" 2>/dev/null; then
+            echo "   ✅ HLS playlist reachable"
+          else
+            echo "   ⚠️ HLS playlist NOT reachable (stream down?) — will keep trying in the loop"
+            send_heartbeat "⚠️ HLS unreachable"
+          fi
+
+          echo "   🔍 Pre-flight: checking rclone Drive access..."
+          if timeout 30 rclone lsd gdrive: >/dev/null 2>&1; then
+            echo "   ✅ rclone can reach Google Drive"
+          else
+            echo "   ⚠️ rclone CANNOT reach Google Drive — uploads will fail"
+            send_heartbeat "⚠️ rclone Drive access failed"
+          fi
+
           # Extract one segment (single URL, hard timeout so one bad minute can't stall the run)
           extract_segment() {
             local seg_file="$1"
+            local HLS_URL="${HLS_URLS[0]}"
             local attempt=1
 
             while [ $attempt -le 3 ]; do
