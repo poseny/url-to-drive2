@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       batch_duration_minutes:
-        description: "כמה דקות לרוץ ברציפות (ברירת מחדל 340 ≈ 5.7 שעות). מגבלת GitHub ל-repo ציבורי: 360 דקות. ל-repo פרטי אפשר יותר (עד 35 ימים)."
+        description: "כמה דקות לרוץ ברציפות (ברירת מחדל 340 ≈ 5.7 שעות). מגבלת GitHub-hosted runner: 360 דקות להרצה (גם פרטי וגם ציבורי) — ערכים מעל 350 יקוצצו אוטומטית."
         required: false
         default: "340"
       segment_seconds:
@@ -43,7 +43,7 @@ env:
 jobs:
   extract-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ fromJSON(inputs.batch_duration_minutes || '340') + 10 }}
+    timeout-minutes: 355
     permissions:
       contents: read
       actions: read
@@ -124,6 +124,12 @@ jobs:
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
 
+          # GitHub-hosted runners cap every job at 360 minutes — clamp the input so
+          # the loop always finishes (and cleanup + email run) before GitHub kills it.
+          if [ "$BATCH_MINUTES" -gt 350 ]; then
+            echo "   ⚠️ Requested ${BATCH_MINUTES} min > GitHub-hosted limit (360 min) — clamping to 350 min"
+            BATCH_MINUTES=350
+          fi
           BATCH_DURATION=$((BATCH_MINUTES * 60))
           echo "🚀 [$(date -u +"%H:%M:%S")] Starting CONTINUOUS extraction (batch: ${BATCH_MINUTES} min, segments: ${SEGMENT_SEC}s)"
           echo "   Stop: Cancel the run on GitHub (or start a new run — the old one stops automatically)"
