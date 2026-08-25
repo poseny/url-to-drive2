@@ -17,10 +17,6 @@ on:
         description: "מספר נסיונות במקרה של כשל"
         required: false
         default: "2"
-      cookies:
-        description: "עוגיות (Netscape format) — אופציונלי, עוקף Cloudflare אם ה-HLS חסום"
-        required: false
-        default: ""
 
 env:
   EMAIL_TO: "p0556722432@gmail.com"
@@ -28,16 +24,12 @@ env:
   SMTP_SERVER: "smtp.gmail.com"
   SMTP_PORT: "587"
   EMAIL_USER: "p0556722432@gmail.com"
-  # HLS URL — Redge Media (עובד יציב, 2024-2026)
+  # HLS URL — Redge Media (stable, 2024-2026)
   CH14_HLS_URL: "https://r.il.cdn-redge.media/livehls/oil/ch14/live/ch14/live.livx/playlist.m3u8"
-  # Fallback: Akamai CDN (עשוי לדרוש טוקן מתחלף)
-  FALLBACK_HLS_URL_1: "https://ch14-channel14-content.akamaized.net/hls/live/2104807/CH14_CHANNEL14/master.m3u8"
-  # Fallback 2: ריק (מולא דינמית מ-yt-dlp/streamlink)
-  FALLBACK_HLS_URL_2: ""
-  # אתר ערוץ 14 (לחילוץ HLS URL דינמי דרך yt-dlp / streamlink)
-  CH14_WEBSITE_URL: "https://www.now14.co.il/live"
-  # Headers — ריק כברירת מחדל (Redge לא דורש, Akamai דוחה עם headers)
+  # Headers — empty (Redge doesn't need them)
   FFMPEG_HEADERS: ""
+  # אתר ערוץ 14 (לשימוש עתידי אם ה-CDN משתנה)
+  CH14_WEBSITE_URL: "https://www.now14.co.il/live"
   # חפיפה של 30 שניות בין הרצות cron — מונע פערים
   BATCH_DURATION_SECONDS: "330"
   SEGMENT_SECONDS: "60"
@@ -79,7 +71,7 @@ jobs:
           echo "🔧 [$(date -u +"%H:%M:%S")] Installing dependencies..."
           curl -fsSL https://rclone.org/install.sh | sudo bash
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg msmtp msmtp-mta
-          pip install -q -U yt-dlp streamlink
+          pip install -q -U yt-dlp
           echo "✅ Dependencies installed"
 
       # ================================================================
@@ -127,7 +119,6 @@ jobs:
           BATCH_DURATION: ${{ github.event.inputs.batch_duration_seconds || env.BATCH_DURATION_SECONDS || '330' }}
           SEGMENT_SEC: ${{ env.SEGMENT_SECONDS || '60' }}
           MAX_RETRIES: ${{ github.event.inputs.retries || '2' }}
-          CH14_COOKIES: ${{ github.event.inputs.cookies || env.CH14_COOKIES }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
@@ -149,89 +140,43 @@ jobs:
             echo -e "${FFMPEG_HEADERS}" > "$HEADERS_FILE"
           fi
 
-          # Resolve HLS URL (validate output — yt-dlp can leak errors into stdout)
-          RESOLVED_HLS_URL=""
-          echo "🔍 [$(date -u +"%H:%M:%S")] Resolving live HLS URL..."
+          # -------------------------------------------
+          # HLS URLs — Redge Media primary, nothing else
+          # Akamai dead (400), yt-dlp/streamlink blocked by Cloudflare
+          # -------------------------------------------
+          HLS_URLS=("$CH14_HLS_URL")
+          echo "   📋 Primary URL: ${CH14_HLS_URL:0:70}..."
 
-          # Helper: only accept URLs that start with http
-          is_valid_url() {
-            [[ "$1" =~ ^https?:// ]]
-          }
-
-          if JSON_INFO=$(yt-dlp --dump-json --no-download --flat-playlist "$CH14_WEBSITE_URL" 2>/dev/null); then
-            CANDIDATE=$(echo "$JSON_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
-            if is_valid_url "$CANDIDATE"; then
-              RESOLVED_HLS_URL="$CANDIDATE"
-              echo "   ✅ yt-dlp resolved: $RESOLVED_HLS_URL"
-            else
-              echo "   ⚠️ yt-dlp returned non-URL: ${CANDIDATE:0:80}"
-            fi
-          fi
-
-          if [ -z "$RESOLVED_HLS_URL" ]; then
-            echo "   🔄 Trying streamlink..."
-            CANDIDATE=$(streamlink --stream-url "$CH14_WEBSITE_URL" best 2>/dev/null || echo "")
-            if is_valid_url "$CANDIDATE"; then
-              RESOLVED_HLS_URL="$CANDIDATE"
-              echo "   ✅ streamlink resolved: $RESOLVED_HLS_URL"
-            fi
-          fi
-
-          if [ -z "$RESOLVED_HLS_URL" ] && [ -n "$CH14_COOKIES" ]; then
-            echo "   🔄 Trying yt-dlp with user cookies..."
-            echo "$CH14_COOKIES" > "${TMP_DIR}/cookies.txt"
-            if JSON_INFO=$(yt-dlp --dump-json --no-download --cookies "${TMP_DIR}/cookies.txt" "$CH14_WEBSITE_URL" 2>/dev/null); then
-              CANDIDATE=$(echo "$JSON_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
-              if is_valid_url "$CANDIDATE"; then
-                RESOLVED_HLS_URL="$CANDIDATE"
-                echo "   ✅ yt-dlp+cookies resolved: $RESOLVED_HLS_URL"
-              fi
-            fi
-          fi
-
-          HLS_URLS=()
-          [ -n "$RESOLVED_HLS_URL" ] && HLS_URLS+=("$RESOLVED_HLS_URL")
-          [ -n "$CH14_HLS_URL" ] && HLS_URLS+=("$CH14_HLS_URL")
-          [ -n "$FALLBACK_HLS_URL_1" ] && HLS_URLS+=("$FALLBACK_HLS_URL_1")
-          [ -n "$FALLBACK_HLS_URL_2" ] && HLS_URLS+=("$FALLBACK_HLS_URL_2")
-          echo "   📋 ${#HLS_URLS[@]} HLS URL(s) queued"
-
-          # Extract one segment (tries all URLs)
+          # Extract one segment (single URL, no fallback to broken services)
           extract_segment() {
             local seg_file="$1"
-            for HLS_URL in "${HLS_URLS[@]}"; do
-              local attempt=1
-              while [ $attempt -le 2 ]; do
-                local hdr_arg=""
-                if [ -s "$HEADERS_FILE" ]; then
-                  hdr_arg="-headers $(cat "$HEADERS_FILE")"
-                fi
-                ffmpeg -y \
-                  $hdr_arg \
-                  -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 \
-                  -i "$HLS_URL" \
-                  -t "$SEGMENT_SEC" \
-                  -c copy \
-                  -f mpegts \
-                  "$seg_file" \
-                  2>&1 | tail -5
+            local HLS_URL="${HLS_URLS[0]}"
+            local attempt=1
 
-                if [ ${PIPESTATUS[0]} -eq 0 ] && [ -s "$seg_file" ]; then
-                  echo "      ✅ $(numfmt --to=iec $(stat -c%s "$seg_file")) from $HLS_URL"
-                  return 0
-                fi
+            while [ $attempt -le 3 ]; do
+              local hdr_arg=""
+              if [ -s "$HEADERS_FILE" ]; then
+                hdr_arg="-headers $(cat "$HEADERS_FILE")"
+              fi
 
-                if [ $attempt -ge 2 ]; then
-                  echo "      🔄 yt-dlp fallback..."
-                  yt-dlp --downloader ffmpeg --downloader-args "ffmpeg:-t ${SEGMENT_SEC}" -o "$seg_file" "$HLS_URL" 2>&1 | tail -3
-                  if [ -s "$seg_file" ]; then
-                    echo "      ✅ $(numfmt --to=iec $(stat -c%s "$seg_file")) via yt-dlp"
-                    return 0
-                  fi
-                fi
-                attempt=$((attempt + 1))
-                sleep 2
-              done
+              ffmpeg -y \
+                $hdr_arg \
+                -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 \
+                -i "$HLS_URL" \
+                -t "$SEGMENT_SEC" \
+                -c copy \
+                -f mpegts \
+                "$seg_file" \
+                2>&1 | tail -5
+
+              if [ ${PIPESTATUS[0]} -eq 0 ] && [ -s "$seg_file" ]; then
+                echo "      ✅ $(numfmt --to=iec $(stat -c%s "$seg_file"))"
+                return 0
+              fi
+
+              echo "      ⚠️ attempt $attempt failed, retrying in 3s..."
+              attempt=$((attempt + 1))
+              sleep 3
             done
             return 1
           }
