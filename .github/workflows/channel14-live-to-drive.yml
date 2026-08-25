@@ -298,7 +298,9 @@ jobs:
             # --tpslimit / --drive-pacer-min-sleep מפחיתים Rate-Limit מ-Google
             local sleep_s=10
             for up in 1 2 3 4 5; do
-              if rclone copy "$zip_path" "gdrive:${FOLDER}/${zip_name}" \
+              # rclone copy treats the destination as a DIRECTORY — pass the folder
+              # only, so the zip lands directly in ${FOLDER}/ (no folder-per-file)
+              if rclone copy "$zip_path" "gdrive:${FOLDER}" \
                   --retries 5 --retries-sleep 5s --low-level-retries 10 \
                   --tpslimit 4 --tpslimit-burst 8 --drive-pacer-min-sleep 100ms \
                   --timeout 60s > /dev/null 2>&1; then
@@ -399,12 +401,13 @@ jobs:
 
           echo "   Retention: ${RETENTION_MINUTES} minutes (before $CUTOFF)"
 
-          rclone lsf --files-only "$REMOTE_DIR" 2>/dev/null | while read -r fname; do
-            if [[ "$fname" =~ channel14_([0-9]{8}_[0-9]{4})\\.zip ]]; then
+          # List files AND dirs — old versions created a folder per file, so clean those too
+          rclone lsf "$REMOTE_DIR" 2>/dev/null | while read -r fname; do
+            if [[ "$fname" =~ ^channel14_([0-9]{8}_[0-9]{4})\.zip/?$ ]]; then
               fts="${BASH_REMATCH[1]}"
               if [[ "$fts" < "$CUTOFF" ]]; then
                 echo "   🗑️ Deleting: $fname (timestamp: $fts)"
-                rclone delete "${REMOTE_DIR}/${fname}" 2>/dev/null || true
+                rclone purge "${REMOTE_DIR}/${fname}" 2>/dev/null || rclone delete "${REMOTE_DIR}/${fname}" 2>/dev/null || true
               fi
             fi
           done
