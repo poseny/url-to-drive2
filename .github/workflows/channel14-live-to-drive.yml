@@ -24,6 +24,10 @@ on:
         description: "מחיקת קבצים ישנים מה-Drive אחרי כמה דקות (240 = 4 שעות)"
         required: false
         default: "240"
+      heartbeat_minutes:
+        description: "שליחת מייל סטטוס חי כל כמה דקות (0 = כבוי). ברירת מחדל 10"
+        required: false
+        default: "10"
 
 concurrency:
   group: channel14-live-to-drive
@@ -106,7 +110,7 @@ jobs:
           chmod 600 ~/.config/rclone/rclone.conf
 
           echo "🔍 Testing rclone connection..."
-          rclone lsd gdrive: 2>&1 | head -5 || echo "⚠️ rclone lsd had issues (may be normal)"
+          timeout 30 rclone lsd gdrive: 2>&1 | head -5 || echo "⚠️ rclone lsd timed out/failed (continuing anyway)"
           echo "✅ rclone configured"
 
       # ================================================================
@@ -120,6 +124,8 @@ jobs:
           FOLDER: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}
           BATCH_MINUTES: ${{ github.event.inputs.batch_duration_minutes || '340' }}
           SEGMENT_SEC: ${{ github.event.inputs.segment_seconds || '60' }}
+          HEARTBEAT_MIN: ${{ github.event.inputs.heartbeat_minutes || '10' }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
@@ -143,7 +149,64 @@ jobs:
           SEGMENT_COUNT=0
           CONSEC_FAIL=0
           UPLOADED_FILE="${TMP_DIR}/uploaded.txt"
+          SEGMENTS_FILE="${TMP_DIR}/segments.txt"
           : > "$UPLOADED_FILE"
+          : > "$SEGMENTS_FILE"
+
+          # ---- msmtp config (for live heartbeat emails during the run) ----
+          if [ -n "$EMAIL_PASSWORD" ]; then
+            mkdir -p ~/.msmtp
+            cat > ~/.msmtprc <<MSMTPEOF
+          defaults
+          auth on
+          tls on
+          tls_trust_file /etc/ssl/certs/ca-certificates.crt
+          logfile ~/.msmtp.log
+          account gmail
+          host $SMTP_SERVER
+          port $SMTP_PORT
+          from $EMAIL_FROM
+          user $EMAIL_USER
+          password $EMAIL_PASSWORD
+          account default : gmail
+          MSMTPEOF
+            chmod 600 ~/.msmtprc
+            echo "📧 Heartbeat emails enabled (every ${HEARTBEAT_MIN} min)"
+          else
+            echo "⚠️ EMAIL_PASSWORD empty — no heartbeat emails"
+          fi
+
+          send_heartbeat() {
+            local label="${1:-Heartbeat}"
+            local sc=$(cat "$SEGMENTS_FILE" 2>/dev/null || echo 0)
+            local up=$(wc -l < "$UPLOADED_FILE" 2>/dev/null || echo 0)
+            local now=$(date -u +%s)
+            local el=$(( (now - BATCH_START) / 60 ))
+            local rem=$(( (BATCH_END - now) / 60 ))
+            [ $rem -lt 0 ] && rem=0
+            local body=""
+            body+="⏱️ Live status — ${el} min elapsed, ~${rem} min remaining\n"
+            body+="📊 Captured: ${sc} segments | Uploaded to Drive: ${up}\n"
+            body+="📂 Folder: ${FOLDER}\n"
+            body+="🏃 Run: ${{ github.run_id }}\n"
+            body+="\n--- Last 30 lines of log ---\n"
+            body+=$(tail -30 "$LOG_FILE")
+            echo -e "Subject: [CH14 Live] ${label} — ${up} files in Drive\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n${body}" | msmtp -a gmail "$EMAIL_TO" 2>/dev/null || true
+            echo "📧 [$(date -u +"%H:%M:%S")] ${label} sent (${up} uploaded)"
+          }
+
+          # Background heartbeat — fires every HEARTBEAT_MIN minutes no matter what
+          HEARTBEAT_PID=""
+          if [ "${HEARTBEAT_MIN:-10}" -gt 0 ] 2>/dev/null && [ -n "$EMAIL_PASSWORD" ]; then
+            (
+              HB_SLEEP=$((HEARTBEAT_MIN * 60))
+              while true; do
+                sleep "$HB_SLEEP"
+                send_heartbeat
+              done
+            ) &
+            HEARTBEAT_PID=$!
+          fi
 
           # Build headers file for ffmpeg (only if headers are configured)
           HEADERS_FILE="${TMP_DIR}/ffmpeg_headers.txt"
@@ -168,7 +231,7 @@ jobs:
 
               timeout 120 ffmpeg -y -nostdin \
                 $hdr_arg \
-                -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 -rw_timeout 20000000 \
+                -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 \
                 -i "$HLS_URL" \
                 -t "$SEGMENT_SEC" \
                 -c copy \
@@ -242,6 +305,7 @@ jobs:
 
           while [ $(date -u +%s) -lt $BATCH_END ]; do
             SEGMENT_COUNT=$((SEGMENT_COUNT + 1))
+            echo "$SEGMENT_COUNT" > "$SEGMENTS_FILE"
             NOW_TS=$(date -u +"%Y%m%d_%H%M")
             SEG_FILE="${TMP_DIR}/ch14_${NOW_TS}.ts"
 
@@ -263,10 +327,18 @@ jobs:
                 sleep 3
               fi
             fi
+
+            # Early alert: after 3 attempts, if nothing reached Drive — email now
+            if [ "$SEGMENT_COUNT" -eq 3 ] && [ ! -s "$UPLOADED_FILE" ]; then
+              echo "   🚨 3 segments attempted but 0 uploaded — sending alert email"
+              send_heartbeat "🚨 No uploads yet"
+            fi
           done
 
-          # Wait for background uploads (|| true — wait returns nonzero if a job failed,
-          # but we count real successes ourselves from $UPLOADED_FILE)
+          # Stop the heartbeat loop first (otherwise wait would block on it forever),
+          # then wait for background uploads (|| true — wait returns nonzero if a job
+          # failed, but we count real successes ourselves from $UPLOADED_FILE)
+          kill "$HEARTBEAT_PID" 2>/dev/null || true
           echo ""
           echo "   ⏳ Waiting for remaining uploads..."
           wait || true
