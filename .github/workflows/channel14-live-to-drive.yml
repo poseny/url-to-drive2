@@ -250,11 +250,9 @@ jobs:
               timeout 120 ffmpeg -y -nostdin \
                 $hdr_arg \
                 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 \
-                -copyts \
                 -i "$HLS_URL" \
                 -t "$SEGMENT_SEC" \
                 -c copy \
-                -muxdelay 0 -muxpreload 0 \
                 -f mpegts \
                 "$seg_file" \
                 2>&1 | tail -3
@@ -288,8 +286,9 @@ jobs:
             fi
 
             echo "      🗜️  ${zip_name} ($(numfmt --to=iec $seg_size))"
-            (cd "$(dirname "$seg_file")" && zip -j -q "$zip_path" "$(basename "$seg_file")")
-            rm -f "$seg_file"
+            local meta_path="${seg_file%.ts}.meta"
+            (cd "$(dirname "$seg_file")" && zip -j -q "$zip_path" "$(basename "$seg_file")" "$(basename "$meta_path")" 2>/dev/null || zip -j -q "$zip_path" "$(basename "$seg_file")")
+            rm -f "$seg_file" "$meta_path"
 
             if [ ! -s "$zip_path" ]; then
               echo "      ❌ Zip failed"
@@ -330,6 +329,9 @@ jobs:
             echo "$SEGMENT_COUNT" > "$SEGMENTS_FILE"
             NOW_TS=$(date -u +"%Y%m%d_%H%M")
             SEG_FILE="${TMP_DIR}/ch14_${NOW_TS}.ts"
+            META_FILE="${TMP_DIR}/ch14_${NOW_TS}.meta"
+            CAPTURE_MS=$(date -u +%s%3N)
+            echo "$CAPTURE_MS" > "$META_FILE"
 
             echo "   🎬 Segment #${SEGMENT_COUNT} [${NOW_TS}] ─ capturing ${SEGMENT_SEC}s..."
 
