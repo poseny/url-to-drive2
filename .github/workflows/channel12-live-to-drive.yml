@@ -229,7 +229,15 @@ jobs:
           CHANNEL="${{ github.event.inputs.channel || '14' }}"
           case "$CHANNEL" in
             11) CHOSEN_HLS_URL="$CH11_HLS_URL" ;;
-            12) CHOSEN_HLS_URL="$CH12_HLS_URL" ;;
+            12)
+              # N12/Akamai may expose a signed URL through its official playlist API.
+              # Prefer that fresh URL; fall back to the configured public URL.
+              N12_API="https://www.n12.co.il/AjaxPage?jspName=playlist.jsp&vcmid=1e2258089b67f510VgnVCM2000002a0c10acRCRD&videoChannelId=31750a2610f26110VgnVCM1000005201000aRCRD&galleryChannelId=1e2258089b67f510VgnVCM2000002a0c10acRCRD&isGallery=false&consumer=web_html5&encryption=no"
+              N12_JSON=$(curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
+                -A "Mozilla/5.0" -e "https://www.n12.co.il/" "$N12_API" 2>/dev/null || true)
+              N12_DISCOVERED=$(printf '%s' "$N12_JSON" | python3 -c "import sys,re; s=sys.stdin.read(); m=re.search(r'https://mako-streaming\\.akamaized\\.net/[^\\\" ]+index\\.m3u8(?:\\?[^\\\" ]+)?', s); print(m.group(0) if m else '')" 2>/dev/null || true)
+              CHOSEN_HLS_URL="${N12_DISCOVERED:-$CH12_HLS_URL}"
+              ;;
             13) CHOSEN_HLS_URL="$CH13_HLS_URL" ;;
             14) CHOSEN_HLS_URL="$CH14_HLS_URL" ;;
             *) echo "❌ Unsupported channel: $CHANNEL"; exit 1 ;;
