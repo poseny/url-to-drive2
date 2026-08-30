@@ -1,0 +1,534 @@
+name: Channel 14 Live → Google Drive (Per Minute)
+
+on:
+  # ⏹️ מצב ידני: לחץ Run workflow → ירוץ ברציפות (קובץ לדקה) עד שתעצור אותו.
+  # לעצירה: Cancel run ב-GitHub, או פשוט הרץ שוב — ההרצה הקודמת תיעצר אוטומטית.
+  # כדי לחזור למצב אוטומטי 24/7, בטל את ההערה על בלוק ה-schedule למטה:
+  # schedule:
+  #   - cron: '*/5 * * * *'   # כל 5 דקות — כל הרצה תופסת 5.5 דקות
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "ערוץ לשידור (11, 12, 13 או 14)"
+        required: false
+        default: "14"
+      batch_duration_minutes:
+        description: "כמה דקות לרוץ ברציפות (ברירת מחדל 340 ≈ 5.7 שעות). מגבלת GitHub-hosted runner: 360 דקות להרצה (גם פרטי וגם ציבורי) — ערכים מעל 350 יקוצצו אוטומטית."
+        required: false
+        default: "340"
+      segment_seconds:
+        description: "אורך כל קטע בשניות (60 = קובץ לדקה)"
+        required: false
+        default: "60"
+      drive_folder:
+        description: "תיקיית יעד ב-Google Drive"
+        required: true
+        default: "Channel14Live"
+      retention_minutes:
+        description: "מחיקת קבצים ישנים מה-Drive אחרי כמה דקות (240 = 4 שעות)"
+        required: false
+        default: "240"
+      heartbeat_minutes:
+        description: "שליחת מייל סטטוס חי כל כמה דקות (0 = כבוי). ברירת מחדל 10"
+        required: false
+        default: "10"
+
+concurrency:
+  group: channel14-live-to-drive
+  cancel-in-progress: true
+
+env:
+  EMAIL_TO: "p0556722432@gmail.com"
+  EMAIL_FROM: "p0556722432@gmail.com"
+  SMTP_SERVER: "smtp.gmail.com"
+  SMTP_PORT: "587"
+  EMAIL_USER: "p0556722432@gmail.com"
+  # Default source. The selected channel is mapped in the extraction step.
+  CH14_HLS_URL: "https://r.il.cdn-redge.media/livehls/oil/ch14/live/ch14/live.livx/playlist.m3u8"
+  # TODO: replace these placeholders with the verified HLS URLs for each channel.
+  # The workflow fails safely instead of uploading unrelated content.
+  CH11_HLS_URL: "https://kancdn.medonecdn.net/livehls/oil/kancdn-live/live/kan11/live.livx/playlist.m3u8"
+  CH12_HLS_URL: "https://mako-streaming.akamaized.net/stream/hls/live/20000821/k12n12wad/index.m3u8"
+  CH13_HLS_URL: "https://d18b0e6mopany4.cloudfront.net/out/v1/2f2bc414a3db4698a8e94b89eaf2da2a/index.m3u8"
+  # Headers — empty (Redge doesn't need them)
+  FFMPEG_HEADERS: ""
+
+jobs:
+  extract-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      # ================================================================
+      # 1️⃣ התקנת תלויות + אתחול לוג
+      # ================================================================
+      - name: Install dependencies & Init log
+        continue-on-error: true
+        shell: bash
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "=== Channel 14 Live Extractor Log ==="
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run Number: ${{ github.run_number }}"
+          echo "Repo: ${{ github.repository }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Started: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo "Channel: ${{ github.event.inputs.channel || '14' }}"
+          echo "Duration: ${{ github.event.inputs.batch_duration_minutes || '340' }} minutes (continuous)"
+          echo "Drive Folder: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}"
+          echo "HLS URL: $CH14_HLS_URL"
+          echo "========================================"
+          echo ""
+
+          echo "🔧 [$(date -u +"%H:%M:%S")] Installing dependencies..."
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg zip msmtp msmtp-mta
+          pip install -q -U yt-dlp
+          echo "✅ Dependencies installed"
+
+      # ================================================================
+      # 2️⃣ קונפיג rclone
+      # ================================================================
+      - name: Configure rclone
+        continue-on-error: true
+        shell: bash
+        env:
+          RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🔧 [$(date -u +"%H:%M:%S")] Configuring rclone..."
+
+          if [[ -z "$RCLONE_GDRIVE_TOKEN" ]]; then
+            echo "❌ RCLONE_GDRIVE_TOKEN secret is EMPTY!"
+            exit 1
+          fi
+
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<'RCLONEEOF'
+          [gdrive]
+          type = drive
+          scope = drive.file
+          token = RCLONE_GDRIVE_TOKEN_PLACEHOLDER
+          RCLONEEOF
+          # Replace placeholder with actual token
+          sed -i "s|RCLONE_GDRIVE_TOKEN_PLACEHOLDER|$RCLONE_GDRIVE_TOKEN|g" ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+
+          echo "🔍 Testing rclone connection..."
+          timeout 30 rclone lsd gdrive: 2>&1 | head -5 || echo "⚠️ rclone lsd timed out/failed (continuing anyway)"
+          echo "✅ rclone configured"
+
+      # ================================================================
+      # 3️⃣ חילוץ דקה + ZIP + העלאה ל-Drive (לולאה רציפה עד הזמן שנקבע)
+      # ================================================================
+      - name: Extract → Zip → Upload (continuous loop)
+        continue-on-error: true
+        id: extract_upload
+        shell: bash
+        env:
+          FOLDER: ${{ github.event.inputs.drive_folder || format('Channel{0}Live', github.event.inputs.channel || '14') }}
+          BATCH_MINUTES: ${{ github.event.inputs.batch_duration_minutes || '340' }}
+          SEGMENT_SEC: ${{ github.event.inputs.segment_seconds || '60' }}
+          HEARTBEAT_MIN: ${{ github.event.inputs.heartbeat_minutes || '10' }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+
+          # GitHub-hosted runners cap every job at 360 minutes — clamp the input so
+          # the loop always finishes (and cleanup + email run) before GitHub kills it.
+          if [ "$BATCH_MINUTES" -gt 350 ]; then
+            echo "   ⚠️ Requested ${BATCH_MINUTES} min > GitHub-hosted limit (360 min) — clamping to 350 min"
+            BATCH_MINUTES=350
+          fi
+          BATCH_DURATION=$((BATCH_MINUTES * 60))
+          echo "🚀 [$(date -u +"%H:%M:%S")] Starting CONTINUOUS extraction (batch: ${BATCH_MINUTES} min, segments: ${SEGMENT_SEC}s)"
+          echo "   Stop: Cancel the run on GitHub (or start a new run — the old one stops automatically)"
+
+          set -e
+          set -o pipefail
+
+          TMP_DIR=$(mktemp -d)
+          BATCH_START=$(date -u +%s)
+          BATCH_END=$((BATCH_START + BATCH_DURATION))
+          SEGMENT_COUNT=0
+          CONSEC_FAIL=0
+          UPLOADED_FILE="${TMP_DIR}/uploaded.txt"
+          SEGMENTS_FILE="${TMP_DIR}/segments.txt"
+          : > "$UPLOADED_FILE"
+          : > "$SEGMENTS_FILE"
+
+          # ---- msmtp config (for live heartbeat emails during the run) ----
+          if [ -n "$EMAIL_PASSWORD" ]; then
+            mkdir -p ~/.msmtp
+            cat > ~/.msmtprc <<MSMTPEOF
+          defaults
+          auth on
+          tls on
+          tls_trust_file /etc/ssl/certs/ca-certificates.crt
+          logfile ~/.msmtp.log
+          account gmail
+          host $SMTP_SERVER
+          port $SMTP_PORT
+          from $EMAIL_FROM
+          user $EMAIL_USER
+          password $EMAIL_PASSWORD
+          account default : gmail
+          MSMTPEOF
+            chmod 600 ~/.msmtprc
+            echo "📧 Heartbeat emails enabled (every ${HEARTBEAT_MIN} min)"
+          else
+            echo "⚠️ EMAIL_PASSWORD empty — no heartbeat emails"
+          fi
+
+          send_heartbeat() {
+            local label="${1:-Heartbeat}"
+            local sc=$(cat "$SEGMENTS_FILE" 2>/dev/null || echo 0)
+            local up=$(wc -l < "$UPLOADED_FILE" 2>/dev/null || echo 0)
+            local now=$(date -u +%s)
+            local el=$(( (now - BATCH_START) / 60 ))
+            local rem=$(( (BATCH_END - now) / 60 ))
+            [ $rem -lt 0 ] && rem=0
+            local body=""
+            body+="⏱️ Live status — ${el} min elapsed, ~${rem} min remaining\n"
+            body+="📊 Captured: ${sc} segments | Uploaded to Drive: ${up}\n"
+            body+="📂 Folder: ${FOLDER}\n"
+            body+="🏃 Run: ${{ github.run_id }}\n"
+            body+="\n--- Last 30 lines of log ---\n"
+            body+=$(tail -30 "$LOG_FILE")
+            echo -e "Subject: [CH14 Live] ${label} — ${up} files in Drive\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n${body}" | msmtp -a gmail "$EMAIL_TO" 2>/dev/null || true
+            echo "📧 [$(date -u +"%H:%M:%S")] ${label} sent (${up} uploaded)"
+          }
+
+          # Background heartbeat — fires every HEARTBEAT_MIN minutes no matter what
+          HEARTBEAT_PID=""
+          if [ "${HEARTBEAT_MIN:-10}" -gt 0 ] 2>/dev/null && [ -n "$EMAIL_PASSWORD" ]; then
+            (
+              HB_SLEEP=$((HEARTBEAT_MIN * 60))
+              while true; do
+                sleep "$HB_SLEEP"
+                send_heartbeat
+              done
+            ) &
+            HEARTBEAT_PID=$!
+          fi
+
+          # Build headers file for ffmpeg (only if headers are configured)
+          HEADERS_FILE="${TMP_DIR}/ffmpeg_headers.txt"
+          if [ -n "${FFMPEG_HEADERS}" ]; then
+            echo -e "${FFMPEG_HEADERS}" > "$HEADERS_FILE"
+          fi
+
+          # Select the source URL for the requested channel. Fill CH11_HLS_URL,
+          # CH12_HLS_URL and CH13_HLS_URL with the verified HLS URLs before use.
+          CHANNEL="${{ github.event.inputs.channel || '14' }}"
+          case "$CHANNEL" in
+            11) CHOSEN_HLS_URL="$CH11_HLS_URL" ;;
+            12) CHOSEN_HLS_URL="$CH12_HLS_URL" ;;
+            13) CHOSEN_HLS_URL="$CH13_HLS_URL" ;;
+            14) CHOSEN_HLS_URL="$CH14_HLS_URL" ;;
+            *) echo "❌ Unsupported channel: $CHANNEL"; exit 1 ;;
+          esac
+          if [ -z "$CHOSEN_HLS_URL" ] || [[ "$CHOSEN_HLS_URL" == REPLACE_WITH_* ]]; then
+            echo "❌ No verified HLS URL configured for channel $CHANNEL"
+            exit 1
+          fi
+          if [ "$CHANNEL" = "12" ]; then
+            FFMPEG_HEADERS="Origin: https://www.n12.co.il\r\nReferer: https://www.n12.co.il/\r\nUser-Agent: Mozilla/5.0"
+          elif [ "$CHANNEL" = "13" ]; then
+            FFMPEG_HEADERS="Origin: https://kondoplay.cfd\r\nReferer: https://kondoplay.cfd/\r\nUser-Agent: Mozilla/5.0"
+          fi
+          HLS_URLS=("$CHOSEN_HLS_URL")
+          echo "   📋 Channel $CHANNEL URL: ${CHOSEN_HLS_URL:0:70}..."
+
+          # ---- Pre-flight checks: diagnose failures in the FIRST minute, not at the end ----
+          echo "   🔍 Pre-flight: checking HLS playlist..."
+          if curl -fsS --max-time 15 -o /dev/null "$CH14_HLS_URL" 2>/dev/null; then
+            echo "   ✅ HLS playlist reachable"
+          else
+            echo "   ⚠️ HLS playlist NOT reachable (stream down?) — will keep trying in the loop"
+            send_heartbeat "⚠️ HLS unreachable"
+          fi
+
+          echo "   🔍 Pre-flight: checking rclone Drive access..."
+          if timeout 30 rclone lsd gdrive: >/dev/null 2>&1; then
+            echo "   ✅ rclone can reach Google Drive"
+          else
+            echo "   ⚠️ rclone CANNOT reach Google Drive — uploads will fail"
+            send_heartbeat "⚠️ rclone Drive access failed"
+          fi
+
+          # Extract one segment (single URL, hard timeout so one bad minute can't stall the run)
+          extract_segment() {
+            local seg_file="$1"
+            local HLS_URL="${HLS_URLS[0]}"
+            local attempt=1
+
+            while [ $attempt -le 3 ]; do
+              local hdr_arg=""
+              if [ -s "$HEADERS_FILE" ]; then
+                hdr_arg="-headers $(cat "$HEADERS_FILE")"
+              fi
+
+              timeout 120 ffmpeg -y -nostdin \
+                $hdr_arg \
+                -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 \
+                -i "$HLS_URL" \
+                -t "$SEGMENT_SEC" \
+                -c copy \
+                -f mpegts \
+                "$seg_file" \
+                2>&1 | tail -3
+              local rc=${PIPESTATUS[0]}
+
+              if [ $rc -eq 0 ] && [ -s "$seg_file" ]; then
+                echo "      ✅ $(numfmt --to=iec $(stat -c%s "$seg_file"))"
+                return 0
+              fi
+
+              echo "      ⚠️ attempt $attempt failed (rc=$rc), retrying in 3s..."
+              attempt=$((attempt + 1))
+              sleep 3
+            done
+            return 1
+          }
+
+          # Zip + upload — each successful upload is recorded in $UPLOADED_FILE
+          # so the final count reflects reality, not just captured segments.
+          zip_and_upload() {
+            local seg_file="$1"
+            local ts="$2"
+            local zip_name="channel${CHANNEL}_${ts}.zip"
+            local zip_path="${TMP_DIR}/${zip_name}"
+
+            local seg_size=$(stat -c%s "$seg_file" 2>/dev/null || echo 0)
+            if [ "$seg_size" -lt 524288 ]; then
+              echo "      ⏭️  Too small (${seg_size}B), skipping"
+              rm -f "$seg_file"
+              return
+            fi
+
+            echo "      🗜️  ${zip_name} ($(numfmt --to=iec $seg_size))"
+            local meta_path="${seg_file%.ts}.meta"
+            (cd "$(dirname "$seg_file")" && zip -j -q "$zip_path" "$(basename "$seg_file")" "$(basename "$meta_path")" 2>/dev/null || zip -j -q "$zip_path" "$(basename "$seg_file")")
+            rm -f "$seg_file" "$meta_path"
+
+            if [ ! -s "$zip_path" ]; then
+              echo "      ❌ Zip failed"
+              return
+            fi
+
+            # Robust upload: rclone internal retries + 5 shell attempts with backoff.
+            # --tpslimit / --drive-pacer-min-sleep מפחיתים Rate-Limit מ-Google
+            local sleep_s=10
+            for up in 1 2 3 4 5; do
+              # rclone copy treats the destination as a DIRECTORY — pass the folder
+              # only, so the zip lands directly in ${FOLDER}/ (no folder-per-file)
+              if rclone copy "$zip_path" "gdrive:${FOLDER}" \
+                  --retries 5 --retries-sleep 5s --low-level-retries 10 \
+                  --tpslimit 4 --tpslimit-burst 8 --drive-pacer-min-sleep 100ms \
+                  --timeout 60s > /dev/null 2>&1; then
+                echo "      📤 Uploaded → ${FOLDER}/${zip_name}"
+                echo "$zip_name" >> "$UPLOADED_FILE"
+                rm -f "$zip_path"
+                return 0
+              fi
+              echo "      ⚠️ upload attempt $up failed, retrying in ${sleep_s}s..."
+              sleep "$sleep_s"
+              sleep_s=$((sleep_s * 2))
+            done
+            echo "      ❌ Upload failed after 5 attempts"
+            rm -f "$zip_path"
+            return 1
+          }
+
+          # Main loop: extract minute by minute until the batch time runs out
+          echo ""
+          echo "   ⏱️  Batch: $(date -u -d @${BATCH_START} '+%H:%M:%S') → $(date -u -d @${BATCH_END} '+%H:%M:%S') UTC"
+          echo ""
+
+          while [ $(date -u +%s) -lt $BATCH_END ]; do
+            SEGMENT_COUNT=$((SEGMENT_COUNT + 1))
+            echo "$SEGMENT_COUNT" > "$SEGMENTS_FILE"
+            NOW_TS=$(date -u +"%Y%m%d_%H%M")
+            SEG_FILE="${TMP_DIR}/ch${CHANNEL}_${NOW_TS}.ts"
+            META_FILE="${TMP_DIR}/ch${CHANNEL}_${NOW_TS}.meta"
+            CAPTURE_MS=$(date -u +%s%3N)
+            echo "$CAPTURE_MS" > "$META_FILE"
+
+            echo "   🎬 Segment #${SEGMENT_COUNT} [${NOW_TS}] ─ capturing ${SEGMENT_SEC}s..."
+
+            if extract_segment "$SEG_FILE"; then
+              CONSEC_FAIL=0
+              # Upload runs in background while the next minute is captured
+              zip_and_upload "$SEG_FILE" "$NOW_TS" &
+            else
+              echo "   ⚠️ Segment #${SEGMENT_COUNT} failed, continuing..."
+              rm -f "$SEG_FILE"
+              CONSEC_FAIL=$((CONSEC_FAIL + 1))
+              if [ $CONSEC_FAIL -ge 3 ]; then
+                echo "   💤 Stream down — waiting 60s before next attempt..."
+                sleep 60
+                CONSEC_FAIL=0
+              else
+                sleep 3
+              fi
+            fi
+
+            # Early alert: after 3 attempts, if nothing reached Drive — email now
+            if [ "$SEGMENT_COUNT" -eq 3 ] && [ ! -s "$UPLOADED_FILE" ]; then
+              echo "   🚨 3 segments attempted but 0 uploaded — sending alert email"
+              send_heartbeat "🚨 No uploads yet"
+            fi
+          done
+
+          # Stop the heartbeat loop first (otherwise wait would block on it forever),
+          # then wait for background uploads (|| true — wait returns nonzero if a job
+          # failed, but we count real successes ourselves from $UPLOADED_FILE)
+          kill "$HEARTBEAT_PID" 2>/dev/null || true
+          echo ""
+          echo "   ⏳ Waiting for remaining uploads..."
+          wait || true
+
+          UPLOADED_COUNT=$(wc -l < "$UPLOADED_FILE" 2>/dev/null || echo 0)
+
+          echo ""
+          echo "   ✅ BATCH COMPLETE: ${UPLOADED_COUNT}/${SEGMENT_COUNT} segments ACTUALLY uploaded to Drive"
+          if [ "$UPLOADED_COUNT" -gt 0 ]; then
+            echo "STATUS=success" >> $GITHUB_OUTPUT
+          else
+            echo "STATUS=failed" >> $GITHUB_OUTPUT
+          fi
+          echo "SEGMENT_COUNT=${SEGMENT_COUNT}" >> $GITHUB_OUTPUT
+          echo "UPLOADED_COUNT=${UPLOADED_COUNT}" >> $GITHUB_OUTPUT
+
+          rm -rf "$TMP_DIR"
+
+      # ================================================================
+      # 4️⃣ ניקוי ZIPים ישנים מ-Drive
+      # ================================================================
+      - name: Cleanup old ZIPs from Drive
+        continue-on-error: true
+        shell: bash
+        env:
+          FOLDER: ${{ github.event.inputs.drive_folder || format('Channel{0}Live', github.event.inputs.channel || '14') }}
+          RETENTION_MINUTES: ${{ github.event.inputs.retention_minutes || '240' }}
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "🧹 [$(date -u +"%H:%M:%S")] Cleaning old ZIPs from Drive..."
+
+          REMOTE_DIR="gdrive:${FOLDER}"
+          CUTOFF=$(date -u -d "${RETENTION_MINUTES} minutes ago" +"%Y%m%d_%H%M" 2>/dev/null || echo "")
+
+          if [ -z "$CUTOFF" ]; then
+            echo "⚠️ Could not compute cutoff time. Skipping cleanup."
+            exit 0
+          fi
+
+          echo "   Retention: ${RETENTION_MINUTES} minutes (before $CUTOFF)"
+
+          # List files AND dirs — old versions created a folder per file, so clean those too
+          rclone lsf "$REMOTE_DIR" 2>/dev/null | while read -r fname; do
+            if [[ "$fname" =~ ^channel14_([0-9]{8}_[0-9]{4})\.zip/?$ ]]; then
+              fts="${BASH_REMATCH[1]}"
+              if [[ "$fts" < "$CUTOFF" ]]; then
+                echo "   🗑️ Deleting: $fname (timestamp: $fts)"
+                rclone purge "${REMOTE_DIR}/${fname}" 2>/dev/null || rclone delete "${REMOTE_DIR}/${fname}" 2>/dev/null || true
+              fi
+            fi
+          done
+
+          echo "✅ Cleanup complete"
+
+      # ================================================================
+      # 5️⃣ שליחת אימיול (תמיד — גם בהצלחה וגם בכשל)
+      # ================================================================
+      - name: Send log email
+        if: always()
+        shell: bash
+        env:
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          STATUS: ${{ steps.extract_upload.outputs.STATUS || 'failed' }}
+          SEGMENT_COUNT: ${{ steps.extract_upload.outputs.SEGMENT_COUNT || '0' }}
+          UPLOADED_COUNT: ${{ steps.extract_upload.outputs.UPLOADED_COUNT || '0' }}
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo "📧 [$(date -u +"%H:%M:%S")] Preparing email..."
+
+          if [[ -z "$EMAIL_PASSWORD" ]]; then
+            echo "⚠️ EMAIL_PASSWORD secret is EMPTY – skipping email send"
+            exit 0
+          fi
+
+          mkdir -p ~/.msmtp
+          cat > ~/.msmtprc <<MSMTPEOF
+          defaults
+          auth on
+          tls on
+          tls_trust_file /etc/ssl/certs/ca-certificates.crt
+          logfile ~/.msmtp.log
+          account gmail
+          host $SMTP_SERVER
+          port $SMTP_PORT
+          from $EMAIL_FROM
+          user $EMAIL_USER
+          password $EMAIL_PASSWORD
+          account default : gmail
+          MSMTPEOF
+          chmod 600 ~/.msmtprc
+
+          if [[ "$STATUS" == "success" ]]; then
+            SUBJECT="✅ [CH14 Live] Batch SUCCESS — ${UPLOADED_COUNT} segments uploaded"
+            PREFIX="הבאץ' הושלם בהצלחה."
+          else
+            SUBJECT="❌ [CH14 Live] Batch FAILED — Run ${{ github.run_id }}"
+            PREFIX="הבאץ' נכשל!"
+          fi
+
+          BODY="${PREFIX}\\n\\n"
+          BODY+="📊 Segments: ${UPLOADED_COUNT}/${SEGMENT_COUNT} actually uploaded to Drive\\n"
+          BODY+="📺 Channel: ${{ github.event.inputs.channel || '14' }}\\n"
+          BODY+="📂 Folder: ${{ github.event.inputs.drive_folder || format('Channel{0}Live', github.event.inputs.channel || '14') }}\\n"
+          BODY+="🏃 Run: ${{ github.run_id }} (#${{ github.run_number }})\\n"
+          BODY+="⏱️ Time: $(date -u +"%Y-%m-%d %H:%M:%S UTC")\\n"
+          BODY+="\\n--- Last 80 lines of log ---\\n"
+          BODY+=$(tail -80 "$LOG_FILE")
+
+          echo -e "Subject: $SUBJECT\\nFrom: $EMAIL_FROM\\nTo: $EMAIL_TO\\nContent-Type: text/plain; charset=UTF-8\\n\\n$BODY" | msmtp -a gmail "$EMAIL_TO"
+          echo "✅ Email sent to $EMAIL_TO"
+
+      # ================================================================
+      # 6️⃣ העלאת לוג כ-Artifact
+      # ================================================================
+      - name: Upload log as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ch14-live-log-${{ github.run_id }}
+          path: ${{ runner.temp }}/workflow_log.txt
+          retention-days: 3
+          if-no-files-found: warn
+
+      # ================================================================
+      # 7️⃣ סיכום
+      # ================================================================
+      - name: Final summary
+        if: always()
+        shell: bash
+        run: |
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          exec >> "$LOG_FILE" 2>&1
+          echo ""
+          echo "=== FINAL SUMMARY ==="
+          echo "Run: ${{ github.run_id }} (#${{ github.run_number }})"
+          echo "Status: ${{ steps.extract_upload.outputs.STATUS || 'failed' }}"
+          echo "Segments: ${{ steps.extract_upload.outputs.SEGMENT_COUNT || '0' }} total, ${{ steps.extract_upload.outputs.UPLOADED_COUNT || '0' }} uploaded"
+          echo "Log entries: $(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)"
+          echo "====================="
