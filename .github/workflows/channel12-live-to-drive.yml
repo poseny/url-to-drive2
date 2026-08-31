@@ -45,10 +45,10 @@ env:
   EMAIL_USER: "p0556722432@gmail.com"
   # Default source. The selected channel is mapped in the extraction step.
   CH14_HLS_URL: "https://r.il.cdn-redge.media/livehls/oil/ch14/live/ch14/live.livx/playlist.m3u8"
-  # TODO: replace these placeholders with the verified HLS URLs for each channel.
-  # The workflow fails safely instead of uploading unrelated content.
+  # The selected channel is validated before recording. Channel 12 uses the
+  # current N12/Akamai direct rendition as a fallback if discovery is unavailable.
   CH11_HLS_URL: "https://kancdn.medonecdn.net/livehls/oil/kancdn-live/live/kan11/live.livx/playlist.m3u8"
-  CH12_HLS_URL: "https://mako-streaming.akamaized.net/stream/hls/live/20000821/k12n12wad/index.m3u8"
+  CH12_HLS_URL: "https://mako-streaming.akamaized.net/direct/hls/live/20000821/k12ni-bu/index.m3u8?b-in-range=0-800"
   CH13_HLS_URL: "https://d18b0e6mopany4.cloudfront.net/out/v1/2f2bc414a3db4698a8e94b89eaf2da2a/index.m3u8"
   # Headers — empty (Redge doesn't need them)
   FFMPEG_HEADERS: ""
@@ -127,11 +127,10 @@ jobs:
       # 3️⃣ חילוץ דקה + ZIP + העלאה ל-Drive (לולאה רציפה עד הזמן שנקבע)
       # ================================================================
       - name: Extract → Zip → Upload (continuous loop)
-        continue-on-error: true
         id: extract_upload
         shell: bash
         env:
-          FOLDER: ${{ github.event.inputs.drive_folder || format('Channel{0}Live', github.event.inputs.channel || '14') }}
+          FOLDER: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}
           BATCH_MINUTES: ${{ github.event.inputs.batch_duration_minutes || '340' }}
           SEGMENT_SEC: ${{ github.event.inputs.segment_seconds || '60' }}
           HEARTBEAT_MIN: ${{ github.event.inputs.heartbeat_minutes || '10' }}
@@ -218,25 +217,52 @@ jobs:
             HEARTBEAT_PID=$!
           fi
 
-          # Build headers file for ffmpeg (only if headers are configured)
-          HEADERS_FILE="${TMP_DIR}/ffmpeg_headers.txt"
-          if [ -n "${FFMPEG_HEADERS}" ]; then
-            echo -e "${FFMPEG_HEADERS}" > "$HEADERS_FILE"
-          fi
-
-          # Select the source URL for the requested channel. Fill CH11_HLS_URL,
-          # CH12_HLS_URL and CH13_HLS_URL with the verified HLS URLs before use.
+          # Select the source URL for the requested channel. Channel 12 must
+          # use the current URL published by N12; a stale static Akamai URL
+          # returns 403 and must never be sent to the long capture loop.
           CHANNEL="${{ github.event.inputs.channel || '14' }}"
           case "$CHANNEL" in
             11) CHOSEN_HLS_URL="$CH11_HLS_URL" ;;
             12)
-              # N12/Akamai may expose a signed URL through its official playlist API.
-              # Prefer that fresh URL; fall back to the configured public URL.
               N12_API="https://www.n12.co.il/AjaxPage?jspName=playlist.jsp&vcmid=1e2258089b67f510VgnVCM2000002a0c10acRCRD&videoChannelId=31750a2610f26110VgnVCM1000005201000aRCRD&galleryChannelId=1e2258089b67f510VgnVCM2000002a0c10acRCRD&isGallery=false&consumer=web_html5&encryption=no"
+              N12_API_ALT="https://www.n12.co.il/AjaxPage?jspName=playlist.jsp&vcmid=003432e70df02310VgnVCM100000290b320aRCRD&videoChannelId=6361323ddea5a810VgnVCM100000700a10acRCRD&galleryChannelId=3a66e69c0802b810VgnVCM200000650aRCRD&isGallery=false&consumer=web_html5&encryption=no"
+              N12_COOKIE_JAR="$TMP_DIR/n12.cookies"
+              N12_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+              curl -fsSL --retry 2 --connect-timeout 10 --max-time 30 \
+                -A "$N12_UA" -c "$N12_COOKIE_JAR" -o /dev/null \
+                "https://www.n12.co.il/" 2>/dev/null || true
               N12_JSON=$(curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
-                -A "Mozilla/5.0" -e "https://www.n12.co.il/" "$N12_API" 2>/dev/null || true)
-              N12_DISCOVERED=$(printf '%s' "$N12_JSON" | python3 -c "import sys,re; s=sys.stdin.read(); m=re.search(r'https://mako-streaming\\.akamaized\\.net/[^\\\" ]+index\\.m3u8(?:\\?[^\\\" ]+)?', s); print(m.group(0) if m else '')" 2>/dev/null || true)
-              CHOSEN_HLS_URL="${N12_DISCOVERED:-$CH12_HLS_URL}"
+                -A "$N12_UA" -b "$N12_COOKIE_JAR" -c "$N12_COOKIE_JAR" \
+                -e "https://www.n12.co.il/" \
+                -H "Accept: application/json,text/plain,*/*" "$N12_API" 2>/dev/null || true)
+              N12_JSON_ALT=$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 30 \
+                -A "$N12_UA" -b "$N12_COOKIE_JAR" \
+                -e "https://www.n12.co.il/" \
+                -H "Accept: application/json,text/plain,*/*" "$N12_API_ALT" 2>/dev/null || true)
+              N12_JSON="${N12_JSON}\n${N12_JSON_ALT}"
+              N12_DISCOVERED=$(printf '%s' "$N12_JSON" | python3 -c 'import sys,re; s=sys.stdin.read().replace("\\/","/"); u=re.findall(r"https://mako-streaming[.]akamaized[.]net/[^" + chr(34) + r"\\ ]+?index[.]m3u8(?:[?][^" + chr(34) + r"\\ ]+)?",s); u=sorted(set(u),key=lambda x:("k12ni-bu" not in x,"/direct/" not in x,"b-in-range" not in x)); print(u[0] if u else "")' 2>/dev/null || true)
+              CHOSEN_HLS_URL=""
+              N12_CANDIDATES=("$N12_DISCOVERED" "$CH12_HLS_URL" \
+                "https://mako-streaming.akamaized.net/direct/hls/live/20000821/k12ni-bu/index.m3u8?b-in-range=0-800" \
+                "https://mako-streaming.akamaized.net/direct/hls/live/20000821/k12n12wad/index.m3u8?b-in-range=0-800")
+              while IFS= read -r candidate; do
+                [ -z "$candidate" ] && continue
+                if curl -fsSL --max-time 20 -A "${N12_UA:-Mozilla/5.0}" \
+                    -b "${N12_COOKIE_JAR:-/dev/null}" \
+                    -e "https://www.n12.co.il/" -H "Origin: https://www.n12.co.il" \
+                    -o "$TMP_DIR/n12_probe.m3u8" "$candidate" 2>"$TMP_DIR/n12_probe.err" && \
+                    grep -q "#EXTM3U" "$TMP_DIR/n12_probe.m3u8"; then
+                  CHOSEN_HLS_URL="$candidate"
+                  echo "   ✅ N12 HLS candidate accepted"
+                  break
+                fi
+                echo "   ⚠️ N12 candidate rejected: ${candidate:0:100}"
+                tail -1 "$TMP_DIR/n12_probe.err" 2>/dev/null || true
+              done < <(printf '%s\n' "${N12_CANDIDATES[@]}" | awk 'NF && !seen[$0]++')
+              if [ -z "$CHOSEN_HLS_URL" ]; then
+                echo "   ❌ N12 did not provide an authorized HLS playlist; stopping before capture"
+                exit 1
+              fi
               ;;
             13) CHOSEN_HLS_URL="$CH13_HLS_URL" ;;
             14) CHOSEN_HLS_URL="$CH14_HLS_URL" ;;
@@ -247,20 +273,38 @@ jobs:
             exit 1
           fi
           if [ "$CHANNEL" = "12" ]; then
-            FFMPEG_HEADERS="Origin: https://www.n12.co.il\r\nReferer: https://www.n12.co.il/\r\nUser-Agent: Mozilla/5.0"
+            FFMPEG_HEADERS="$(printf '%b' 'Origin: https://www.n12.co.il\r\nReferer: https://www.n12.co.il/\r\nUser-Agent: Mozilla/5.0\r\n')"
           elif [ "$CHANNEL" = "13" ]; then
-            FFMPEG_HEADERS="Origin: https://kondoplay.cfd\r\nReferer: https://kondoplay.cfd/\r\nUser-Agent: Mozilla/5.0"
+            FFMPEG_HEADERS="$(printf '%b' 'Origin: https://kondoplay.cfd\r\nReferer: https://kondoplay.cfd/\r\nUser-Agent: Mozilla/5.0\r\n')"
+          fi
+          # Pass the selected channel headers directly to ffmpeg. This must be
+          # built after CHANNEL is known; otherwise N12 receives no Referer.
+          FFMPEG_INPUT_ARGS=()
+          if [ -n "$FFMPEG_HEADERS" ]; then
+            FFMPEG_INPUT_ARGS+=( -headers "$FFMPEG_HEADERS" )
           fi
           HLS_URLS=("$CHOSEN_HLS_URL")
-          echo "   📋 Channel $CHANNEL URL: ${CHOSEN_HLS_URL:0:70}..."
+          echo "   📋 Channel $CHANNEL URL: ${CHOSEN_HLS_URL:0:110}..."
 
-          # ---- Pre-flight checks: diagnose failures in the FIRST minute, not at the end ----
-          echo "   🔍 Pre-flight: checking HLS playlist..."
-          if curl -fsS --max-time 15 -o /dev/null "$CH14_HLS_URL" 2>/dev/null; then
-            echo "   ✅ HLS playlist reachable"
+          # ---- Pre-flight checks: diagnose failures in the FIRST minute ----
+          # Channel 12 was already validated while selecting its candidate.
+          # Other channels are checked here with their own optional headers.
+          echo "   🔍 Pre-flight: checking selected HLS playlist..."
+          PREFLIGHT_ARGS=()
+          if [ "$CHANNEL" = "12" ]; then
+            PREFLIGHT_ARGS+=( -A "Mozilla/5.0" -e "https://www.n12.co.il/" -H "Origin: https://www.n12.co.il" )
+          elif [ "$CHANNEL" = "13" ]; then
+            PREFLIGHT_ARGS+=( -A "Mozilla/5.0" -e "https://kondoplay.cfd/" -H "Origin: https://kondoplay.cfd" )
+          fi
+          if curl -fsSL --max-time 20 "${PREFLIGHT_ARGS[@]}" -o "$TMP_DIR/preflight_playlist.txt" "$CHOSEN_HLS_URL" 2>/dev/null && \
+              grep -q "#EXTM3U" "$TMP_DIR/preflight_playlist.txt"; then
+            echo "   ✅ Selected HLS playlist reachable and valid"
           else
-            echo "   ⚠️ HLS playlist NOT reachable (stream down?) — will keep trying in the loop"
-            send_heartbeat "⚠️ HLS unreachable"
+            echo "   ❌ Selected HLS playlist is not valid/reachable for channel $CHANNEL"
+            head -5 "$TMP_DIR/preflight_playlist.txt" 2>/dev/null || true
+            echo "   ℹ️ A 403 means the URL requires authorization, a fresh signature, or different headers."
+            send_heartbeat "❌ HLS unreachable (channel $CHANNEL)"
+            exit 1
           fi
 
           echo "   🔍 Pre-flight: checking rclone Drive access..."
@@ -278,13 +322,8 @@ jobs:
             local attempt=1
 
             while [ $attempt -le 3 ]; do
-              local hdr_arg=""
-              if [ -s "$HEADERS_FILE" ]; then
-                hdr_arg="-headers $(cat "$HEADERS_FILE")"
-              fi
-
               timeout 120 ffmpeg -y -nostdin \
-                $hdr_arg \
+                "${FFMPEG_INPUT_ARGS[@]}" \
                 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 \
                 -i "$HLS_URL" \
                 -t "$SEGMENT_SEC" \
@@ -424,7 +463,7 @@ jobs:
         continue-on-error: true
         shell: bash
         env:
-          FOLDER: ${{ github.event.inputs.drive_folder || format('Channel{0}Live', github.event.inputs.channel || '14') }}
+          FOLDER: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}
           RETENTION_MINUTES: ${{ github.event.inputs.retention_minutes || '240' }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
@@ -443,8 +482,8 @@ jobs:
 
           # List files AND dirs — old versions created a folder per file, so clean those too
           rclone lsf "$REMOTE_DIR" 2>/dev/null | while read -r fname; do
-            if [[ "$fname" =~ ^channel14_([0-9]{8}_[0-9]{4})\.zip/?$ ]]; then
-              fts="${BASH_REMATCH[1]}"
+            if [[ "$fname" =~ ^channel(11|12|13|14)_([0-9]{8}_[0-9]{4})\.zip/?$ ]]; then
+              fts="${BASH_REMATCH[2]}"
               if [[ "$fts" < "$CUTOFF" ]]; then
                 echo "   🗑️ Deleting: $fname (timestamp: $fts)"
                 rclone purge "${REMOTE_DIR}/${fname}" 2>/dev/null || rclone delete "${REMOTE_DIR}/${fname}" 2>/dev/null || true
