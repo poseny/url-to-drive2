@@ -45,10 +45,10 @@ env:
   EMAIL_USER: "p0556722432@gmail.com"
   # Default source. The selected channel is mapped in the extraction step.
   CH14_HLS_URL: "https://r.il.cdn-redge.media/livehls/oil/ch14/live/ch14/live.livx/playlist.m3u8"
-  # The selected channel is validated before recording. Channel 12 uses the
-  # current N12/Akamai direct rendition as a fallback if discovery is unavailable.
+  # Channel 12 — mcquack.net proxy (bypasses Akamai TICKET authorization)
+  # Alternative: mako-streaming.akamaized.net (requires dynamic TICKET)
   CH11_HLS_URL: "https://kancdn.medonecdn.net/livehls/oil/kancdn-live/live/kan11/live.livx/playlist.m3u8"
-  CH12_HLS_URL: "https://mako-streaming.akamaized.net/direct/hls/live/20000821/k12ni-bu/index.m3u8?b-in-range=0-800"
+  CH12_HLS_URL: "http://stream.mcquack.net/294/index.m3u8"
   CH13_HLS_URL: "https://d18b0e6mopany4.cloudfront.net/out/v1/2f2bc414a3db4698a8e94b89eaf2da2a/index.m3u8"
   # Headers — empty (Redge doesn't need them)
   FFMPEG_HEADERS: ""
@@ -62,6 +62,9 @@ jobs:
       actions: read
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       # ================================================================
       # 1️⃣ התקנת תלויות + אתחול לוג
       # ================================================================
@@ -217,53 +220,12 @@ jobs:
             HEARTBEAT_PID=$!
           fi
 
-          # Select the source URL for the requested channel. Channel 12 must
-          # use the current URL published by N12; a stale static Akamai URL
-          # returns 403 and must never be sent to the long capture loop.
+          # Select the source URL for the requested channel.
+          # Channel 12 uses mcquack.net proxy (no Akamai TICKET needed).
           CHANNEL="${{ github.event.inputs.channel || '14' }}"
           case "$CHANNEL" in
             11) CHOSEN_HLS_URL="$CH11_HLS_URL" ;;
-            12)
-              N12_API="https://www.n12.co.il/AjaxPage?jspName=playlist.jsp&vcmid=1e2258089b67f510VgnVCM2000002a0c10acRCRD&videoChannelId=31750a2610f26110VgnVCM1000005201000aRCRD&galleryChannelId=1e2258089b67f510VgnVCM2000002a0c10acRCRD&isGallery=false&consumer=web_html5&encryption=no"
-              N12_API_ALT="https://www.n12.co.il/AjaxPage?jspName=playlist.jsp&vcmid=003432e70df02310VgnVCM100000290b320aRCRD&videoChannelId=6361323ddea5a810VgnVCM100000700a10acRCRD&galleryChannelId=3a66e69c0802b810VgnVCM200000650aRCRD&isGallery=false&consumer=web_html5&encryption=no"
-              N12_COOKIE_JAR="$TMP_DIR/n12.cookies"
-              N12_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
-              curl -fsSL --retry 2 --connect-timeout 10 --max-time 30 \
-                -A "$N12_UA" -c "$N12_COOKIE_JAR" -o /dev/null \
-                "https://www.n12.co.il/" 2>/dev/null || true
-              N12_JSON=$(curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
-                -A "$N12_UA" -b "$N12_COOKIE_JAR" -c "$N12_COOKIE_JAR" \
-                -e "https://www.n12.co.il/" \
-                -H "Accept: application/json,text/plain,*/*" "$N12_API" 2>/dev/null || true)
-              N12_JSON_ALT=$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 30 \
-                -A "$N12_UA" -b "$N12_COOKIE_JAR" \
-                -e "https://www.n12.co.il/" \
-                -H "Accept: application/json,text/plain,*/*" "$N12_API_ALT" 2>/dev/null || true)
-              N12_JSON="${N12_JSON}\n${N12_JSON_ALT}"
-              N12_DISCOVERED=$(printf '%s' "$N12_JSON" | python3 -c 'import sys,re; s=sys.stdin.read().replace("\\/","/"); u=re.findall(r"https://mako-streaming[.]akamaized[.]net/[^" + chr(34) + r"\\ ]+?index[.]m3u8(?:[?][^" + chr(34) + r"\\ ]+)?",s); u=sorted(set(u),key=lambda x:("k12ni-bu" not in x,"/direct/" not in x,"b-in-range" not in x)); print(u[0] if u else "")' 2>/dev/null || true)
-              CHOSEN_HLS_URL=""
-              N12_CANDIDATES=("$N12_DISCOVERED" "$CH12_HLS_URL" \
-                "https://mako-streaming.akamaized.net/direct/hls/live/20000821/k12ni-bu/index.m3u8?b-in-range=0-800" \
-                "https://mako-streaming.akamaized.net/direct/hls/live/20000821/k12n12wad/index.m3u8?b-in-range=0-800")
-              while IFS= read -r candidate; do
-                [ -z "$candidate" ] && continue
-                if curl -fsSL --max-time 20 -A "${N12_UA:-Mozilla/5.0}" \
-                    -b "${N12_COOKIE_JAR:-/dev/null}" \
-                    -e "https://www.n12.co.il/" -H "Origin: https://www.n12.co.il" \
-                    -o "$TMP_DIR/n12_probe.m3u8" "$candidate" 2>"$TMP_DIR/n12_probe.err" && \
-                    grep -q "#EXTM3U" "$TMP_DIR/n12_probe.m3u8"; then
-                  CHOSEN_HLS_URL="$candidate"
-                  echo "   ✅ N12 HLS candidate accepted"
-                  break
-                fi
-                echo "   ⚠️ N12 candidate rejected: ${candidate:0:100}"
-                tail -1 "$TMP_DIR/n12_probe.err" 2>/dev/null || true
-              done < <(printf '%s\n' "${N12_CANDIDATES[@]}" | awk 'NF && !seen[$0]++')
-              if [ -z "$CHOSEN_HLS_URL" ]; then
-                echo "   ❌ N12 did not provide an authorized HLS playlist; stopping before capture"
-                exit 1
-              fi
-              ;;
+            12) CHOSEN_HLS_URL="$CH12_HLS_URL" ;;
             13) CHOSEN_HLS_URL="$CH13_HLS_URL" ;;
             14) CHOSEN_HLS_URL="$CH14_HLS_URL" ;;
             *) echo "❌ Unsupported channel: $CHANNEL"; exit 1 ;;
@@ -272,10 +234,10 @@ jobs:
             echo "❌ No verified HLS URL configured for channel $CHANNEL"
             exit 1
           fi
-          if [ "$CHANNEL" = "12" ]; then
-            FFMPEG_HEADERS="$(printf '%b' 'Origin: https://www.n12.co.il\r\nReferer: https://www.n12.co.il/\r\nUser-Agent: Mozilla/5.0\r\n')"
-          elif [ "$CHANNEL" = "13" ]; then
-            FFMPEG_HEADERS="$(printf '%b' 'Origin: https://kondoplay.cfd\r\nReferer: https://kondoplay.cfd/\r\nUser-Agent: Mozilla/5.0\r\n')"
+          FFMPEG_HEADERS=""
+          # Channel 13 needs specific headers for KondoPlay CDN
+          if [ "$CHANNEL" = "13" ]; then
+            FFMPEG_HEADERS=$(printf '%b' 'Origin: https://kondoplay.cfd\r\nReferer: https://kondoplay.cfd/\r\nUser-Agent: Mozilla/5.0\r\n')
           fi
           # Pass the selected channel headers directly to ffmpeg. This must be
           # built after CHANNEL is known; otherwise N12 receives no Referer.
@@ -287,13 +249,10 @@ jobs:
           echo "   📋 Channel $CHANNEL URL: ${CHOSEN_HLS_URL:0:110}..."
 
           # ---- Pre-flight checks: diagnose failures in the FIRST minute ----
-          # Channel 12 was already validated while selecting its candidate.
-          # Other channels are checked here with their own optional headers.
           echo "   🔍 Pre-flight: checking selected HLS playlist..."
           PREFLIGHT_ARGS=()
-          if [ "$CHANNEL" = "12" ]; then
-            PREFLIGHT_ARGS+=( -A "Mozilla/5.0" -e "https://www.n12.co.il/" -H "Origin: https://www.n12.co.il" )
-          elif [ "$CHANNEL" = "13" ]; then
+          # Channel 13 needs specific headers for KondoPlay CDN
+          if [ "$CHANNEL" = "13" ]; then
             PREFLIGHT_ARGS+=( -A "Mozilla/5.0" -e "https://kondoplay.cfd/" -H "Origin: https://kondoplay.cfd" )
           fi
           if curl -fsSL --max-time 20 "${PREFLIGHT_ARGS[@]}" -o "$TMP_DIR/preflight_playlist.txt" "$CHOSEN_HLS_URL" 2>/dev/null && \
