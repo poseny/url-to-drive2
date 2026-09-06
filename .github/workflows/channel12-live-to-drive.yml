@@ -83,7 +83,7 @@ jobs:
           echo "Channel: ${{ github.event.inputs.channel || '14' }}"
           echo "Duration: ${{ github.event.inputs.batch_duration_minutes || '340' }} minutes (continuous)"
           echo "Drive Folder: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}"
-          echo "HLS URL: $CH14_HLS_URL"
+          echo "HLS URL: (set per channel below)"
           echo "========================================"
           echo ""
 
@@ -133,7 +133,8 @@ jobs:
         id: extract_upload
         shell: bash
         env:
-          FOLDER: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}
+          CHANNEL_IN: ${{ github.event.inputs.channel || '14' }}
+          FOLDER: ${{ github.event.inputs.drive_folder || format('Channel{0}Live', github.event.inputs.channel || '14') }}
           BATCH_MINUTES: ${{ github.event.inputs.batch_duration_minutes || '340' }}
           SEGMENT_SEC: ${{ github.event.inputs.segment_seconds || '60' }}
           HEARTBEAT_MIN: ${{ github.event.inputs.heartbeat_minutes || '10' }}
@@ -203,7 +204,7 @@ jobs:
             body+="🏃 Run: ${{ github.run_id }}\n"
             body+="\n--- Last 30 lines of log ---\n"
             body+=$(tail -30 "$LOG_FILE")
-            echo -e "Subject: [CH14 Live] ${label} — ${up} files in Drive\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n${body}" | msmtp -a gmail "$EMAIL_TO" 2>/dev/null || true
+            echo -e "Subject: [CH${CHANNEL_IN} Live] ${label} — ${up} files in Drive\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n${body}" | msmtp -a gmail "$EMAIL_TO" 2>/dev/null || true
             echo "📧 [$(date -u +"%H:%M:%S")] ${label} sent (${up} uploaded)"
           }
 
@@ -222,7 +223,7 @@ jobs:
 
           # Select the source URL for the requested channel.
           # Channel 12 uses mcquack.net proxy (no Akamai TICKET needed).
-          CHANNEL="${{ github.event.inputs.channel || '14' }}"
+          CHANNEL="$CHANNEL_IN"
           case "$CHANNEL" in
             11) CHOSEN_HLS_URL="$CH11_HLS_URL" ;;
             12) CHOSEN_HLS_URL="$CH12_HLS_URL" ;;
@@ -275,21 +276,41 @@ jobs:
           fi
 
           # Extract one segment (single URL, hard timeout so one bad minute can't stall the run)
+          # Channel 12 bitrate control: re-encode to limit file size (~1.5 Mbps target)
+          # Channel 14 uses stream-copy (fast, ~1 Mbps native bitrate)
+          if [ "$CHANNEL" = "12" ]; then
+            echo "   📊 Channel 12: re-encoding to ~1.5 Mbps (slower but smaller files)"
+          fi
+
           extract_segment() {
             local seg_file="$1"
             local HLS_URL="${HLS_URLS[0]}"
             local attempt=1
 
             while [ $attempt -le 3 ]; do
-              timeout 120 ffmpeg -y -nostdin \
-                "${FFMPEG_INPUT_ARGS[@]}" \
-                -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 \
-                -i "$HLS_URL" \
-                -t "$SEGMENT_SEC" \
-                -c copy \
-                -f mpegts \
-                "$seg_file" \
-                2>&1 | tail -3
+              # Channel 12: re-encode with bitrate limit; others: stream-copy (fast)
+              if [ "$CHANNEL" = "12" ]; then
+                timeout 180 ffmpeg -y -nostdin \
+                  "${FFMPEG_INPUT_ARGS[@]}" \
+                  -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 \
+                  -i "$HLS_URL" \
+                  -t "$SEGMENT_SEC" \
+                  -c:v libx264 -preset fast -crf 28 -maxrate 1500k -bufsize 3000k \
+                  -c:a aac -b:a 96k \
+                  -f mpegts \
+                  "$seg_file" \
+                  2>&1 | tail -3
+              else
+                timeout 120 ffmpeg -y -nostdin \
+                  "${FFMPEG_INPUT_ARGS[@]}" \
+                  -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 \
+                  -i "$HLS_URL" \
+                  -t "$SEGMENT_SEC" \
+                  -c copy \
+                  -f mpegts \
+                  "$seg_file" \
+                  2>&1 | tail -3
+              fi
               local rc=${PIPESTATUS[0]}
 
               if [ $rc -eq 0 ] && [ -s "$seg_file" ]; then
@@ -422,7 +443,7 @@ jobs:
         continue-on-error: true
         shell: bash
         env:
-          FOLDER: ${{ github.event.inputs.drive_folder || 'Channel14Live' }}
+          FOLDER: ${{ github.event.inputs.drive_folder || format('Channel{0}Live', github.event.inputs.channel || '14') }}
           RETENTION_MINUTES: ${{ github.event.inputs.retention_minutes || '240' }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
@@ -491,10 +512,10 @@ jobs:
           chmod 600 ~/.msmtprc
 
           if [[ "$STATUS" == "success" ]]; then
-            SUBJECT="✅ [CH14 Live] Batch SUCCESS — ${UPLOADED_COUNT} segments uploaded"
+            SUBJECT="✅ [CH${{ github.event.inputs.channel || '14' }} Live] Batch SUCCESS — ${UPLOADED_COUNT} segments uploaded"
             PREFIX="הבאץ' הושלם בהצלחה."
           else
-            SUBJECT="❌ [CH14 Live] Batch FAILED — Run ${{ github.run_id }}"
+            SUBJECT="❌ [CH${{ github.event.inputs.channel || '14' }} Live] Batch FAILED — Run ${{ github.run_id }}"
             PREFIX="הבאץ' נכשל!"
           fi
 
@@ -517,7 +538,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ch14-live-log-${{ github.run_id }}
+          name: ch${{ github.event.inputs.channel || '14' }}-live-log-${{ github.run_id }}
           path: ${{ runner.temp }}/workflow_log.txt
           retention-days: 3
           if-no-files-found: warn
