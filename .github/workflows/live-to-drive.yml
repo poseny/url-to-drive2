@@ -1,4 +1,4 @@
-name: "Live TV — Channel 
+name: "Live TV — Channel ${{ github.event.inputs.channel || '14' }}"
 
 on:
   # ⏹️ מצב ידני: לחץ Run workflow → ירוץ ברציפות (קובץ לדקה) עד שתעצור אותו.
