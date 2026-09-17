@@ -1,4 +1,4 @@
-name: ניסויYouTube → Google Drive (ZIP) — via Invidious proxy
+name: ניסויYouTube → Google Drive (ZIP) — Invidious + Piped proxy
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ on:
         required: false
         default: ""
       invidious_instance:
-        description: "instance משלך (אופציונלי, מומלץ) — למשל https://invidious.example.com"
+        description: "instance משלך (אופציונלי, מומלץ)"
         required: false
         default: ""
 
@@ -36,9 +36,6 @@ jobs:
       actions: read
 
     steps:
-      # ------------------------------------------------------------
-      # 0️⃣  התקנות + אתחול הלוג
-      # ------------------------------------------------------------
       - name: Install dependencies & init log
         shell: bash
         run: |
@@ -47,21 +44,18 @@ jobs:
           SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
           : > "$LOG_FILE"; : > "$SUMMARY_FILE"
           exec >> "$LOG_FILE" 2>&1
-          echo "=== YouTube → Invidious proxy → Drive ==="
+          echo "=== YouTube → proxy → Drive (v6) ==="
           echo "Run: ${{ github.run_id }} | Repo: ${{ github.repository }}"
           echo "URL:    ${{ github.event.inputs.url }}"
-          echo "Folder: ${{ github.event.inputs.folder }}"
           echo "Started: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "=========================================="
           curl -fsSL https://rclone.org/install.sh | sudo bash; echo "rclone exit=$?"
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg zip jq msmtp msmtp-mta; echo "deps exit=$?"
-          echo "host | adaptive_itag | audio_itag | result" > "$SUMMARY_FILE"
-          echo "✅ dependencies installed"
+          sudo apt-get install -y -qq ffmpeg zip jq msmtp msmtp-mta curl; echo "deps exit=$?"
+          echo "host | api | ct_video | ct_audio | result" > "$SUMMARY_FILE"
+          echo "✅ dependencies installed" >> "$LOG_FILE"
+          echo "start" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------
-      # 1️⃣  קונפיג rclone
-      # ------------------------------------------------------------
       - name: Configure rclone
         shell: bash
         env:
@@ -80,11 +74,11 @@ jobs:
           rclone lsd gdrive: | head -5
           echo "✅ rclone configured"
 
-      # ------------------------------------------------------------
-      # 2️⃣  הורדה דרך פרוקסי של Invidious (הראנר לא נוגע בגוגל)
-      # ------------------------------------------------------------
-      - name: Download via Invidious proxy
-        id: dl
+      # ============================================================
+      # Strategy A - Invidious
+      # ============================================================
+      - name: Strategy A - Invidious
+        id: inv
         shell: bash
         env:
           VIDEO_URL: ${{ github.event.inputs.url }}
@@ -93,141 +87,169 @@ jobs:
           set +e; set +u; set -o pipefail
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
-          OUT="$RUNNER_TEMP/success"
-          WORK="$RUNNER_TEMP/inv"
+          OUT="$RUNNER_TEMP/success"; WORK="$RUNNER_TEMP/inv"
           exec >> "$LOG_FILE" 2>&1
-          mkdir -p "$OUT" "$WORK"
-          rm -f "$OUT"/* 2>/dev/null
+          mkdir -p "$OUT" "$WORK"; rm -f "$OUT"/* 2>/dev/null
           echo "success=false" >> "$GITHUB_OUTPUT"
-          echo ""
-          echo "===== Invidious proxy download ====="
+          echo ""; echo "===== Strategy A: Invidious ====="
 
-          # ---- 2.1 חילוץ VIDEO_ID ----
           VIDEO_ID=""
           case "$VIDEO_URL" in
             *youtu.be/*) VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*youtu\.be/([^?&/]+).*#\1#') ;;
-            *shorts/*)   VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#') ;;
-            *)           VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*[?&]v=([^?&]+).*#\1#') ;;
+            *shorts/*|*embed/*) VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#') ;;
+            *) VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*[?&]v=([^?&]+).*#\1#') ;;
           esac
-          if [[ -z "$VIDEO_ID" || "$VIDEO_ID" == "$VIDEO_URL" ]]; then
-            VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#')
-          fi
-          echo "VIDEO_ID = ${VIDEO_ID:-<none>}"
-          [[ -z "$VIDEO_ID" ]] && { echo "❌ could not parse video id"; exit 0; }
+          [[ -z "$VIDEO_ID" || "$VIDEO_ID" == "$VIDEO_URL" ]] && VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#')
+          echo "VIDEO_ID = ${VIDEO_ID:-none}"
+          [[ -z "$VIDEO_ID" ]] && { echo "no video id"; exit 0; }
 
-          # ---- 2.2 בניית רשימת instances ----
-          INSTANCES=()
-          add_inst() {
-            local v="${1:-}"
-            v="${v#http://}"; v="${v#https://}"; v="${v%%/*}"; v="${v%%:*}"
-            [[ -z "$v" || "$v" != *.* ]] && return 0
-            local e; for e in "${INSTANCES[@]}"; do [[ "$e" == "$v" ]] && return 0; done
-            INSTANCES+=("$v")
-          }
-          [[ -n "${USER_INST:-}" ]] && add_inst "$USER_INST"
-          for h in invidious.nerdvpn.de vid.priv.au invidious.incogniweb.net invidious.fi; do add_inst "$h"; done
-
+          INST=()
+          add_i() { local v="${1:-}"; v="${v#http://}"; v="${v#https://}"; v="${v%%/*}"; v="${v%%:*}"; [[ -z "$v" || "$v" != *.* ]] && return 0; [[ "$v" == *onion* ]] && return 0; for e in "${INST[@]}"; do [[ "$e" == "$v" ]] && return 0; done; INST+=("$v"); }
+          [[ -n "${USER_INST:-}" ]] && add_i "$USER_INST"
+          # seeds (no Cloudflare); note some may use Anubis or be down — we just try
+          for h in invidious.nerdvpn.de vid.priv.au invidious.f5.si invidious.tiekoetter.com yt.chocolatemoo53.com inv.nadeko.net invidious.materialio.us invidious.jing.rocks iv.datura.network; do add_i "$h"; done
+          # dynamic discovery
           BODY="$WORK/list.json"
           curl -sS --max-time 25 -o "$BODY" -w '%{http_code}' "https://api.invidious.io/instances.json" > "$WORK/lc" 2>/dev/null
           if [[ -s "$BODY" ]] && jq -e . "$BODY" >/dev/null 2>&1; then
-            mapfile -t DISC < <(jq -r '.. | strings' "$BODY" 2>/dev/null \
-              | grep -Eo '([a-z0-9-]+\.)+[a-z]{2,}' \
-              | grep -viE 'invidious\.io|github|google|cloudflare|w3\.org|schema\.org' | sort -u)
-            for d in "${DISC[@]}"; do add_inst "$d"; done
-            echo "discovered ${#DISC[@]} hostnames"
+            mapfile -t D < <(jq -r '.[]? | (.[1].uri? // empty)' "$BODY" 2>/dev/null | grep -Eo '([a-z0-9-]+\.)+[a-z]{2,}' | sort -u)
+            for d in "${D[@]}"; do add_i "$d"; done
+            echo "discovered ${#D[@]} from registry"
           else
-            echo "⚠️ could not fetch instance list — using static seeds only"
+            echo "registry unavailable — seeds only"
           fi
-          echo "📋 total instances: ${#INSTANCES[@]}"
+          echo "📋 Invidious candidates: ${#INST[@]}"
 
-          # ---- 2.3 מעבר על instances ----
           tried=0
-          for H in "${INSTANCES[@]}"; do
-            [[ "$tried" -ge 12 ]] && { echo "⏹️ reached max 12 instances"; break; }
+          for H in "${INST[@]}"; do
+            [[ "$tried" -ge 20 ]] && break
             tried=$((tried+1))
-            echo ""
-            echo "-------- [$tried] $H --------"
+            echo ""; echo "-------- [$tried] $H --------"
             INFO="$WORK/info-$tried.json"
-
             HCODE=$(curl -sS --max-time 30 -H 'Accept: application/json' -o "$INFO" -w '%{http_code}' "https://$H/api/v1/videos/$VIDEO_ID" 2>/dev/null)
             if [[ ! -s "$INFO" ]] || ! jq -e . "$INFO" >/dev/null 2>&1; then
-              echo "  ❌ api not JSON (http=${HCODE:-?}) -> skip"
-              printf '%s | - | - | api-not-json(%s)\n' "$H" "${HCODE:-?}" >> "$SUMMARY_FILE"
-              continue
+              echo "  api not JSON (http=${HCODE:-?}) -> skip"
+              printf '%s | %s | - | - | api(%s)\n' "$H" "${HCODE:-?}" "${HCODE:-?}" >> "$SUMMARY_FILE"; continue
             fi
-            NIH=$(jq -r '(.adaptiveFormats // []) | length' "$INFO" 2>/dev/null || echo 0)
-            NMX=$(jq -r '(.formatStreams // []) | length' "$INFO" 2>/dev/null || echo 0)
-            echo "  formats: adaptive=$NIH muxed=$NMX"
-            if [[ "${NIH:-0}" -eq 0 && "${NMX:-0}" -eq 0 ]]; then
-              echo "  ❌ no formats (instance may be YouTube-blocked) -> skip"
-              printf '%s | - | - | no-formats\n' "$H" >> "$SUMMARY_FILE"
-              continue
-            fi
+            NI=$(jq -r '(.adaptiveFormats // []) | length' "$INFO" 2>/dev/null); NM=$(jq -r '(.formatStreams // []) | length' "$INFO" 2>/dev/null)
+            echo "  formats: adaptive=${NI:-0} muxed=${NM:-0}"
+            if [[ "${NI:-0}" -eq 0 && "${NM:-0}" -eq 0 ]]; then echo "  no formats -> skip"; printf '%s | %s | - | - | no-formats\n' "$H" "${HCODE:-?}" >> "$SUMMARY_FILE"; continue; fi
 
             VITAG=$(jq -r '[ (.adaptiveFormats // [])[] | select((.type//"")|test("video/")) | {itag:(.itag|tostring), height:(.height//0), bitrate:(.bitrate//0), avc:(((.type//"")|test("avc1|h264";"i")))} ] | sort_by((if .avc then 1 else 0 end), .height, .bitrate) | last | .itag // empty' "$INFO" 2>/dev/null)
             AITAG=$(jq -r '[ (.adaptiveFormats // [])[] | select((.type//"")|test("audio/")) | {itag:(.itag|tostring), bitrate:(.bitrate//0), mp4a:(((.type//"")|test("mp4a|aac";"i")))} ] | sort_by((if .mp4a then 1 else 0 end), .bitrate) | last | .itag // empty' "$INFO" 2>/dev/null)
-            echo "  chosen itags: video=${VITAG:-none} audio=${AITAG:-none}"
+            echo "  itags: v=${VITAG:-none} a=${AITAG:-none}"
 
-            GOT=""
-            # ---- adaptive (איכות מקסימלית) ----
+            CTV="-"; CTA="-"; GOT=""
             if [[ -n "$VITAG" && -n "$AITAG" ]]; then
               VF="$WORK/v-$tried.bin"; AF="$WORK/a-$tried.bin"
-              echo "  ⬇️ video itag $VITAG (proxied) ..."
-              curl -fSL --max-redirs 0 --max-time 1800 \
-                "https://$H/latest_version?id=$VIDEO_ID&itag=$VITAG&local=true" -o "$VF" 2>/dev/null; RCV=$?
-              echo "  ⬇️ audio itag $AITAG (proxied) ..."
-              curl -fSL --max-redirs 0 --max-time 900 \
-                "https://$H/latest_version?id=$VIDEO_ID&itag=$AITAG&local=true" -o "$AF" 2>/dev/null; RCA=$?
-              VSZ=$(stat -c%s "$VF" 2>/dev/null || echo 0)
-              ASZ=$(stat -c%s "$AF" 2>/dev/null || echo 0)
-              echo "  sizes: video=$VSZ audio=$ASZ (rc $RCV/$RCA)"
-              if [[ $RCV -eq 0 && $RCA -eq 0 && "$VSZ" -gt 100000 && "$ASZ" -gt 10000 ]]; then
-                echo "  🎬 merging (ffmpeg -c copy) ..."
+              RV=$(curl -sS -L --max-redirs 0 --max-time 1800 -o "$VF" -w '%{http_code}|%{content_type}' "https://$H/latest_version?id=$VIDEO_ID&itag=$VITAG&local=true" 2>/dev/null || true)
+              RA=$(curl -sS -L --max-redirs 0 --max-time 900  -o "$AF" -w '%{http_code}|%{content_type}' "https://$H/latest_version?id=$VIDEO_ID&itag=$AITAG&local=true" 2>/dev/null || true)
+              CTV=$(printf '%s' "$RV" | cut -d'|' -f2); CTA=$(printf '%s' "$RA" | cut -d'|' -f2)
+              echo "  download: video=${RV:-none}  audio=${RA:-none}"
+              if [[ "$CTV" == video/* || "$CTV" == application/octet-stream ]] && [[ "$CTA" == audio/* || "$CTA" == application/octet-stream ]]; then
                 ffmpeg -y -loglevel error -i "$VF" -i "$AF" -c copy "$OUT/merged.mp4" 2>>"$LOG_FILE"
-                if [[ ! -s "$OUT/merged.mp4" ]]; then
-                  ffmpeg -y -loglevel error -i "$VF" -i "$AF" -c copy "$OUT/merged.mkv" 2>>"$LOG_FILE"
-                fi
+                [[ ! -s "$OUT/merged.mp4" ]] && ffmpeg -y -loglevel error -i "$VF" -i "$AF" -c copy "$OUT/merged.mkv" 2>>"$LOG_FILE"
                 [[ -s "$OUT/merged.mp4" ]] && GOT="$OUT/merged.mp4"
                 [[ -z "$GOT" && -s "$OUT/merged.mkv" ]] && GOT="$OUT/merged.mkv"
-                [[ -n "$GOT" ]] && echo "  ✅ adaptive merge OK: $GOT ($(stat -c%s "$GOT") bytes)"
+                [[ -n "$GOT" ]] && echo "  ✅ merged: $GOT"
+              else
+                echo "  ⚠️ not media (Anubis/challenge?) -> skip adaptive"
               fi
             fi
 
-            # ---- fallback: muxed itag 22 ואז 18 ----
             if [[ -z "$GOT" ]]; then
               for MX in 22 18; do
-                echo "  ↪️ fallback muxed itag $MX ..."
-                curl -fSL --max-redirs 0 --max-time 1800 \
-                  "https://$H/latest_version?id=$VIDEO_ID&itag=$MX&local=true" -o "$OUT/muxed.bin" 2>/dev/null; RCM=$?
-                MSZ=$(stat -c%s "$OUT/muxed.bin" 2>/dev/null || echo 0)
-                if [[ $RCM -eq 0 && "$MSZ" -gt 100000 ]] && \
-                   ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT/muxed.bin" 2>/dev/null | grep -q video; then
-                  mv "$OUT/muxed.bin" "$OUT/muxed.mp4"
-                  GOT="$OUT/muxed.mp4"
-                  echo "  ✅ muxed OK ($(stat -c%s "$GOT") bytes)"
-                  break
-                else
-                  echo "  ❌ muxed $MX failed (rc=$RCM size=$MSZ)"
-                  rm -f "$OUT/muxed.bin"
+                R=$(curl -sS -L --max-redirs 0 --max-time 1800 -o "$OUT/muxed.bin" -w '%{http_code}|%{content_type}' "https://$H/latest_version?id=$VIDEO_ID&itag=$MX&local=true" 2>/dev/null || true)
+                CT=$(printf '%s' "$R" | cut -d'|' -f2)
+                echo "  muxed $MX -> ${R:-none}"
+                if [[ "$CT" == video/* || "$CT" == application/octet-stream ]] && ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT/muxed.bin" 2>/dev/null | grep -q video; then
+                  mv "$OUT/muxed.bin" "$OUT/muxed.mp4"; GOT="$OUT/muxed.mp4"; echo "  ✅ muxed OK"; break
                 fi
+                rm -f "$OUT/muxed.bin"
               done
             fi
 
-            printf '%s | %s | %s | %s\n' "$H" "${VITAG:-none}" "${AITAG:-none}" "${GOT:-fail}" >> "$SUMMARY_FILE"
+            printf '%s | %s | %s | %s | %s\n' "$H" "${HCODE:-?}" "${CTV:-}" "${CTA:-}" "${GOT:-fail}" >> "$SUMMARY_FILE"
             if [[ -n "$GOT" ]]; then
-              FILE="video.${GOT##*.}"
-              mv "$GOT" "$OUT/$FILE"
-              echo "success=true" >> "$GITHUB_OUTPUT"
-              echo "file=$OUT/$FILE" >> "$GITHUB_OUTPUT"
-              echo "🎉 SUCCESS via $H"
-              break
+              EXT="${GOT##*.}"; mv "$GOT" "$OUT/video.$EXT"
+              echo "success=true" >> "$GITHUB_OUTPUT"; echo "file=$OUT/video.$EXT" >> "$GITHUB_OUTPUT"
+              echo "🎉 Invidious SUCCESS via $H"; break
             fi
           done
-          echo ""; echo "instances tried: $tried"
+          echo "Invidious tried: $tried"
 
-      # ------------------------------------------------------------
-      # 3️⃣  אימות התוצאה
-      # ------------------------------------------------------------
+      # ============================================================
+      # Strategy B - Piped
+      # ============================================================
+      - name: Strategy B - Piped
+        id: piped
+        if: ${{ always() && steps.inv.outputs.success != 'true' }}
+        shell: bash
+        env:
+          VIDEO_URL: ${{ github.event.inputs.url }}
+        run: |
+          set +e; set +u; set -o pipefail
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
+          SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
+          OUT="$RUNNER_TEMP/success"; WORK="$RUNNER_TEMP/piped"
+          exec >> "$LOG_FILE" 2>&1
+          mkdir -p "$OUT" "$WORK"; echo ""; echo "===== Strategy B: Piped ====="
+
+          VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*[?&]v=([^?&]+).*#\1#')
+          [[ "$VIDEO_ID" == "$VIDEO_URL" || -z "$VIDEO_ID" ]] && VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#')
+          echo "VIDEO_ID = ${VIDEO_ID:-none}"
+          [[ -z "$VIDEO_ID" ]] && exit 0
+
+          APIS=()
+          add_a() { local v="${1:-}"; v="${v#http://}"; v="${v#https://}"; v="${v%%/*}"; v="${v%%:*}"; [[ -z "$v" || "$v" != *.* ]] && return 0; for e in "${APIS[@]}"; do [[ "$e" == "$v" ]] && return 0; done; APIS+=("$v"); }
+          for a in pipedapi.kavin.rocks piped-api.garudalinux.org pipedapi.adminforge.de pipedapi.drgns.space api.piped.privacy.com.de pipedapi.projectsegfau.lt pipedapi.leptons.xyz; do add_a "$a"; done
+          PL="$WORK/piped-instances.json"
+          curl -sS --max-time 25 -o "$PL" -w '%{http_code}' "https://piped-instances.kavin.rocks/" >/dev/null 2>&1
+          if [[ -s "$PL" ]] && jq -e . "$PL" >/dev/null 2>&1; then
+            mapfile -t DA < <(jq -r '.[]? | (.api_url? // empty)' "$PL" 2>/dev/null | sed -E 's#https?://##' | cut -d/ -f1 | sort -u)
+            for a in "${DA[@]}"; do add_a "$a"; done
+            echo "discovered ${#DA[@]} piped apis"
+          fi
+          echo "📋 Piped candidates: ${#APIS[@]}"
+
+          tried=0
+          for H in "${APIS[@]}"; do
+            [[ "$tried" -ge 12 ]] && break
+            tried=$((tried+1)); echo ""; echo "-------- [$tried] $H --------"
+            JS="$WORK/streams-$tried.json"
+            HC=$(curl -sS --max-time 30 -H 'Accept: application/json' -o "$JS" -w '%{http_code}' "https://$H/streams/$VIDEO_ID" 2>/dev/null)
+            if [[ ! -s "$JS" ]] || ! jq -e . "$JS" >/dev/null 2>&1; then
+              echo "  api not JSON (http=${HC:-?}) -> skip"; printf '%s(P) | %s | - | - | api(%s)\n' "$H" "${HC:-?}" "${HC:-?}" >> "$SUMMARY_FILE"; continue
+            fi
+            # best video (prefer avc1, then qualityRank) + best audio (prefer mp4a)
+            VURL=$(jq -r '[ (.videoStreams // [])[] | select((.mimeType//"")|test("video")) | {u:(.proxyUrl // .url), qr:(.qualityRank//0), avc:((.codec//"")|test("avc1|h264";"i"))} ] | sort_by((if .avc then 1 else 0 end), .qr) | last | .u // empty' "$JS" 2>/dev/null)
+            AURL=$(jq -r '[ (.audioStreams // [])[] | {u:(.proxyUrl // .url), br:(.bitrate//0), mp4a:((.codec//"")|test("mp4a|aac";"i"))} ] | sort_by((if .mp4a then 1 else 0 end), .br) | last | .u // empty' "$JS" 2>/dev/null)
+            VHOST=$(printf '%s' "$VURL" | awk -F/ '{print $3}'); AHOST=$(printf '%s' "$AURL" | awk -F/ '{print $3}')
+            echo "  chosen video host=${VHOST:-none} audio host=${AHOST:-none}"
+            if [[ -z "$VURL" || -z "$AURL" ]]; then echo "  no streams -> skip"; printf '%s(P) | %s | - | - | no-streams\n' "$H" "${HC:-?}" >> "$SUMMARY_FILE"; continue; fi
+            if printf '%s %s' "$VHOST" "$AHOST" | grep -qi googlevideo; then echo "  stream url points to googlevideo (no proxy) -> skip"; printf '%s(P) | %s | - | - | googlevideo\n' "$H" "${HC:-?}" >> "$SUMMARY_FILE"; continue; fi
+
+            VF="$WORK/v-$tried.bin"; AF="$WORK/a-$tried.bin"
+            RV=$(curl -sS -L --max-redirs 5 --max-time 1800 -o "$VF" -w '%{http_code}|%{content_type}' "$VURL" 2>/dev/null || true)
+            RA=$(curl -sS -L --max-redirs 5 --max-time 900  -o "$AF" -w '%{http_code}|%{content_type}' "$AURL" 2>/dev/null || true)
+            CTV=$(printf '%s' "$RV" | cut -d'|' -f2); CTA=$(printf '%s' "$RA" | cut -d'|' -f2)
+            echo "  download: video=${RV:-none} audio=${RA:-none}"
+            GOT=""
+            if [[ "$CTV" == video/* || "$CTV" == application/octet-stream ]] && [[ "$CTA" == audio/* || "$CTA" == application/octet-stream ]]; then
+              ffmpeg -y -loglevel error -i "$VF" -i "$AF" -c copy "$OUT/merged.mp4" 2>>"$LOG_FILE"
+              [[ ! -s "$OUT/merged.mp4" ]] && ffmpeg -y -loglevel error -i "$VF" -i "$AF" -c copy "$OUT/merged.mkv" 2>>"$LOG_FILE"
+              [[ -s "$OUT/merged.mp4" ]] && GOT="$OUT/merged.mp4"
+              [[ -z "$GOT" && -s "$OUT/merged.mkv" ]] && GOT="$OUT/merged.mkv"
+            fi
+            printf '%s(P) | %s | %s | %s | %s\n' "$H" "${HC:-?}" "${CTV:-}" "${CTA:-}" "${GOT:-fail}" >> "$SUMMARY_FILE"
+            if [[ -n "$GOT" ]]; then
+              EXT="${GOT##*.}"; mv "$GOT" "$OUT/video.$EXT"
+              echo "success=true" >> "$GITHUB_OUTPUT"; echo "file=$OUT/video.$EXT" >> "$GITHUB_OUTPUT"
+              echo "🎉 Piped SUCCESS via $H"; break
+            fi
+          done
+          echo "Piped tried: $tried"
+
       - name: Verify result
         id: verify
         if: always()
@@ -242,13 +264,9 @@ jobs:
             echo "success=true" >> "$GITHUB_OUTPUT"; echo "file=$FILE" >> "$GITHUB_OUTPUT"
             echo "✅ output: $FILE ($(stat -c%s "$FILE") bytes)"
           else
-            echo "success=false" >> "$GITHUB_OUTPUT"
-            echo "❌ no output file"
+            echo "success=false" >> "$GITHUB_OUTPUT"; echo "❌ no output file"
           fi
 
-      # ------------------------------------------------------------
-      # 4️⃣  ZIP + העלאה ל-Drive
-      # ------------------------------------------------------------
       - name: Zip and upload to Drive
         id: upload
         if: ${{ steps.verify.outputs.success == 'true' }}
@@ -261,33 +279,23 @@ jobs:
           set +e; set +u
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
-          echo ""
-          echo "===== Zip + upload ====="
-          TMP_DIR="$(mktemp -d)"
-          INPUT_EXT="${INPUT_FILE##*.}"
+          TMP_DIR="$(mktemp -d)"; INPUT_EXT="${INPUT_FILE##*.}"
           if [[ -n "$USER_FILENAME" ]]; then BASE_NAME="$USER_FILENAME"; else BASE_NAME="$(basename "${INPUT_FILE%.*}")"; fi
           BASE_NAME="$(printf '%s' "$BASE_NAME" | tr '/\\' '__' | tr -cd '[:alnum:] ._-')"
           BASE_NAME="${BASE_NAME:0:180}"; [[ -n "$BASE_NAME" ]] || BASE_NAME="youtube_video"
-          ZIP_NAME="${BASE_NAME}.zip"
-          ZIP_FILE="$TMP_DIR/$ZIP_NAME"
-          INNER_FILE="$TMP_DIR/$BASE_NAME.$INPUT_EXT"
-          cp "$INPUT_FILE" "$INNER_FILE"
-          zip -j -q "$ZIP_FILE" "$INNER_FILE"
-          if [[ ! -s "$ZIP_FILE" ]]; then echo "ZIP failed"; echo "STATUS=failed" >> "$GITHUB_OUTPUT"; exit 0; fi
+          ZIP_NAME="${BASE_NAME}.zip"; ZIP_FILE="$TMP_DIR/$ZIP_NAME"; INNER_FILE="$TMP_DIR/$BASE_NAME.$INPUT_EXT"
+          cp "$INPUT_FILE" "$INNER_FILE"; zip -j -q "$ZIP_FILE" "$INNER_FILE"
+          if [[ ! -s "$ZIP_FILE" ]]; then echo "STATUS=failed" >> "$GITHUB_OUTPUT"; exit 0; fi
           REMOTE_PATH="gdrive:${FOLDER}/${ZIP_NAME}"
-          if rclone lsf "$REMOTE_PATH" >/dev/null 2>&1; then rclone delete "$REMOTE_PATH"; fi
+          rclone lsf "$REMOTE_PATH" >/dev/null 2>&1 && rclone delete "$REMOTE_PATH"
           rclone copy "$ZIP_FILE" "$REMOTE_PATH" --progress
           if [[ $? -eq 0 ]]; then
-            echo "STATUS=success" >> "$GITHUB_OUTPUT"
-            echo "FILE_NAME=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+            echo "STATUS=success" >> "$GITHUB_OUTPUT"; echo "FILE_NAME=$ZIP_NAME" >> "$GITHUB_OUTPUT"
             echo "FILE_SIZE=$(stat -c%s "$ZIP_FILE" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
           else
             echo "STATUS=failed" >> "$GITHUB_OUTPUT"
           fi
 
-      # ------------------------------------------------------------
-      # 5️⃣  מייל עם הלוג המלא + סיכום instances
-      # ------------------------------------------------------------
       - name: Send full log email
         if: always()
         shell: bash
@@ -298,9 +306,8 @@ jobs:
           FILE_SIZE: ${{ steps.upload.outputs.FILE_SIZE }}
         run: |
           set +e; set +u
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
-          if [[ -z "${EMAIL_PASSWORD:-}" ]]; then echo "EMAIL_PASSWORD empty"; exit 0; fi
+          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"; SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
+          [[ -z "${EMAIL_PASSWORD:-}" ]] && { echo "EMAIL_PASSWORD empty"; exit 0; }
           mkdir -p "$HOME/.msmtp"
           cat > "$HOME/.msmtprc" <<EOF
           defaults
@@ -325,18 +332,13 @@ jobs:
             INTRO="ההורדה נכשלה. ר' סיכום ה-instances והלוג המלא."
           fi
           {
-            printf 'Subject: %s\n' "$SUBJECT"
-            printf 'From: %s\n' "$EMAIL_FROM"
-            printf 'To: %s\n' "$EMAIL_TO"
-            printf 'Content-Type: text/plain; charset=UTF-8\n\n'
-            printf '%s\n\n' "$INTRO"
+            printf 'Subject: %s\n' "$SUBJECT"; printf 'From: %s\n' "$EMAIL_FROM"; printf 'To: %s\n' "$EMAIL_TO"
+            printf 'Content-Type: text/plain; charset=UTF-8\n\n'; printf '%s\n\n' "$INTRO"
             printf 'מקור: %s\n' '${{ github.event.inputs.url }}'
             printf 'Run: %s (%s)\n' '${{ github.run_id }}' '${{ github.run_number }}'
             printf 'זמן: %s\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            printf '%s\n' '===== INSTANCE SUMMARY ====='
-            cat "$SUMMARY_FILE" 2>/dev/null
-            printf '\n%s\n' '===== FULL LOG ====='
-            cat "$LOG_FILE" 2>/dev/null
+            printf '%s\n' '===== INSTANCE SUMMARY ====='; cat "$SUMMARY_FILE" 2>/dev/null
+            printf '\n%s\n' '===== FULL LOG ====='; cat "$LOG_FILE" 2>/dev/null
           } | msmtp -a gmail "$EMAIL_TO"
           echo "email sent"
 
@@ -344,7 +346,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: youtube-invidious-${{ github.run_id }}
+          name: yt-proxy-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/workflow_log.txt
             ${{ runner.temp }}/instance_summary.txt
