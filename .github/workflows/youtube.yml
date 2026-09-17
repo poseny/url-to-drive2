@@ -1,22 +1,22 @@
-name: ניסויYouTube → Google Drive ZIP — Cobalt v3
+name: ניסויYouTube → Google Drive (ZIP) — via Invidious proxy
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "YouTube URL"
+        description: "קישור היוטיוב"
         required: true
         default: ""
       folder:
-        description: "Google Drive folder"
+        description: "תיקיית יעד ב-Drive"
         required: true
         default: "YouTubeDownloads"
       filename:
-        description: "ZIP base name (empty = auto)"
+        description: "שם בסיס ל-ZIP (ריק = אוטומטי)"
         required: false
         default: ""
-      cobalt_instance:
-        description: "Optional cobalt instance URL"
+      invidious_instance:
+        description: "instance משלך (אופציונלי, מומלץ) — למשל https://invidious.example.com"
         required: false
         default: ""
 
@@ -28,43 +28,46 @@ env:
   EMAIL_USER: "p0556722432@gmail.com"
 
 jobs:
-  download:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 55
     permissions:
       contents: read
       actions: read
 
     steps:
-      - name: Install dependencies and init log
+      # ------------------------------------------------------------
+      # 0️⃣  התקנות + אתחול הלוג
+      # ------------------------------------------------------------
+      - name: Install dependencies & init log
         shell: bash
         run: |
-          set +e
-          set +u
-          set -o pipefail
+          set +e; set +u
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
-          : > "$LOG_FILE"
-          : > "$SUMMARY_FILE"
+          : > "$LOG_FILE"; : > "$SUMMARY_FILE"
           exec >> "$LOG_FILE" 2>&1
-          echo "=== YouTube -> Cobalt -> Google Drive ==="
-          echo "Run: ${{ github.run_id }}"
-          echo "URL: ${{ github.event.inputs.url }}"
+          echo "=== YouTube → Invidious proxy → Drive ==="
+          echo "Run: ${{ github.run_id }} | Repo: ${{ github.repository }}"
+          echo "URL:    ${{ github.event.inputs.url }}"
           echo "Folder: ${{ github.event.inputs.folder }}"
           echo "Started: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "=========================================="
-          curl -fsSL https://rclone.org/install.sh | sudo bash; echo "rclone install exit=$?"
+          curl -fsSL https://rclone.org/install.sh | sudo bash; echo "rclone exit=$?"
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq zip ffmpeg msmtp msmtp-mta; echo "deps exit=$?"
-          echo "host | probe | http_status | post_status | error_code" > "$SUMMARY_FILE"
+          sudo apt-get install -y -qq ffmpeg zip jq msmtp msmtp-mta; echo "deps exit=$?"
+          echo "host | adaptive_itag | audio_itag | result" > "$SUMMARY_FILE"
+          echo "✅ dependencies installed"
 
+      # ------------------------------------------------------------
+      # 1️⃣  קונפיג rclone
+      # ------------------------------------------------------------
       - name: Configure rclone
         shell: bash
         env:
           RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
         run: |
-          set +e
-          set +u
+          set +e; set +u
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
           mkdir -p "$HOME/.config/rclone"
@@ -75,226 +78,191 @@ jobs:
           token = $RCLONE_GDRIVE_TOKEN
           EOF
           rclone lsd gdrive: | head -5
-          echo "rclone configuration finished"
+          echo "✅ rclone configured"
 
-      - name: Strategy A - Cobalt v11
-        id: cobalt
+      # ------------------------------------------------------------
+      # 2️⃣  הורדה דרך פרוקסי של Invidious (הראנר לא נוגע בגוגל)
+      # ------------------------------------------------------------
+      - name: Download via Invidious proxy
+        id: dl
         shell: bash
         env:
           VIDEO_URL: ${{ github.event.inputs.url }}
-          USER_INSTANCE: ${{ github.event.inputs.cobalt_instance }}
+          USER_INST: ${{ github.event.inputs.invidious_instance }}
         run: |
-          set +e
-          set +u
-          set -o pipefail
+          set +e; set +u; set -o pipefail
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
-          OUT_DIR="$RUNNER_TEMP/success"
-          WORK_DIR="$RUNNER_TEMP/cobalt-work"
+          OUT="$RUNNER_TEMP/success"
+          WORK="$RUNNER_TEMP/inv"
           exec >> "$LOG_FILE" 2>&1
-          mkdir -p "$OUT_DIR" "$WORK_DIR"
-          rm -f "$OUT_DIR"/* 2>/dev/null
+          mkdir -p "$OUT" "$WORK"
+          rm -f "$OUT"/* 2>/dev/null
           echo "success=false" >> "$GITHUB_OUTPUT"
           echo ""
-          echo "===== Strategy A: Cobalt ====="
+          echo "===== Invidious proxy download ====="
 
-          HOSTS=()
-          add_host() {
+          # ---- 2.1 חילוץ VIDEO_ID ----
+          VIDEO_ID=""
+          case "$VIDEO_URL" in
+            *youtu.be/*) VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*youtu\.be/([^?&/]+).*#\1#') ;;
+            *shorts/*)   VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#') ;;
+            *)           VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*[?&]v=([^?&]+).*#\1#') ;;
+          esac
+          if [[ -z "$VIDEO_ID" || "$VIDEO_ID" == "$VIDEO_URL" ]]; then
+            VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#')
+          fi
+          echo "VIDEO_ID = ${VIDEO_ID:-<none>}"
+          [[ -z "$VIDEO_ID" ]] && { echo "❌ could not parse video id"; exit 0; }
+
+          # ---- 2.2 בניית רשימת instances ----
+          INSTANCES=()
+          add_inst() {
             local v="${1:-}"
             v="${v#http://}"; v="${v#https://}"; v="${v%%/*}"; v="${v%%:*}"
-            [[ -z "$v" ]] && return 0
-            [[ "$v" != *.* ]] && return 0
-            local e
-            for e in "${HOSTS[@]}"; do [[ "$e" == "$v" ]] && return 0; done
-            HOSTS+=("$v"); return 0
+            [[ -z "$v" || "$v" != *.* ]] && return 0
+            local e; for e in "${INSTANCES[@]}"; do [[ "$e" == "$v" ]] && return 0; done
+            INSTANCES+=("$v")
           }
+          [[ -n "${USER_INST:-}" ]] && add_inst "$USER_INST"
+          for h in invidious.nerdvpn.de vid.priv.au invidious.incogniweb.net invidious.fi; do add_inst "$h"; done
 
-          [[ -n "${USER_INSTANCE:-}" ]] && add_host "$USER_INSTANCE"
+          BODY="$WORK/list.json"
+          curl -sS --max-time 25 -o "$BODY" -w '%{http_code}' "https://api.invidious.io/instances.json" > "$WORK/lc" 2>/dev/null
+          if [[ -s "$BODY" ]] && jq -e . "$BODY" >/dev/null 2>&1; then
+            mapfile -t DISC < <(jq -r '.. | strings' "$BODY" 2>/dev/null \
+              | grep -Eo '([a-z0-9-]+\.)+[a-z]{2,}' \
+              | grep -viE 'invidious\.io|github|google|cloudflare|w3\.org|schema\.org' | sort -u)
+            for d in "${DISC[@]}"; do add_inst "$d"; done
+            echo "discovered ${#DISC[@]} hostnames"
+          else
+            echo "⚠️ could not fetch instance list — using static seeds only"
+          fi
+          echo "📋 total instances: ${#INSTANCES[@]}"
 
-          SEED_HOSTS=(
-            kityune.imput.net olly.imput.net nachos.imput.net sunny.imput.net
-            blossom.imput.net noodle.imput.net cobalt-api.kwiatekmiki.com
-            cobalt-7.kwiatekmiki.com cobalt-backend.canine.tools
-            downloadapi.stuff.solutions capi.3kh0.net cobalt-api.meowing.de
-            cobalt-api.clxxped.lol
-          )
-          for h in "${SEED_HOSTS[@]}"; do add_host "$h"; done
-
-          LIST_URLS=(
-            "https://instances.cobalt.best/instances.json"
-            "https://instances.cobalt.best/api/instances"
-            "https://codeberg.org/kwiat/instances/raw/branch/main/src/lib/input/instances.json"
-          )
-          for LU in "${LIST_URLS[@]}"; do
-            echo "Trying list: $LU"
-            BODY="$WORK_DIR/list.json"
-            CODE=$(curl -sS --max-time 20 -H 'Accept: application/json' -o "$BODY" -w '%{http_code}' "$LU" 2>/dev/null)
-            RC=$?
-            if [[ "$RC" -ne 0 || ! -s "$BODY" ]]; then echo "  failed rc=$RC http=${CODE:-?}"; continue; fi
-            jq -e . "$BODY" >/dev/null 2>&1 || { echo "  not JSON"; continue; }
-            mapfile -t DISC < <(jq -r '.. | strings' "$BODY" 2>/dev/null | grep -Eo '([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}' 2>/dev/null | sort -u)
-            for h in "${DISC[@]}"; do add_host "$h"; done
-            echo "  added ${#DISC[@]} hostnames"
-          done
-
-          echo "Total candidates: ${#HOSTS[@]}"
-          REQ=$(jq -cn --arg url "$VIDEO_URL" '{url:$url, videoQuality:"max", downloadMode:"auto", filenameStyle:"basic", alwaysProxy:true, localProcessing:"disabled"}' 2>/dev/null)
-          [[ -z "$REQ" ]] && { echo "could not build request"; exit 0; }
-
+          # ---- 2.3 מעבר על instances ----
           tried=0
-          for H in "${HOSTS[@]}"; do
-            [[ "$tried" -ge 10 ]] && break
+          for H in "${INSTANCES[@]}"; do
+            [[ "$tried" -ge 12 ]] && { echo "⏹️ reached max 12 instances"; break; }
             tried=$((tried+1))
             echo ""
             echo "-------- [$tried] $H --------"
-            PF="$WORK_DIR/probe-$tried.txt"; RF="$WORK_DIR/resp-$tried.txt"
+            INFO="$WORK/info-$tried.json"
 
-            curl -sS --max-time 25 -H 'Accept: application/json' -o "$PF" -w '%{http_code}' "https://$H/" > "$WORK_DIR/ph-$tried" 2>/dev/null
-            if [[ -s "$PF" ]] && jq -e . "$PF" >/dev/null 2>&1; then probe="ok"; echo "Probe OK"; else probe="fail"; echo "Probe fail"; fi
-
-            POST_HTTP=$(curl -sS --max-time 150 -H 'Accept: application/json' -H 'Content-Type: application/json' -X POST --data "$REQ" -o "$RF" -w '%{http_code}' "https://$H/" 2>/dev/null)
-            echo "HTTP: ${POST_HTTP:-?}"
-            echo "Raw: $(head -c 600 "$RF" 2>/dev/null || echo '<empty>')"
-
-            post_status="empty"; error_code=""
-            if [[ -s "$RF" ]] && jq -e . "$RF" >/dev/null 2>&1; then
-              post_status=$(jq -r '.status // "empty"' "$RF" 2>/dev/null || echo empty)
-              error_code=$(jq -r '.error.code // .code // empty' "$RF" 2>/dev/null || true)
-            else
-              post_status="non-json"
+            HCODE=$(curl -sS --max-time 30 -H 'Accept: application/json' -o "$INFO" -w '%{http_code}' "https://$H/api/v1/videos/$VIDEO_ID" 2>/dev/null)
+            if [[ ! -s "$INFO" ]] || ! jq -e . "$INFO" >/dev/null 2>&1; then
+              echo "  ❌ api not JSON (http=${HCODE:-?}) -> skip"
+              printf '%s | - | - | api-not-json(%s)\n' "$H" "${HCODE:-?}" >> "$SUMMARY_FILE"
+              continue
             fi
-            printf '%s | %s | %s | %s | %s\n' "$H" "$probe" "${POST_HTTP:-?}" "$post_status" "${error_code:-}" >> "$SUMMARY_FILE"
-            echo "status=$post_status error=${error_code:-none}"
-
-            [[ "$post_status" == "tunnel" ]] || continue
-
-            DL_URL=$(jq -r '.url // empty' "$RF" 2>/dev/null || true)
-            [[ -n "$DL_URL" ]] || continue
-            [[ "$DL_URL" == https://* ]] || continue
-            DL_HOST=$(printf '%s\n' "$DL_URL" | awk -F/ '{print $3}' 2>/dev/null)
-            [[ -n "$DL_HOST" ]] || continue
-            if printf '%s\n' "$DL_HOST" | grep -qiE '(^|\.)(youtube\.com|youtu\.be|googlevideo\.com|google\.com|googleapis\.com|ytimg\.com)$'; then
-              echo "Rejected: google host"; continue
-            fi
-            if [[ "$DL_HOST" != "$H" && "$DL_HOST" != *".$H" ]]; then
-              echo "Rejected: not owned by $H"; continue
+            NIH=$(jq -r '(.adaptiveFormats // []) | length' "$INFO" 2>/dev/null || echo 0)
+            NMX=$(jq -r '(.formatStreams // []) | length' "$INFO" 2>/dev/null || echo 0)
+            echo "  formats: adaptive=$NIH muxed=$NMX"
+            if [[ "${NIH:-0}" -eq 0 && "${NMX:-0}" -eq 0 ]]; then
+              echo "  ❌ no formats (instance may be YouTube-blocked) -> skip"
+              printf '%s | - | - | no-formats\n' "$H" >> "$SUMMARY_FILE"
+              continue
             fi
 
-            echo "Downloading from $DL_HOST ..."
-            curl -f -sS --max-time 1200 --proto '=https' --max-redirs 0 -o "$OUT_DIR/video.mp4" "$DL_URL"
-            rc=$?
-            size=$(stat -c%s "$OUT_DIR/video.mp4" 2>/dev/null || echo 0)
-            if [[ "$rc" -eq 0 && "$size" -gt 100000 ]]; then
-              echo "SUCCESS via $H ($size bytes)"
+            VITAG=$(jq -r '[ (.adaptiveFormats // [])[] | select((.type//"")|test("video/")) | {itag:(.itag|tostring), height:(.height//0), bitrate:(.bitrate//0), avc:(((.type//"")|test("avc1|h264";"i")))} ] | sort_by((if .avc then 1 else 0 end), .height, .bitrate) | last | .itag // empty' "$INFO" 2>/dev/null)
+            AITAG=$(jq -r '[ (.adaptiveFormats // [])[] | select((.type//"")|test("audio/")) | {itag:(.itag|tostring), bitrate:(.bitrate//0), mp4a:(((.type//"")|test("mp4a|aac";"i")))} ] | sort_by((if .mp4a then 1 else 0 end), .bitrate) | last | .itag // empty' "$INFO" 2>/dev/null)
+            echo "  chosen itags: video=${VITAG:-none} audio=${AITAG:-none}"
+
+            GOT=""
+            # ---- adaptive (איכות מקסימלית) ----
+            if [[ -n "$VITAG" && -n "$AITAG" ]]; then
+              VF="$WORK/v-$tried.bin"; AF="$WORK/a-$tried.bin"
+              echo "  ⬇️ video itag $VITAG (proxied) ..."
+              curl -fSL --max-redirs 0 --max-time 1800 \
+                "https://$H/latest_version?id=$VIDEO_ID&itag=$VITAG&local=true" -o "$VF" 2>/dev/null; RCV=$?
+              echo "  ⬇️ audio itag $AITAG (proxied) ..."
+              curl -fSL --max-redirs 0 --max-time 900 \
+                "https://$H/latest_version?id=$VIDEO_ID&itag=$AITAG&local=true" -o "$AF" 2>/dev/null; RCA=$?
+              VSZ=$(stat -c%s "$VF" 2>/dev/null || echo 0)
+              ASZ=$(stat -c%s "$AF" 2>/dev/null || echo 0)
+              echo "  sizes: video=$VSZ audio=$ASZ (rc $RCV/$RCA)"
+              if [[ $RCV -eq 0 && $RCA -eq 0 && "$VSZ" -gt 100000 && "$ASZ" -gt 10000 ]]; then
+                echo "  🎬 merging (ffmpeg -c copy) ..."
+                ffmpeg -y -loglevel error -i "$VF" -i "$AF" -c copy "$OUT/merged.mp4" 2>>"$LOG_FILE"
+                if [[ ! -s "$OUT/merged.mp4" ]]; then
+                  ffmpeg -y -loglevel error -i "$VF" -i "$AF" -c copy "$OUT/merged.mkv" 2>>"$LOG_FILE"
+                fi
+                [[ -s "$OUT/merged.mp4" ]] && GOT="$OUT/merged.mp4"
+                [[ -z "$GOT" && -s "$OUT/merged.mkv" ]] && GOT="$OUT/merged.mkv"
+                [[ -n "$GOT" ]] && echo "  ✅ adaptive merge OK: $GOT ($(stat -c%s "$GOT") bytes)"
+              fi
+            fi
+
+            # ---- fallback: muxed itag 22 ואז 18 ----
+            if [[ -z "$GOT" ]]; then
+              for MX in 22 18; do
+                echo "  ↪️ fallback muxed itag $MX ..."
+                curl -fSL --max-redirs 0 --max-time 1800 \
+                  "https://$H/latest_version?id=$VIDEO_ID&itag=$MX&local=true" -o "$OUT/muxed.bin" 2>/dev/null; RCM=$?
+                MSZ=$(stat -c%s "$OUT/muxed.bin" 2>/dev/null || echo 0)
+                if [[ $RCM -eq 0 && "$MSZ" -gt 100000 ]] && \
+                   ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT/muxed.bin" 2>/dev/null | grep -q video; then
+                  mv "$OUT/muxed.bin" "$OUT/muxed.mp4"
+                  GOT="$OUT/muxed.mp4"
+                  echo "  ✅ muxed OK ($(stat -c%s "$GOT") bytes)"
+                  break
+                else
+                  echo "  ❌ muxed $MX failed (rc=$RCM size=$MSZ)"
+                  rm -f "$OUT/muxed.bin"
+                fi
+              done
+            fi
+
+            printf '%s | %s | %s | %s\n' "$H" "${VITAG:-none}" "${AITAG:-none}" "${GOT:-fail}" >> "$SUMMARY_FILE"
+            if [[ -n "$GOT" ]]; then
+              FILE="video.${GOT##*.}"
+              mv "$GOT" "$OUT/$FILE"
               echo "success=true" >> "$GITHUB_OUTPUT"
+              echo "file=$OUT/$FILE" >> "$GITHUB_OUTPUT"
+              echo "🎉 SUCCESS via $H"
               break
             fi
-            echo "download failed rc=$rc size=$size"
-            rm -f "$OUT_DIR/video.mp4"
           done
-          echo ""; echo "Cobalt tried: $tried"
+          echo ""; echo "instances tried: $tried"
 
-      - name: Strategy B - pastedownload fallback
-        id: pastedown
-        if: ${{ always() && steps.cobalt.outputs.success != 'true' }}
-        continue-on-error: true
-        shell: bash
-        env:
-          VIDEO_URL: ${{ github.event.inputs.url }}
-        run: |
-          set +e
-          set +u
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          OUT_DIR="$RUNNER_TEMP/success"
-          exec >> "$LOG_FILE" 2>&1
-          echo ""
-          echo "===== Strategy B: pastedownload.com ====="
-          cd "$RUNNER_TEMP"
-          npm init -y >/dev/null 2>&1
-          npm install playwright >/dev/null 2>&1
-          npx playwright install --with-deps chromium >/dev/null 2>&1
-
-          cat > "$RUNNER_TEMP/pw.js" <<'NODE'
-          const { chromium } = require("playwright");
-          const fs = require("fs");
-          const path = require("path");
-          (async () => {
-            const out = path.join(process.env.RUNNER_TEMP, "success");
-            fs.mkdirSync(out, { recursive: true });
-            const block = /(^|\.)(youtube\.com|youtu\.be|googlevideo\.com|google\.com|googleapis\.com|ytimg\.com|gstatic\.com)$/i;
-            const browser = await chromium.launch({ args: ["--no-sandbox"] });
-            const context = await browser.newContext({ acceptDownloads: true });
-            await context.route("**/*", route => {
-              try { const h = new URL(route.request().url()).hostname; if (block.test(h)) return route.abort(); } catch (_) {}
-              return route.continue();
-            });
-            const page = await context.newPage();
-            let downloaded = false;
-            page.on("download", async d => {
-              await d.saveAs(path.join(out, "video.mp4"));
-              downloaded = true;
-              console.log("browser download captured");
-            });
-            await page.goto("https://pastedownload.com/youtube-video2-downloader/", { waitUntil: "domcontentloaded", timeout: 60000 });
-            console.log("title:", await page.title());
-            const input = page.locator('input[type="url"], input[name*="url" i], input[type="text"], textarea').first();
-            await input.fill(process.env.VIDEO_URL);
-            console.log("url filled");
-            const button = page.getByRole("button", { name: /download|start|submit|convert|get/i }).first();
-            if (await button.count()) { await button.click(); } else { await input.press("Enter"); }
-            console.log("submitted");
-            const deadline = Date.now() + 180000;
-            while (Date.now() < deadline && !downloaded) {
-              const links = await page.locator("a[href]").evaluateAll(items =>
-                items.map(a => ({ href: a.href, text: a.innerText || "", download: a.hasAttribute("download") })));
-              for (const it of links) {
-                let h = ""; try { h = new URL(it.href).hostname; } catch (_) {}
-                const media = /\.(mp4|webm|mkv|m4v|mov)(\?|$)/i.test(it.href) || it.download || /download|save/i.test(it.text);
-                if (!media || block.test(h)) continue;
-                if (!/pastedownload\.com$/i.test(h)) { console.log("ignoring non-pastedownload:", h); continue; }
-                console.log("result link:", it.href);
-                await page.goto(it.href, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
-              }
-              await new Promise(r => setTimeout(r, 3000));
-            }
-            await browser.close();
-            console.log(fs.existsSync(path.join(out, "video.mp4")) ? "got file" : "no video obtained");
-            process.exit(0);
-          })().catch(e => { console.log("error:", e && e.message); process.exit(0); });
-          NODE
-          node "$RUNNER_TEMP/pw.js"
-
-      - name: Collect result
-        id: collect
+      # ------------------------------------------------------------
+      # 3️⃣  אימות התוצאה
+      # ------------------------------------------------------------
+      - name: Verify result
+        id: verify
         if: always()
         shell: bash
         run: |
-          set +e
-          set +u
+          set +e; set +u
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          OUT_DIR="$RUNNER_TEMP/success"
           exec >> "$LOG_FILE" 2>&1
-          file="$(find "$OUT_DIR" -type f \( -iname '*.mp4' -o -iname '*.webm' -o -iname '*.mkv' -o -iname '*.m4v' -o -iname '*.mov' \) 2>/dev/null | head -1)"
-          if [[ -n "$file" && -s "$file" ]]; then
-            echo "success=true" >> "$GITHUB_OUTPUT"; echo "file=$file" >> "$GITHUB_OUTPUT"
-            echo "Output found: $file"
+          OUT="$RUNNER_TEMP/success"
+          FILE=$(find "$OUT" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' \) 2>/dev/null | head -1)
+          if [[ -n "$FILE" && -s "$FILE" ]]; then
+            echo "success=true" >> "$GITHUB_OUTPUT"; echo "file=$FILE" >> "$GITHUB_OUTPUT"
+            echo "✅ output: $FILE ($(stat -c%s "$FILE") bytes)"
           else
-            echo "success=false" >> "$GITHUB_OUTPUT"; echo "No output file produced"
+            echo "success=false" >> "$GITHUB_OUTPUT"
+            echo "❌ no output file"
           fi
 
-      - name: ZIP and upload to Drive
+      # ------------------------------------------------------------
+      # 4️⃣  ZIP + העלאה ל-Drive
+      # ------------------------------------------------------------
+      - name: Zip and upload to Drive
         id: upload
-        if: ${{ steps.collect.outputs.success == 'true' }}
+        if: ${{ steps.verify.outputs.success == 'true' }}
         shell: bash
         env:
-          INPUT_FILE: ${{ steps.collect.outputs.file }}
+          INPUT_FILE: ${{ steps.verify.outputs.file }}
           FOLDER: ${{ github.event.inputs.folder }}
           USER_FILENAME: ${{ github.event.inputs.filename }}
         run: |
-          set +e
-          set +u
+          set +e; set +u
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
+          echo ""
+          echo "===== Zip + upload ====="
           TMP_DIR="$(mktemp -d)"
           INPUT_EXT="${INPUT_FILE##*.}"
           if [[ -n "$USER_FILENAME" ]]; then BASE_NAME="$USER_FILENAME"; else BASE_NAME="$(basename "${INPUT_FILE%.*}")"; fi
@@ -317,6 +285,9 @@ jobs:
             echo "STATUS=failed" >> "$GITHUB_OUTPUT"
           fi
 
+      # ------------------------------------------------------------
+      # 5️⃣  מייל עם הלוג המלא + סיכום instances
+      # ------------------------------------------------------------
       - name: Send full log email
         if: always()
         shell: bash
@@ -326,11 +297,11 @@ jobs:
           FILE_NAME: ${{ steps.upload.outputs.FILE_NAME }}
           FILE_SIZE: ${{ steps.upload.outputs.FILE_SIZE }}
         run: |
-          set +e
-          set +u
+          set +e; set +u
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
           if [[ -z "${EMAIL_PASSWORD:-}" ]]; then echo "EMAIL_PASSWORD empty"; exit 0; fi
+          mkdir -p "$HOME/.msmtp"
           cat > "$HOME/.msmtprc" <<EOF
           defaults
           auth on
@@ -351,7 +322,7 @@ jobs:
             INTRO="ההורדה וההעלאה הושלמו. ZIP: ${FILE_NAME} ($(numfmt --to=iec ${FILE_SIZE:-0} 2>/dev/null || echo ${FILE_SIZE:-?}) bytes)"
           else
             SUBJECT="❌ YouTube → Drive FAILED - ${{ github.repository }}"
-            INTRO="ההורדה נכשלה. ר' סיכום ה-instances והלוג המלא למטה."
+            INTRO="ההורדה נכשלה. ר' סיכום ה-instances והלוג המלא."
           fi
           {
             printf 'Subject: %s\n' "$SUBJECT"
@@ -373,7 +344,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: youtube-workflow-${{ github.run_id }}
+          name: youtube-invidious-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/workflow_log.txt
             ${{ runner.temp }}/instance_summary.txt
