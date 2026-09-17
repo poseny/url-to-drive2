@@ -1,4 +1,4 @@
-name: ניסויYouTube → Google Drive (ZIP) — via cobalt (no direct YouTube access)
+name: ניסויYouTube → Google Drive (ZIP) — cobalt (server-side) + fallback
 
 on:
   workflow_dispatch:
@@ -16,14 +16,9 @@ on:
         required: false
         default: ""
       cobalt_instance:
-        description: "cobalt instance משלך (אופציונלי, למשל https://cobalt-api.example.com) - עדיף"
+        description: "cobalt instance משלך (אופציונלי, מומלץ מאוד) — למשל https://my-cobalt.example.com"
         required: false
         default: ""
-      allow_direct_google:
-        description: "לאפשר גישה ישירה לגוגל אם אין ברירה (false = אסור)"
-        type: boolean
-        required: false
-        default: false
 
 env:
   EMAIL_TO: "p0556722432@gmail.com"
@@ -52,16 +47,16 @@ jobs:
           exec >> "$LOG_FILE" 2>&1
           echo "=== YouTube via cobalt -> Drive ==="
           echo "Run: ${{ github.run_id }} | Repo: ${{ github.repository }}"
-          echo "URL: ${{ inputs.url }}"
-          echo "Folder: ${{ inputs.folder }}"
+          echo "URL:    ${{ github.event.inputs.url }}"
+          echo "Folder: ${{ github.event.inputs.folder }}"
           echo "========================================"
           curl -fsSL https://rclone.org/install.sh | sudo bash
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg msmtp msmtp-mta zip jq
-          echo "OK dependencies installed"
+          echo "✅ dependencies installed"
 
       # ------------------------------------------------------------
-      # 1️⃣  קונפיג rclone
+      # 1️⃣  קונפיג rclone (זהה למה שכבר יש לך)
       # ------------------------------------------------------------
       - name: Configure rclone
         continue-on-error: true
@@ -79,287 +74,235 @@ jobs:
           token = $RCLONE_GDRIVE_TOKEN
           EOF
           rclone lsd gdrive: | head -5
-          echo "OK rclone configured"
+          echo "✅ rclone configured"
 
       # ------------------------------------------------------------
-      # 2️⃣  אסטרטגיה A: cobalt API (הקובץ מגיע מהשרת של השירות)
+      # 2️⃣  Strategy A: cobalt — ההורדה מתבצעת אצל ה-instance
       # ------------------------------------------------------------
-      - name: "Strategy A: cobalt API"
+      - name: Strategy A - cobalt (server-side download)
         id: cobalt
-        continue-on-error: true
+        if: ${{ !cancelled() }}
         shell: bash
         env:
-          VIDEO_URL: ${{ inputs.url }}
-          COBALT_INSTANCE: ${{ inputs.cobalt_instance }}
-          ALLOW_GOOGLE: ${{ inputs.allow_direct_google }}
+          VIDEO_URL: ${{ github.event.inputs.url }}
+          USER_INSTANCE: ${{ github.event.inputs.cobalt_instance }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
+          set -uo pipefail
           echo ""
           echo "===== Strategy A: cobalt ====="
-          mkdir -p "$RUNNER_TEMP/success" "$RUNNER_TEMP/co"
-          cd "$RUNNER_TEMP/co"
+          OUT_DIR="$RUNNER_TEMP/success"
+          mkdir -p "$OUT_DIR"
+          rm -f "$OUT_DIR"/video.* 2>/dev/null || true
+          echo "success=false" >> "$GITHUB_OUTPUT"
 
-          PAYLOAD=$(jq -n --arg u "$VIDEO_URL" '{
-            url: $u,
-            videoQuality: "max",
-            downloadMode: "auto",
-            filenameStyle: "basic",
-            alwaysProxy: true,
-            localProcessing: "disabled"
-          }')
+          HOSTS=()
+          add_host() {
+            local h="$1"
+            h="${h#http://}"; h="${h#https://}"; h="${h%%/*}"
+            [[ -z "$h" ]] && return
+            [[ "$h" == *.* ]] || return
+            local x
+            for x in ${HOSTS[@]+"${HOSTS[@]}"}; do [[ "$x" == "$h" ]] && return; done
+            HOSTS+=("$h")
+          }
 
-          # --- בניית רשימת instance-ים ---
-          CANDS="$RUNNER_TEMP/co/candidates.txt"
-          : > "$CANDS"
-
-          if [[ -n "${COBALT_INSTANCE:-}" ]]; then
-            echo "${COBALT_INSTANCE%/}" >> "$CANDS"
-            echo "user instance: ${COBALT_INSTANCE%/}"
+          # ---- 2.1 instance שהמשתמש סיפק (עדיפות ראשונה) ----
+          if [[ -n "$USER_INSTANCE" ]]; then
+            echo "➕ user instance: $USER_INSTANCE"
+            add_host "$USER_INSTANCE"
           fi
 
-          for lst in \
-            "https://instances.cobalt.best/api/instances" \
+          # ---- 2.2 רשימה מאומתת (seed) — מובנית בתוך הקוד ----
+          for h in kityune.imput.net olly.imput.net nachos.imput.net sunny.imput.net \
+                   blossom.imput.net noodle.imput.net cobalt-api.kwiatekmiki.com \
+                   cobalt-7.kwiatekmiki.com cobalt-backend.canine.tools \
+                   downloadapi.stuff.solutions capi.3kh0.net cobalt-api.meowing.de \
+                   cobalt-api.clxxped.lol ; do
+            add_host "$h"
+          done
+
+          # ---- 2.3 גילוי נוסף מרשימות חיצוניות (best effort) ----
+          for LU in \
             "https://instances.cobalt.best/instances.json" \
-            "https://instances.cobalt.best/instances" ; do
-            echo "trying instance list: $lst"
-            if curl -fsS --max-time 25 "$lst" -o list.json 2>/dev/null \
-               && jq -e . list.json >/dev/null 2>&1; then
-              jq -r '[..|strings]|.[]' list.json 2>/dev/null \
-                | grep -Eo '^https://[A-Za-z0-9._-]+' \
-                | sed 's#/$##' >> "$CANDS"
-              echo "found $(wc -l < "$CANDS") candidate(s)"
-              break
+            "https://instances.cobalt.best/api/instances" \
+            "https://codeberg.org/kwiat/instances/raw/branch/main/src/lib/input/instances.json" ; do
+            echo "🔎 trying list: $LU"
+            BODY=$(curl -sS -m 20 -H 'Accept: application/json' "$LU" 2>/dev/null || true)
+            [[ -z "$BODY" ]] && { echo "   -> empty"; continue; }
+            echo "$BODY" | jq -e . >/dev/null 2>&1 || { echo "   -> not JSON"; continue; }
+            mapfile -t FOUND < <(echo "$BODY" | jq -r '.. | strings' 2>/dev/null \
+              | grep -Eo '([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}' | sort -u)
+            for f in ${FOUND[@]+"${FOUND[@]}"}; do add_host "$f"; done
+            echo "   -> merged ${#FOUND[@]} hostnames"
+          done
+
+          echo "📋 total candidates: ${#HOSTS[@]}"
+
+          REQ_BODY=$(jq -n --arg u "$VIDEO_URL" \
+            '{url:$u, videoQuality:"max", downloadMode:"auto", filenameStyle:"basic", alwaysProxy:true, localProcessing:"disabled"}')
+
+          TRIED=0
+          for H in ${HOSTS[@]+"${HOSTS[@]}"}; do
+            [[ $TRIED -ge 8 ]] && { echo "⏹️  reached max 8 instances"; break; }
+            TRIED=$((TRIED+1))
+            echo "-------- [$TRIED] $H --------"
+
+            # probe: hovide GET / מחזיר JSON? (cobalt v11)
+            PROBE=$(curl -sS -m 20 -H 'Accept: application/json' "https://$H/" 2>/dev/null || true)
+            if ! echo "$PROBE" | jq -e . >/dev/null 2>&1; then
+              echo "   ❌ probe: not JSON / unreachable -> skip"; continue
+            fi
+            echo "   ✅ probe OK"
+
+            RESP=$(curl -sS -m 120 -H 'Accept: application/json' -H 'Content-Type: application/json' \
+                     -X POST --data "$REQ_BODY" "https://$H/" 2>/dev/null || true)
+            STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null)
+            echo "   status=${STATUS:-<none>} resp=$(echo "$RESP" | head -c 300)"
+            [[ "$STATUS" != "tunnel" ]] && { echo "   ⏭️  not tunnel -> skip"; continue; }
+
+            DL_URL=$(echo "$RESP" | jq -r '.url // empty')
+            [[ -z "$DL_URL" ]] && { echo "   ⏭️  no url -> skip"; continue; }
+
+            case "$DL_URL" in
+              https://*) ;;
+              *) echo "   ⛔ non-https url -> skip"; continue ;;
+            esac
+            DL_HOST=$(echo "$DL_URL" | awk -F/ '{print $3}')
+            if echo "$DL_HOST" | grep -qiE 'googlevideo|youtube|youtu\.be|ytimg|google'; then
+              echo "   ⛔ url points to google -> refuse"; continue
+            fi
+            if [[ "$DL_HOST" != "$H" && "$DL_HOST" != *".$H" ]]; then
+              echo "   ⛔ url host ($DL_HOST) not under $H -> refuse"; continue
+            fi
+
+            echo "   ⬇️  downloading from $DL_HOST ..."
+            if curl -f -sS -m 900 --proto '=https' --max-redirs 0 \
+                 -o "$OUT_DIR/video.tmp" "$DL_URL" ; then
+              SIZE=$(stat -c%s "$OUT_DIR/video.tmp" 2>/dev/null || echo 0)
+              if [[ "$SIZE" -gt 100000 ]]; then
+                mv "$OUT_DIR/video.tmp" "$OUT_DIR/video.mp4"
+                echo "   ✅ SUCCESS via $H ($SIZE bytes)"
+                echo "success=true" >> "$GITHUB_OUTPUT"
+                break
+              else
+                echo "   ⚠️ too small ($SIZE bytes) -> skip"; rm -f "$OUT_DIR/video.tmp"
+              fi
+            else
+              echo "   ❌ download failed (redirect/403?) -> skip"; rm -f "$OUT_DIR/video.tmp"
             fi
           done
 
-          awk '!seen[$0]++ && length($0)>0' "$CANDS" > dedup.txt
-          mv dedup.txt "$CANDS"
-          echo "--- candidates ---"; head -25 "$CANDS"; echo "------------------"
-
-          ok=false
-          tried=0
-
-          while read -r INST; do
-            [[ -z "$INST" ]] && continue
-            [[ $tried -ge 6 ]] && break
-
-            # האם זה cobalt עם תמיכה ביוטיוב?
-            META=$(curl -fsS --max-time 20 "$INST/" 2>/dev/null || true)
-            if ! echo "$META" | jq -e '.cobalt.services | index("youtube")' >/dev/null 2>&1; then
-              echo "skip $INST (not cobalt / no youtube)"
-              continue
-            fi
-
-            tried=$((tried+1))
-            echo ""
-            echo "---- instance $tried: $INST ----"
-
-            RESP=$(curl -sS --max-time 120 \
-                     -H "Accept: application/json" \
-                     -H "Content-Type: application/json" \
-                     -H "User-Agent: github-actions/1.0" \
-                     -d "$PAYLOAD" "$INST/" 2>/dev/null || true)
-
-            echo "$RESP" | head -c 600; echo
-
-            STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
-            if [[ "$STATUS" != "tunnel" ]]; then
-              echo "skip: status=${STATUS:-<none>} code=$(echo "$RESP" | jq -r '.error.code // empty' 2>/dev/null)"
-              continue
-            fi
-
-            DURL=$(echo "$RESP" | jq -r '.url // empty' 2>/dev/null)
-            FNAME=$(echo "$RESP" | jq -r '.filename // "video.mp4"' 2>/dev/null)
-
-            [[ "$DURL" =~ ^https:// ]] || { echo "REJECT: not https -> $DURL"; continue; }
-
-            if [[ "${ALLOW_GOOGLE:-false}" != "true" ]] && \
-               echo "$DURL" | grep -Eiq 'googlevideo|youtube\.com|youtu\.be|ytimg\.com|googleusercontent'; then
-              echo "REJECT: tunnel url points at google -> $DURL"
-              continue
-            fi
-
-            DEST_HOST=$(echo "$DURL" | awk -F/ '{print $3}')
-            echo "tunnel host: $DEST_HOST"
-
-            EXT="${FNAME##*.}"
-            [[ -z "$EXT" || "$EXT" == "$FNAME" ]] && EXT=mp4
-            OUT="$RUNNER_TEMP/success/video.$EXT"
-
-            echo "downloading tunnel url ..."
-            if curl -fL --max-time 1200 --retry 2 --retry-delay 3 -o "$OUT" "$DURL"; then
-              if [[ -s "$OUT" ]] && [[ "$(stat -c%s "$OUT")" -gt 100000 ]]; then
-                echo "OK downloaded $(numfmt --to=iec "$(stat -c%s "$OUT")") from $INST"
-                ok=true
-                break
-              fi
-            fi
-            echo "download failed from $INST"
-          done < "$CANDS"
-
-          if [[ "$ok" == "true" ]]; then
-            echo "success=true"  >> "$GITHUB_OUTPUT"
-            echo "OK Strategy A succeeded"
-          else
-            echo "success=false" >> "$GITHUB_OUTPUT"
-            echo "FAIL Strategy A failed (tried $tried instance(s))"
+          if ! grep -q '^success=true' "$GITHUB_OUTPUT"; then
+            echo "❌ Strategy A failed (tried $TRIED instance(s))"
           fi
 
       # ------------------------------------------------------------
-      # 3️⃣  אסטרטגיה B (גיבוי): pastedownload.com בדפדפן headless
+      # 3️⃣  Strategy B: pastedownload.com (דפדפן headless, best-effort)
       # ------------------------------------------------------------
-      - name: "Strategy B: pastedownload.com (headless browser)"
-        id: browser
-        if: ${{ always() && steps.cobalt.outputs.success != 'true' }}
+      - name: Setup Node for Strategy B
+        if: ${{ !cancelled() && steps.cobalt.outputs.success != 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Strategy B - pastedownload.com (best effort)
+        id: pastedown
+        if: ${{ !cancelled() && steps.cobalt.outputs.success != 'true' }}
         continue-on-error: true
         shell: bash
         env:
-          VIDEO_URL: ${{ inputs.url }}
-          ALLOW_GOOGLE: ${{ inputs.allow_direct_google }}
+          VIDEO_URL: ${{ github.event.inputs.url }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
           echo ""
           echo "===== Strategy B: pastedownload.com ====="
-
-          mkdir -p "$RUNNER_TEMP/wa" "$RUNNER_TEMP/success"
-          cd "$RUNNER_TEMP/wa"
-          npm init -y >/dev/null 2>&1
-          npm i playwright >/dev/null 2>&1
+          cd "$RUNNER_TEMP"
+          npm init -y >/dev/null 2>&1 || true
+          npm install playwright >/dev/null 2>&1
           npx playwright install --with-deps chromium >/dev/null 2>&1
 
-          cat > download.js <<'JS'
+          cat > pw.js <<'JS'
           const { chromium } = require('playwright');
           const fs = require('fs');
           const path = require('path');
 
-          const VIDEO_URL = process.env.VIDEO_URL;
-          const ALLOW_GOOGLE = process.env.ALLOW_GOOGLE === 'true';
-          const OUT_DIR = path.join(process.env.RUNNER_TEMP, 'success');
-          const GOOGLE_RE = /(^|\.)(googlevideo\.com|youtube\.com|youtu\.be|ytimg\.com|googleusercontent\.com|google\.com)$/i;
-          fs.mkdirSync(OUT_DIR, { recursive: true });
-
-          async function saveDownload(download, tag) {
-            try {
-              const ext = path.extname(download.suggestedFilename() || '') || '.mp4';
-              const p = path.join(OUT_DIR, 'video' + ext);
-              await download.saveAs(p);
-              console.log('[ok] captured download (' + tag + ') -> ' + p);
-            } catch (e) {
-              console.log('[warn] saveAs failed: ' + e.message);
-            }
-          }
-
           (async () => {
-            const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-            const ctx = await browser.newContext({
-              acceptDownloads: true,
-              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+            const outDir = path.join(process.env.RUNNER_TEMP, 'success');
+            fs.mkdirSync(outDir, { recursive: true });
+            const target = process.env.VIDEO_URL;
+            const BLOCK = /(^|\.)(youtube\.com|youtu\.be|googlevideo\.com|ytimg\.com|google\.com|googleapis\.com|gstatic\.com)$/i;
+            let done = false;
+
+            const browser = await chromium.launch({ args: ['--no-sandbox'] });
+            const ctx = await browser.newContext({ acceptDownloads: true });
+            await ctx.route('**/*', route => {
+              try {
+                const h = new URL(route.request().url()).hostname;
+                if (BLOCK.test(h)) return route.abort();
+              } catch (e) {}
+              return route.continue();
             });
 
-            // לא נוגעים בגוגל בכלל, אלא אם המשתמש התיר במפורש
-            if (!ALLOW_GOOGLE) {
-              await ctx.route('**/*', route => {
-                try {
-                  const h = new URL(route.request().url()).hostname;
-                  if (GOOGLE_RE.test(h)) {
-                    console.log('[blocked direct google request] ' + h);
-                    return route.abort();
-                  }
-                } catch (e) { /* ignore */ }
-                return route.continue();
+            ctx.on('page', p => {
+              p.on('download', async d => {
+                const dest = path.join(outDir, 'video.mp4');
+                await d.saveAs(dest);
+                console.log('download captured ->', dest);
+                done = true;
               });
-            } else {
-              console.log('[warn] allow_direct_google=true - the runner may contact Google');
-            }
-
-            let found = false;
-            ctx.on('page', p => p.on('download', async d => { found = true; await saveDownload(d, 'popup'); }));
-            const page = await ctx.newPage();
-            page.on('download', async d => { found = true; await saveDownload(d, 'main'); });
-            page.setDefaultTimeout(20000);
-
-            console.log('goto pastedownload.com ...');
-            await page.goto('https://pastedownload.com/youtube-video2-downloader/', {
-              waitUntil: 'domcontentloaded', timeout: 60000
             });
-            await page.waitForTimeout(4000);
-            console.log('page title: ' + (await page.title()));
 
-            const selectors = ['input[type="url"]','input[type="search"]','input[type="text"]','input[name*="url" i]','textarea'];
-            let box = null;
-            for (const s of selectors) {
-              const loc = page.locator(s).first();
-              if ((await loc.count()) && (await loc.isVisible().catch(() => false))) { box = loc; break; }
-            }
-            if (!box) { console.log('[error] URL input not found'); await browser.close(); process.exit(1); }
-            await box.fill(VIDEO_URL);
-            console.log('[ok] URL pasted');
+            const page = await ctx.newPage();
+            await page.goto('https://pastedownload.com/youtube-video2-downloader/',
+              { waitUntil: 'domcontentloaded', timeout: 60000 });
+            console.log('page title:', await page.title());
 
-            const btn = page.locator('button, input[type="submit"]')
-              .filter({ hasText: /download|start|convert|get|search|go/i }).first();
-            try {
-              if (await btn.count()) await btn.click({ timeout: 8000 });
-              else await box.press('Enter');
-            } catch (e) {
-              console.log('[warn] click failed, pressing Enter');
-              await box.press('Enter').catch(() => {});
-            }
-            console.log('[ok] submitted, waiting for result ...');
+            const input = page.locator('input[type="text"], input[type="url"], input[name*="url" i], textarea').first();
+            await input.waitFor({ timeout: 30000 });
+            await input.fill(target);
+            console.log('url filled');
 
-            const deadline = Date.now() + 150000;
-            let linkIdx = -1, linkHref = '';
-            while (Date.now() < deadline && !found) {
-              await page.waitForTimeout(4000);
-              const anchors = page.locator('a[href]');
-              const n = await anchors.count();
-              for (let i = 0; i < n; i++) {
-                const href = (await anchors.nth(i).getAttribute('href')) || '';
-                const txt = ((await anchors.nth(i).innerText().catch(() => '')) || '').toLowerCase();
-                if (/googlevideo\.com|videoplayback|\.mp4|\.webm|\.mkv/i.test(href) ||
-                    /download|1080p|720p|\(mp4\)/i.test(txt)) {
-                  linkIdx = i; linkHref = href; break;
-                }
+            const btn = page.getByRole('button', { name: /download|start|submit|convert|get/i }).first();
+            if (await btn.count()) { await btn.click(); }
+            else { await input.press('Enter'); }
+            console.log('submitted, waiting for result...');
+
+            const deadline = Date.now() + 180000;
+            while (Date.now() < deadline && !done) {
+              const links = await page.locator('a[href]').evaluateAll(as =>
+                as.map(a => ({ href: a.href, text: a.innerText, dl: a.hasAttribute('download') })));
+              for (const l of links) {
+                if (!l.href) continue;
+                let h = ''; try { h = new URL(l.href).hostname; } catch (e) {}
+                const looksMedia = /\.(mp4|webm|mkv|m4v|mov)(\?|$)/i.test(l.href) || l.dl ||
+                                   /download|save/i.test(l.text || '');
+                if (!looksMedia) continue;
+                if (BLOCK.test(h)) { console.log('ignoring google link:', h); continue; }
+                if (!/pastedownload\.com$/i.test(h)) { console.log('ignoring non-pastedownload link:', h); continue; }
+                console.log('found result link:', l.href);
+                try { await page.goto(l.href, { waitUntil: 'domcontentloaded', timeout: 60000 }); } catch (e) {}
+                await new Promise(r => setTimeout(r, 5000));
               }
-              if (linkIdx >= 0) break;
-            }
-
-            if (!found && linkIdx >= 0) {
-              console.log('[ok] result link: ' + linkHref.slice(0, 140));
-              let hrefHost = '';
-              try { hrefHost = new URL(linkHref).hostname; } catch (e) {}
-              if (!ALLOW_GOOGLE && GOOGLE_RE.test(hrefHost)) {
-                console.log('[abort] the site handed us a direct Google link (' + hrefHost + '); refusing it.');
-                await browser.close();
-                process.exit(1);
-              }
-              const anchor = page.locator('a[href]').nth(linkIdx);
-              const [dl] = await Promise.all([
-                page.waitForEvent('download', { timeout: 90000 }).catch(() => null),
-                anchor.click({ timeout: 10000 }).catch(() => null),
-              ]);
-              if (dl) await saveDownload(dl, 'clicked');
+              await new Promise(r => setTimeout(r, 3000));
             }
 
             await browser.close();
-            const good = fs.readdirSync(OUT_DIR)
-              .filter(f => f.startsWith('video'))
-              .find(f => fs.statSync(path.join(OUT_DIR, f)).size > 100000);
-            if (good) {
-              console.log('[ok] FINAL: ' + good + ' ' + fs.statSync(path.join(OUT_DIR, good)).size + ' bytes');
-              process.exit(0);
+
+            const files = fs.readdirSync(outDir).filter(f => /\.(mp4|webm|mkv|m4v|mov)$/i.test(f));
+            if (files.length === 0) { console.log('❌ no video obtained'); process.exit(0); }
+            const newest = files.map(f => path.join(outDir, f))
+              .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
+            if (path.basename(newest) !== 'video.mp4') {
+              fs.renameSync(newest, path.join(outDir, 'video.mp4'));
             }
-            console.log('[error] no video obtained from pastedownload.com');
-            process.exit(1);
-          })().catch(e => { console.log('[error] ' + e.message); process.exit(1); });
+            console.log('✅ got file:', newest);
+          })().catch(e => { console.log('❌ error:', e && e.message); process.exit(0); });
           JS
 
-          if node download.js; then
-            echo "success=true"  >> "$GITHUB_OUTPUT"
-          else
-            echo "success=false" >> "$GITHUB_OUTPUT"
-          fi
+          node pw.js || true
 
       # ------------------------------------------------------------
       # 4️⃣  איסוף התוצאה
@@ -368,104 +311,86 @@ jobs:
         id: collect
         if: always()
         shell: bash
-        env:
-          USER_FILENAME: ${{ inputs.filename }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
           echo ""
           echo "===== Collecting result ====="
-
-          SRC=$(find "$RUNNER_TEMP/success" -type f -size +10k \
-                  ! -name '*.part' ! -name '*.ytdl' ! -name '*.tmp' 2>/dev/null | head -1)
-
-          if [[ -z "$SRC" ]]; then
-            echo "have_file=false" >> "$GITHUB_OUTPUT"
-            echo "FAIL no output file produced"
+          OUT_DIR="$RUNNER_TEMP/success"
+          FILE=$(find "$OUT_DIR" -type f \( -iname '*.mp4' -o -iname '*.webm' -o -iname '*.mkv' \
+                 -o -iname '*.m4v' -o -iname '*.mov' \) 2>/dev/null | head -1)
+          if [[ -z "$FILE" || ! -s "$FILE" ]]; then
+            echo "❌ no output file produced"
+            echo "success=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "   file: $SRC ($(numfmt --to=iec "$(stat -c%s "$SRC")"))"
-
-          if [[ -n "${USER_FILENAME:-}" ]]; then
-            BASE="$USER_FILENAME"
-          else
-            BASE="$(basename "$SRC")"; BASE="${BASE%.*}"
-          fi
-          BASE="${BASE//\//_}"; BASE="${BASE:0:150}"
-          EXT="${SRC##*.}"
-
-          WORK_DIR="$RUNNER_TEMP/zipbuild"
-          rm -rf "$WORK_DIR"; mkdir -p "$WORK_DIR"
-          cp "$SRC" "$WORK_DIR/${BASE}.${EXT}"
-
-          echo "base=$BASE"           >> "$GITHUB_OUTPUT"
-          echo "ext=$EXT"             >> "$GITHUB_OUTPUT"
-          echo "work_dir=$WORK_DIR"   >> "$GITHUB_OUTPUT"
-          echo "filename=${BASE}.zip" >> "$GITHUB_OUTPUT"
-          echo "have_file=true"       >> "$GITHUB_OUTPUT"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "success=true" >> "$GITHUB_OUTPUT"
+          echo "✅ output file: $FILE ($(stat -c%s "$FILE") bytes)"
 
       # ------------------------------------------------------------
-      # 5️⃣  ZIP → Drive
+      # 5️⃣  ZIP + העלאה ל-Drive
       # ------------------------------------------------------------
-      - name: Zip + upload to Drive
+      - name: Zip and upload to Drive
         id: upload
-        if: steps.collect.outputs.have_file == 'true'
+        if: ${{ steps.collect.outputs.success == 'true' }}
         shell: bash
         env:
-          FOLDER: ${{ inputs.folder }}
+          FILE: ${{ steps.collect.outputs.file }}
+          FOLDER: ${{ github.event.inputs.folder }}
+          USER_FILENAME: ${{ github.event.inputs.filename }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
+          set -e
           echo ""
-          echo "===== Zip + Upload ====="
-
-          WORK_DIR="${{ steps.collect.outputs.work_dir }}"
-          BASE="${{ steps.collect.outputs.base }}"
-          EXT="${{ steps.collect.outputs.ext }}"
-          ZIP_NAME="${{ steps.collect.outputs.filename }}"
-          TMP_ZIP="$RUNNER_TEMP/$ZIP_NAME"
+          echo "===== Zip + upload ====="
+          if [[ -n "$USER_FILENAME" ]]; then
+            BASE_NAME="$USER_FILENAME"
+          else
+            BASE_NAME="$(basename "${FILE%.*}")"
+          fi
+          BASE_NAME="${BASE_NAME:0:180}"
+          ZIP_NAME="${BASE_NAME}.zip"
           REMOTE_PATH="gdrive:${FOLDER}/${ZIP_NAME}"
+          TMP_DIR=$(mktemp -d)
+          TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
+          cp "$FILE" "${TMP_DIR}/${ZIP_NAME%.zip}"
+          (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "${ZIP_NAME%.zip}")
 
-          ( cd "$WORK_DIR" && zip -j -q "$TMP_ZIP" "${BASE}.${EXT}" )
-          [[ -s "$TMP_ZIP" ]] || { echo "FAIL zip creation failed"; exit 1; }
           ZIP_SIZE=$(stat -c%s "$TMP_ZIP")
-          echo "   ZIP: $ZIP_NAME ($(numfmt --to=iec "$ZIP_SIZE"))"
+          echo "📦 $ZIP_NAME ($(numfmt --to=iec "$ZIP_SIZE"))"
 
           if rclone lsf "$REMOTE_PATH" >/dev/null 2>&1; then
-            echo "   deleting old $REMOTE_PATH"
-            rclone delete "$REMOTE_PATH"
+            echo "🗑️ delete old $REMOTE_PATH"; rclone delete "$REMOTE_PATH"
           fi
+          echo "🚀 uploading..."
+          rclone copy "$TMP_ZIP" "$REMOTE_PATH" --progress
+          rm -rf "$TMP_DIR"
 
-          if rclone copy "$TMP_ZIP" "$REMOTE_PATH" --progress; then
-            echo "OK uploaded to $REMOTE_PATH"
-            echo "uploaded=true"       >> "$GITHUB_OUTPUT"
-            echo "zip_size=$ZIP_SIZE"  >> "$GITHUB_OUTPUT"
-          else
-            echo "FAIL rclone upload failed"
-            echo "uploaded=false"      >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
+          echo "STATUS=success" >> "$GITHUB_OUTPUT"
+          echo "FILE_NAME=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "FILE_SIZE=$ZIP_SIZE" >> "$GITHUB_OUTPUT"
+          echo "✅ uploaded"
 
       # ------------------------------------------------------------
-      # 6️⃣  מייל עם הלוג
+      # 6️⃣  מייל לוג
       # ------------------------------------------------------------
-      - name: Send log email
+      - name: Send log email (always)
         if: always()
         shell: bash
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          UPLOADED: ${{ steps.upload.outputs.uploaded }}
-          ZIP_NAME: ${{ steps.collect.outputs.filename }}
-          ZIP_SIZE: ${{ steps.upload.outputs.zip_size }}
+          STATUS: ${{ steps.upload.outputs.STATUS }}
+          FILE_NAME: ${{ steps.upload.outputs.FILE_NAME }}
+          FILE_SIZE: ${{ steps.upload.outputs.FILE_SIZE }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          echo "preparing email ..."
-
-          if [[ -z "${EMAIL_PASSWORD:-}" ]]; then
-            echo "WARN EMAIL_PASSWORD secret is empty - skipping email"
-            exit 0
+          exec >> "$LOG_FILE" 2>&1
+          echo "📧 preparing email..."
+          if [[ -z "$EMAIL_PASSWORD" ]]; then
+            echo "⚠️ EMAIL_PASSWORD empty - skipping"; exit 0
           fi
-
           mkdir -p ~/.msmtp
           cat > ~/.msmtprc <<EOF
           defaults
@@ -483,30 +408,29 @@ jobs:
           EOF
           chmod 600 ~/.msmtprc
 
-          if [[ "$UPLOADED" == "true" ]]; then
-            SUBJECT="SUCCESS - YouTube -> Drive - ${{ github.repository }}"
+          if [[ "$STATUS" == "success" ]]; then
+            SUBJECT="✅ [GitHub Actions] YouTube → Drive SUCCESS - ${{ github.repository }}"
             BODY="ההורדה וההעלאה הושלמו בהצלחה.\n\n"
-            BODY+="ZIP: $ZIP_NAME\n"
-            BODY+="גודל: $(numfmt --to=iec ${ZIP_SIZE:-0} 2>/dev/null)\n"
-            BODY+="תיקייה: ${{ inputs.folder }}\n"
+            BODY+="📁 ZIP: $FILE_NAME\n"
+            BODY+="📦 גודל: $(numfmt --to=iec ${FILE_SIZE:-0} 2>/dev/null || echo ${FILE_SIZE:-?} bytes)\n"
+            BODY+="📂 תיקייה: ${{ github.event.inputs.folder }}\n"
+            BODY+="🔗 ${{ github.event.inputs.url }}\n"
           else
-            SUBJECT="FAILED - YouTube -> Drive - ${{ github.repository }}"
-            BODY="ההורדה נכשלה. מצורף לוג.\n\n"
+            SUBJECT="❌ [GitHub Actions] YouTube → Drive FAILED - ${{ github.repository }}"
+            BODY="ההורדה נכשלה. מצורף לוג.\n\n🔗 ${{ github.event.inputs.url }}\n"
           fi
-          BODY+="מקור: ${{ inputs.url }}\n"
-          BODY+="Run: ${{ github.run_id }} (${{ github.run_number }})\n"
-          BODY+="$(date -u +'%Y-%m-%d %H:%M:%S UTC')\n"
-          BODY+="\n--- Last 60 lines of log ---\n"
-          BODY+=$(tail -60 "$LOG_FILE")
+          BODY+="🏃 Run: ${{ github.run_id }} (${{ github.run_number }})\n"
+          BODY+="⏱️ $(date -u +"%Y-%m-%d %H:%M:%S UTC")\n\n--- Last 80 lines ---\n"
+          BODY+=$(tail -80 "$LOG_FILE")
 
           echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" \
             | msmtp -a gmail "$EMAIL_TO"
-          echo "OK email sent to $EMAIL_TO"
+          echo "✅ email sent"
 
       # ------------------------------------------------------------
-      # 7️⃣  לוג כ-Artifact
+      # 7️⃣  Artifact + סיכום
       # ------------------------------------------------------------
-      - name: Upload log as Artifact
+      - name: Upload log artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -515,22 +439,11 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-      # ------------------------------------------------------------
-      # 8️⃣  סיכום סופי
-      # ------------------------------------------------------------
       - name: Final summary
         if: always()
         shell: bash
-        env:
-          UPLOADED: ${{ steps.upload.outputs.uploaded }}
         run: |
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          echo "=== FINAL SUMMARY ==="
-          echo "Uploaded: ${UPLOADED:-false}"
-          echo "=== Last 80 log lines ==="
-          tail -80 "$LOG_FILE" 2>/dev/null || true
-          if [[ "${UPLOADED:-false}" != "true" ]]; then
-            echo "FAIL Job failed - see email or log artifact"
-            exit 1
-          fi
-          echo "OK Done"
+          exec >> "$LOG_FILE" 2>&1
+          echo "=== FINAL: cobalt=${{ steps.cobalt.outputs.success }} collect=${{ steps.collect.outputs.success }} upload=${{ steps.upload.outputs.STATUS || 'failed' }} ==="
+          if [[ "${{ steps.upload.outputs.STATUS }}" != "success" ]]; then exit 1; fi
