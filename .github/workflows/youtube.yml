@@ -45,6 +45,7 @@ jobs:
 
     steps:
       - name: Install dependencies & init log
+        id: init
         shell: bash
         run: |
           set +e; set +u
@@ -63,9 +64,12 @@ jobs:
           sudo apt-get install -y -qq ffmpeg zip jq msmtp msmtp-mta curl; echo "deps exit=$?"
           echo "provider | http | detail | detail2 | result" > "$SUMMARY_FILE"
           echo "✅ dependencies installed"
-          echo "start" >> "$GITHUB_OUTPUT"
+          # פורמט GITHUB_OUTPUT הוא name=value — מחרוזת חופשית גורמת לשלב להיכשל
+          echo "init=ok" >> "$GITHUB_OUTPUT" || echo "WARN: GITHUB_OUTPUT write failed"
+          echo "init step finished ok"
 
       - name: Configure rclone
+        if: ${{ always() && !cancelled() }}
         shell: bash
         env:
           RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
@@ -88,6 +92,7 @@ jobs:
       # ============================================================
       - name: Strategy 0 - link-resolver sites
         id: res0
+        if: ${{ always() && !cancelled() }}
         shell: bash
         env:
           VIDEO_URL: ${{ github.event.inputs.url }}
@@ -500,7 +505,7 @@ jobs:
 
       - name: Zip and upload to Drive
         id: upload
-        if: ${{ steps.verify.outputs.success == 'true' }}
+        if: ${{ always() && !cancelled() && steps.verify.outputs.success == 'true' }}
         shell: bash
         env:
           INPUT_FILE: ${{ steps.verify.outputs.file }}
@@ -572,6 +577,13 @@ jobs:
             printf 'מקור: %s\n' '${{ github.event.inputs.url }}'
             printf 'Run: %s (%s) | mode: %s\n' '${{ github.run_id }}' '${{ github.run_number }}' "$MODE"
             printf 'זמן: %s\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            printf '%s\n' '===== STEPS (ריק = השלב לא רץ) ====='
+            printf 'init       = %s\n' '${{ steps.init.outputs.init }}'
+            printf 'res0       = %s\n' '${{ steps.res0.outputs.success }}'
+            printf 'invidious  = %s\n' '${{ steps.inv.outputs.success }}'
+            printf 'piped      = %s\n' '${{ steps.piped.outputs.success }}'
+            printf 'verify     = %s\n' '${{ steps.verify.outputs.success }}'
+            printf 'upload     = %s\n\n' '${{ steps.upload.outputs.STATUS }}'
             printf '%s\n' '===== PROVIDER SUMMARY ====='; cat "$SUMMARY_FILE" 2>/dev/null
             printf '\n%s\n' '===== FULL LOG ====='; cat "$LOG_FILE" 2>/dev/null
           } | msmtp -a gmail "$EMAIL_TO"
