@@ -1,4 +1,4 @@
-name: YouTube → Google Drive (ZIP) — loader.to resolver + email LOG (v8)
+name: YouTube → Google Drive (ZIP) — loader.to resolver + email LOG (v9)
 
 on:
   workflow_dispatch:
@@ -23,6 +23,17 @@ on:
         options:
           - download
           - probe
+      quality:
+        description: "איכות וידאו (best = מהגבוהה ביותר הזמינה ולמטה)"
+        required: false
+        default: "best"
+        type: choice
+        options:
+          - best
+          - "1080"
+          - "720"
+          - "480"
+          - "360"
 env:
   EMAIL_TO: "p0556722432@gmail.com"
   EMAIL_FROM: "p0556722432@gmail.com"
@@ -48,10 +59,11 @@ jobs:
           SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
           : > "$LOG_FILE"; : > "$SUMMARY_FILE"
           exec >> "$LOG_FILE" 2>&1
-          echo "=== YouTube -> loader.to -> Drive (v8) ==="
+          echo "=== YouTube -> loader.to -> Drive (v9: quality) ==="
           echo "Run: ${{ github.run_id }} | Repo: ${{ github.repository }}"
-          echo "URL:    ${{ github.event.inputs.url }}"
-          echo "Mode:   ${{ github.event.inputs.mode }}"
+          echo "URL:     ${{ github.event.inputs.url }}"
+          echo "Mode:    ${{ github.event.inputs.mode }}"
+          echo "Quality: ${{ github.event.inputs.quality }}"
           echo "Started: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "=========================================="
           curl -fsSL https://rclone.org/install.sh | sudo bash; echo "rclone exit=$?"
@@ -92,6 +104,7 @@ jobs:
         env:
           VIDEO_URL: ${{ github.event.inputs.url }}
           MODE: ${{ github.event.inputs.mode }}
+          QUALITY: ${{ github.event.inputs.quality }}
         run: |
           set +e; set +u; set -o pipefail
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
@@ -102,6 +115,13 @@ jobs:
           echo "success=false" >> "$GITHUB_OUTPUT"
           echo "";          echo "===== Resolver: loader.to (p.savenow.to) ====="
           echo "mode = ${MODE:-download}"
+
+          # ---- איכות: best = סולם נפילה 1080→720→480→360, ערך מפורש = 3 ניסיונות על אותה איכות ----
+          Q_IN="${QUALITY:-best}"
+          [[ "$Q_IN" =~ ^(best|[0-9]{3,4})$ ]] || Q_IN=best
+          if [[ "$Q_IN" == "best" ]]; then QLADDER='1080 720 480 360'; else QLADDER="$Q_IN $Q_IN $Q_IN"; fi
+          read -ra QS <<< "$QLADDER"
+          echo "quality = $Q_IN | ladder: ${QS[*]}"
 
           UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
           RESOLVED=""; GOT=""
@@ -136,12 +156,13 @@ jobs:
           }
 
           p_loaderto(){
-            local r j id du i pu
+            local r j id du i pu fmt="${Q:-1080}"
+            echo "  quality request: format=$fmt"
             r=$(curl -sS -m 45 -A "$UA" -H 'Accept: application/json' -H 'Referer: https://loader.to/' -G \
                 --data-urlencode "url=$VIDEO_URL" \
                 --data-urlencode "copyright=0" --data-urlencode "allow_extended_duration=1" \
                 --data-urlencode "add_info=1" --data-urlencode "no_merge=0" \
-                --data-urlencode "format=720" --data-urlencode "api=$SAVENOW_API" \
+                --data-urlencode "format=$fmt" --data-urlencode "api=$SAVENOW_API" \
                 "https://p.savenow.to/ajax/download.php" 2>/dev/null)
             if ! jq -e . <<<"$r" >/dev/null 2>&1; then row "savenow" "-" "${r:0:70}" "" "not-json"; return 1; fi
             id=$(jq -r '.id // empty' <<<"$r")
@@ -161,7 +182,7 @@ jobs:
                 if [[ "$du" == http* ]]; then
                   echo "  progress=1000 -> ${du:0:120}"
                   ad_walk "$du"
-                  RESOLVED="$du"; row "savenow" "200" "progress=1000" "" "resolved"; return 0
+                  RESOLVED="$du"; row "savenow" "200" "progress=1000" "fmt=$fmt" "resolved"; return 0
                 fi
                 if [[ "$(jq -r '.progress // 0' <<<"$j")" == "1000" ]]; then
                   row "savenow" "-" "$(jq -c '{success,text,message}' <<<"$j" 2>/dev/null | head -c 70)" "" "job-failed"
@@ -229,11 +250,12 @@ jobs:
 
           # כל ניסיון יוצר job חדש אצל הספק — שער המודעה נפתח חלקית, ניסוי חוזר מגדיל את הסיכוי
           attempt_loaderto(){
-            local n="$1"
-            echo ""; echo "======== loader.to attempt $n ========"
+            local n="$1" q="$2"
+            Q="$q"
+            echo ""; echo "======== loader.to attempt $n | format=$q ========"
             RESOLVED=""
             p_loaderto
-            [[ "$RESOLVED" != http* ]] && { echo "  resolve failed"; return 1; }
+            [[ "$RESOLVED" != http* ]] && { echo "  resolve failed (format=$q)"; return 1; }
             echo "  resolved -> ${RESOLVED:0:130}"
             if [[ "${MODE:-download}" == "probe" ]]; then
               echo "  (probe: לא מוריד)"
@@ -242,10 +264,10 @@ jobs:
             dl_check "loader.to"
           }
 
-          echo "📋 resolver: loader.to (p.savenow.to) — עד 3 ניסיונות"
-          for AT in 1 2 3; do
-            attempt_loaderto "$AT" && break
-            [[ "$AT" -lt 3 ]] && { echo "  fresh job in 5s..."; sleep 5; }
+          echo "📋 resolver: loader.to (p.savenow.to) — איכות: ${QS[*]}"
+          for AT in "${!QS[@]}"; do
+            attempt_loaderto "$((AT+1))" "${QS[$AT]}" && break
+            [[ "$AT" -lt $((${#QS[@]}-1)) ]] && { echo "  fresh job in 5s..."; sleep 5; }
           done
           [[ -n "$GOT" ]] && { echo ""; echo "🎉 SUCCESS via loader.to"; }
           echo ""
@@ -347,7 +369,7 @@ jobs:
             printf 'Subject: %s\n' "$SUBJECT"; printf 'From: %s\n' "$EMAIL_FROM"; printf 'To: %s\n' "$EMAIL_TO"
             printf 'Content-Type: text/plain; charset=UTF-8\n\n'; printf '%s\n\n' "$INTRO"
             printf 'מקור: %s\n' '${{ github.event.inputs.url }}'
-            printf 'Run: %s (%s) | mode: %s\n' '${{ github.run_id }}' '${{ github.run_number }}' "$MODE"
+            printf 'Run: %s (%s) | mode: %s | quality: %s\n' '${{ github.run_id }}' '${{ github.run_number }}' "$MODE" '${{ github.event.inputs.quality }}'
             printf 'זמן: %s\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             printf '%s\n' '===== STEPS (ריק = השלב לא רץ) ====='
             printf 'init       = %s\n' '${{ steps.init.outputs.init }}'
