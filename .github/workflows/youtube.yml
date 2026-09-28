@@ -1,4 +1,4 @@
-name: ניסויYouTube → Google Drive (ZIP) — link-resolver sites + proxies + email LOG (v7)
+name: YouTube → Google Drive (ZIP) — link-resolver sites + proxies + email LOG (v7)
 
 on:
   workflow_dispatch:
@@ -97,6 +97,7 @@ jobs:
         env:
           VIDEO_URL: ${{ github.event.inputs.url }}
           MODE: ${{ github.event.inputs.mode }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
         run: |
           set +e; set +u; set -o pipefail
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
@@ -109,7 +110,13 @@ jobs:
           echo "mode = ${MODE:-download}"
 
           UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-          RESOLVED=""; RESOLVER=""; GOT=""
+          RESOLVED=""; RESOLVER=""; GOT=""; CANDS=()
+          RAPID_KEY="${RAPIDAPI_KEY:-}"
+          [[ -z "$RAPID_KEY" ]] && echo "⚠️ RAPIDAPI_KEY לא הוגדר — מדלג על שלושת resolvers של RapidAPI"
+
+          VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*[?&]v=([^?&]+).*#\1#')
+          [[ "$VIDEO_ID" == "$VIDEO_URL" || -z "$VIDEO_ID" ]] && VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#')
+          echo "VIDEO_ID = ${VIDEO_ID:-none}"
 
           row(){ printf '%s | %s | %s | %s | %s\n' "$1" "${2:--}" "${3:--}" "${4:--}" "${5:-fail}" >> "$SUMMARY_FILE"; }
 
@@ -126,6 +133,58 @@ jobs:
              | grep -Eiv 'youtube\.com|ytimg\.|googleusercontent|gstatic|schema\.org|w3\.org|doubleclick' \
              | grep -Ei '\.(mp4|m4a|webm|mkv|mp3|aac)(\?|$)|videoplayback|googlevideo|/tunnel|durl' \
              | head -n1
+          }
+
+          # ---------- resolver: RapidAPI (נדרש Secret RAPIDAPI_KEY) ----------
+          # שלושה ספקי RapidAPI שמחזירים קישור חלופי ישירות. נמצאו משימוש אמיתי בקוד פתוח.
+
+          # 1) YouTube Video Downloader Fast — POST /download.php (multipart), תשובה {success, medias[].url}
+          p_rapid_fast(){
+            local r host="youtube-video-downloader-fast.p.rapidapi.com"
+            [[ -z "$RAPID_KEY" ]] && { row "rapid-fast" "-" "no RAPIDAPI_KEY secret" "" "skip"; return 1; }
+            r=$(curl -sS -m 60 -A "$UA" -H "X-RapidAPI-Host: $host" -H "X-RapidAPI-Key: $RAPID_KEY" \
+                -F "url=$VIDEO_URL" "https://$host/download.php" 2>/dev/null)
+            if ! jq -e . <<<"$r" >/dev/null 2>&1; then row "rapid-fast" "-" "${r:0:60}" "" "not-json"; return 1; fi
+            mapfile -t CANDS < <(jq -r '
+              [.medias[]? | .url? // empty | select(startswith("http"))] as $u
+              | ([$u[] | select(test("\\.(mp4|webm)";"i"))] + [$u[] | select((test("\\.(mp4|webm)";"i"))|not)])[]
+              ' <<<"$r" 2>/dev/null | head -8)
+            if [[ ${#CANDS[@]} -eq 0 ]]; then
+              row "rapid-fast" "-" "$(jq -c '{success:.success,msg:(.message//.error//null)}' <<<"$r" 2>/dev/null)" "" "no-medias"
+              return 1
+            fi
+            row "rapid-fast" "200" "${#CANDS[@]} media urls" "" "resolved"
+            return 0
+          }
+
+          # 2) YouTube Media Downloader — GET /v2/video/details?videoId=... , תשובה videos.items[].url
+          p_rapid_ymd(){
+            local r host="youtube-media-downloader.p.rapidapi.com"
+            [[ -z "$RAPID_KEY" ]] && { row "rapid-ytd" "-" "no RAPIDAPI_KEY secret" "" "skip"; return 1; }
+            [[ -z "$VIDEO_ID" ]] && { row "rapid-ytd" "-" "no video id" "" "skip"; return 1; }
+            r=$(curl -sS -m 45 -A "$UA" -H "X-RapidAPI-Host: $host" -H "X-RapidAPI-Key: $RAPID_KEY" \
+                "https://$host/v2/video/details?videoId=$VIDEO_ID&urlAccess=normal&videos=auto&audios=auto" 2>/dev/null)
+            if ! jq -e . <<<"$r" >/dev/null 2>&1; then row "rapid-ytd" "-" "${r:0:60}" "" "not-json"; return 1; fi
+            mapfile -t CANDS < <(jq -r '[.videos.items[]?.url? // empty | select(startswith("http"))] | .[]' <<<"$r" 2>/dev/null | head -6)
+            if [[ ${#CANDS[@]} -eq 0 ]]; then
+              row "rapid-ytd" "-" "$(jq -r '(.message//.error//.status//"?")|tostring' <<<"$r" 2>/dev/null | head -c 50)" "" "no-videos"
+              return 1
+            fi
+            row "rapid-ytd" "200" "${#CANDS[@]} video urls" "" "resolved"
+            return 0
+          }
+
+          # 3) YouTube Download API — GET /<video_id>/mp4
+          p_rapid_dl(){
+            local r du host="youtube-download-api.p.rapidapi.com"
+            [[ -z "$RAPID_KEY" ]] && { row "rapid-dl" "-" "no RAPIDAPI_KEY secret" "" "skip"; return 1; }
+            [[ -z "$VIDEO_ID" ]] && { row "rapid-dl" "-" "no video id" "" "skip"; return 1; }
+            r=$(curl -sS -m 60 -A "$UA" -H "X-RapidAPI-Host: $host" -H "X-RapidAPI-Key: $RAPID_KEY" \
+                "https://$host/$VIDEO_ID/mp4" 2>/dev/null)
+            du=$(json_url <<<"$r"); [[ "$du" != http* ]] && du=$(grab_url <<<"$r")
+            if [[ "$du" == http* ]]; then RESOLVED="$du"; row "rapid-dl" "200" "${du:0:50}" "" "resolved"; return 0; fi
+            row "rapid-dl" "-" "${r:0:60}" "" "no-link"
+            return 1
           }
 
           # ---------- resolver: loader.to ----------
@@ -242,7 +301,7 @@ jobs:
           }
 
           # ---------- הורדה + ולידציה ----------
-          fetch_media(){
+          dl_check(){
             local name="$1" R CODE CT EXT SZ
             echo "  downloading: ${RESOLVED:0:140}"
             R=$(curl -sS -L --max-redirs 8 --max-time 1800 -A "$UA" -e "$VIDEO_URL" \
@@ -282,13 +341,30 @@ jobs:
             return 1
           }
 
+          # מנסה אחד-אחד את כל המועמדים שה-resolver החזיר, עד שמישהו מתגלה כקובץ וידאו תקין
+          fetch_media(){
+            local name="$1" u n=0
+            local -a urls=()
+            [[ -n "$RESOLVED" ]] && urls+=("$RESOLVED")
+            for u in "${CANDS[@]}"; do urls+=("$u"); done
+            if [[ ${#urls[@]} -eq 0 ]]; then row "$name" "-" "no candidates" "" "fail"; return 1; fi
+            echo "  candidates: ${#urls[@]}"
+            for u in "${urls[@]}"; do
+              n=$((n+1)); [[ $n -gt 6 ]] && { echo "  (max 6 candidates)"; break; }
+              echo "  candidate [$n]: ${u:0:130}"
+              RESOLVED="$u"
+              if dl_check "$name"; then GOT=1; return 0; fi
+            done
+            return 1
+          }
+
           try_one(){
             local name="$1" fn="$2"
             echo ""; echo "-------- $name --------"
-            RESOLVED=""
+            RESOLVED=""; CANDS=()
             "$fn"
-            [[ "$RESOLVED" != http* ]] && return 1
-            echo "  resolved -> ${RESOLVED:0:130}"
+            if [[ ${#CANDS[@]} -eq 0 && "$RESOLVED" != http* ]]; then return 1; fi
+            [[ -n "$RESOLVED" ]] && echo "  resolved -> ${RESOLVED:0:130}"
             if [[ "${MODE:-download}" == "probe" ]]; then
               echo "  (probe: לא מוריד)"
               return 0
@@ -296,8 +372,8 @@ jobs:
             fetch_media "$name"
           }
 
-          echo "📋 resolver candidates: 6 (loader.to, y2mate, savefrom, vevioz, 9xbuddy, cobalt-instances)"
-          for spec in "loader.to:p_loaderto" "y2mate:p_y2mate" "savefrom:p_savefrom" "vevioz:p_vevioz" "9xbuddy:p_9xbuddy" "cobalt-instances:p_cobalt"; do
+          echo "📋 resolver candidates: 9 (rapid-fast, rapid-ytd, rapid-dl, loader.to, y2mate, savefrom, vevioz, 9xbuddy, cobalt-instances)"
+          for spec in "rapid-fast:p_rapid_fast" "rapid-ytd:p_rapid_ymd" "rapid-dl:p_rapid_dl" "loader.to:p_loaderto" "y2mate:p_y2mate" "savefrom:p_savefrom" "vevioz:p_vevioz" "9xbuddy:p_9xbuddy" "cobalt-instances:p_cobalt"; do
             nm="${spec%%:*}"; fn="${spec##*:}"
             try_one "$nm" "$fn"
             [[ -n "$GOT" ]] && { echo ""; echo "🎉 SUCCESS via $nm"; break; }
