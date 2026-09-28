@@ -187,24 +187,58 @@ jobs:
             return 1
           }
 
-          # ---------- resolver: loader.to ----------
+          # ---------- resolver: loader.to / p.savenow.to ( אותו backend ) ----------
+          # זרימת API מלאה שנמצאה בקוד פתוח ומאומתת ידנית:
+          #   1) GET /ajax/download.php?url=..&format=720&api=..  -> {success,id,progress_url}
+          #   2) GET <progress_url>                                -> progress=1000 + download_url
+          #   3) download_url יושב על הדומיין של הספק (*.savenow.to) — אין חיבור ישיר ליוטיוב.
+          SAVENOW_API='dfcb6d76f2f6a9894gjkege8a4ab232222'
+
+          # הזרמת-מעבר מודעה: ה-link מפנה תחילה לעמוד מודעה ומחזיר session.
+          ad_walk(){
+            local jar="$WORK/cookies.txt"
+            echo "  walking ad interstitial..."
+            curl -sS -m 25 -A "$UA" -c "$jar" -b "$jar" -o /dev/null -L --max-redirs 5 --max-time 25 "$1" 2>/dev/null
+            sleep 2
+            curl -sS -m 25 -A "$UA" -c "$jar" -b "$jar" -o /dev/null --max-redirs 0 "$1" 2>/dev/null
+          }
+
           p_loaderto(){
-            local r id j du i
-            r=$(curl -sS -m 40 -A "$UA" -H 'Referer: https://loader.to/' \
-                --data-urlencode "start=1" --data-urlencode "end=1" \
-                --data-urlencode "format=mp4" --data-urlencode "url=$VIDEO_URL" \
-                "https://loader.to/ajax/download.php" 2>/dev/null)
-            id=$(jq -r '.id // empty' <<<"$r" 2>/dev/null)
-            if [[ -z "$id" ]]; then row "loader.to" "-" "${r:0:70}" "" "no-id"; return 1; fi
-            echo "  id=$id"
-            for i in $(seq 1 45); do
-              j=$(curl -sS -m 30 -A "$UA" -H 'Referer: https://loader.to/' \
-                  "https://loader.to/ajax/progress.php?id=$id" 2>/dev/null)
-              du=$(jq -r '.download_url // empty' <<<"$j" 2>/dev/null)
-              if [[ "$du" == http* ]]; then RESOLVED="$du"; row "loader.to" "200" "progress ok" "" "resolved"; return 0; fi
+            local r j id du i pu
+            r=$(curl -sS -m 45 -A "$UA" -H 'Accept: application/json' -H 'Referer: https://loader.to/' -G \
+                --data-urlencode "url=$VIDEO_URL" \
+                --data-urlencode "copyright=0" --data-urlencode "allow_extended_duration=1" \
+                --data-urlencode "add_info=1" --data-urlencode "no_merge=0" \
+                --data-urlencode "format=720" --data-urlencode "api=$SAVENOW_API" \
+                "https://p.savenow.to/ajax/download.php" 2>/dev/null)
+            if ! jq -e . <<<"$r" >/dev/null 2>&1; then row "savenow" "-" "${r:0:70}" "" "not-json"; return 1; fi
+            id=$(jq -r '.id // empty' <<<"$r")
+            du=$(jq -r '.url // .download_url // empty' <<<"$r")
+            if [[ -z "$id" && "$du" != http* ]]; then
+              row "savenow" "-" "$(jq -c '{success,message,errors}' <<<"$r" 2>/dev/null | head -c 70)" "" "no-id"
+              return 1
+            fi
+            if [[ "$du" == http* ]]; then RESOLVED="$du"; row "savenow" "200" "direct url" "" "resolved"; return 0; fi
+            echo "  savenow job id=$id"
+            pu=$(jq -r '.progress_url // empty' <<<"$r")
+            [[ -z "$pu" ]] && pu="https://p.savenow.to/api/progress?id=$id"
+            for i in $(seq 1 40); do
+              j=$(curl -sS -m 30 -A "$UA" -H 'Accept: application/json' "$pu" 2>/dev/null)
+              if jq -e . <<<"$j" >/dev/null 2>&1; then
+                du=$(jq -r '.download_url // empty' <<<"$j")
+                if [[ "$du" == http* ]]; then
+                  echo "  progress=1000 -> ${du:0:120}"
+                  ad_walk "$du"
+                  RESOLVED="$du"; row "savenow" "200" "progress=1000" "" "resolved"; return 0
+                fi
+                if [[ "$(jq -r '.progress // 0' <<<"$j")" == "1000" ]]; then
+                  row "savenow" "-" "$(jq -c '{success,text,message}' <<<"$j" 2>/dev/null | head -c 70)" "" "job-failed"
+                  return 1
+                fi
+              fi
               sleep 3
             done
-            row "loader.to" "200" "timeout: ${j:0:60}" "" "no-url"
+            row "savenow" "-" "timeout: ${j:0:60}" "" "no-url"
             return 1
           }
 
@@ -269,14 +303,16 @@ jobs:
           p_cobalt(){
             local LIST="$WORK/cobalt.json" code inst base body st du n=0
             local -a CAND=()
-            code=$(curl -sS -m 25 -A "$UA" -o "$LIST" -w '%{http_code}' "https://instances.cobalt.best/api/instances.json" 2>/dev/null)
+            # -k: לתעודת ה-TLS של האתר יש שרשרת לא תקינה, זה מה שנתן 000 בריצות הקודמות
+            code=$(curl -sS -k -m 25 -A "$UA" -o "$LIST" -w '%{http_code}' "https://instances.cobalt.best/api/instances.json" 2>/dev/null)
             if [[ ! -s "$LIST" ]] || ! jq -e . "$LIST" >/dev/null 2>&1; then
-              row "cobalt-list" "${code:-?}" "instance list unavailable" "" "skip"
-              return 1
+              row "cobalt-list" "${code:-?}" "instance list unavailable -> hardcoded fallback" "" "fallback"
+              CAND=("cobalt.api.r4sh.net" "capi.3kh0.net" "cobalt-api.kwiatekmiki.com" "cobalt-backend.canine.tools" "api.cobalt.tools" "co.wuk.sh" "api.hypernew.xyz" "cobalt-api.meowing.de")
+            else
+              mapfile -t CAND < <(jq -r '.. | strings' "$LIST" 2>/dev/null \
+                | grep -E '^(https?://[a-z0-9.-]+|([a-z0-9-]+\.)+[a-z]{2,})$' \
+                | sed 's#https\?://##; s#/$##' | sort -u)
             fi
-            mapfile -t CAND < <(jq -r '.. | strings' "$LIST" 2>/dev/null \
-              | grep -E '^(https?://[a-z0-9.-]+|([a-z0-9-]+\.)+[a-z]{2,})$' \
-              | sed 's#https\?://##; s#/$##' | sort -u)
             echo "  cobalt candidates: ${#CAND[@]}"
             [[ ${#CAND[@]} -eq 0 ]] && { row "cobalt-list" "-" "empty list" "" "skip"; return 1; }
             for inst in "${CAND[@]}"; do
@@ -302,13 +338,36 @@ jobs:
 
           # ---------- הורדה + ולידציה ----------
           dl_check(){
-            local name="$1" R CODE CT EXT SZ
+            local name="$1" R CODE CT EXT SZ jar="$WORK/cookies.txt"
             echo "  downloading: ${RESOLVED:0:140}"
-            R=$(curl -sS -L --max-redirs 8 --max-time 1800 -A "$UA" -e "$VIDEO_URL" \
+            R=$(curl -sS -L --max-redirs 8 --max-time 1800 -A "$UA" -e "$VIDEO_URL" -c "$jar" -b "$jar" \
                 -o "$WORK/dl.bin" -w '%{http_code}|%{content_type}' "$RESOLVED" 2>>"$LOG_FILE")
             CODE="${R%%|*}"; CT="${R#*|}"
             SZ=$(stat -c%s "$WORK/dl.bin" 2>/dev/null || echo 0)
             echo "  http=$CODE ct=$CT bytes=$SZ"
+
+            # googlevideo חותם את הכתובת ל-IP של מי שמיצה אותה. ניסוי: הורדת הפרמטר ip= וניסיון נוסף.
+            if [[ "$CODE" == "403" && "$RESOLVED" == *googlevideo* ]]; then
+              local U2
+              U2=$(printf '%s' "$RESOLVED" | sed -E 's/\?ip=[^&]*&/?/; s/\?ip=[^&]*$//; s/&ip=[^&]*//g')
+              echo "  403 on googlevideo -> retry without ip= param"
+              R=$(curl -sS -L --max-redirs 8 --max-time 1800 -A "$UA" -e "$VIDEO_URL" \
+                  -o "$WORK/dl.bin" -w '%{http_code}|%{content_type}' "$U2" 2>>"$LOG_FILE")
+              CODE="${R%%|*}"; CT="${R#*|}"
+              SZ=$(stat -c%s "$WORK/dl.bin" 2>/dev/null || echo 0)
+              echo "  retry http=$CODE ct=$CT bytes=$SZ"
+            fi
+
+            # קישור של savenow שנחת על עמוד מודעה (HTML) -> פעם אחת מעבר מודעה ואז ניסוי נוסף
+            if [[ "$RESOLVED" == *savenow.to* && ( "$SZ" -lt 200000 ) ]] && ! ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$WORK/dl.bin" 2>/dev/null | grep -q video; then
+              echo "  landing page instead of media -> ad_walk + retry"
+              ad_walk "$RESOLVED"
+              R=$(curl -sS -L --max-redirs 10 --max-time 1800 -A "$UA" -e "https://loader.to/" -c "$jar" -b "$jar" \
+                  -o "$WORK/dl.bin" -w '%{http_code}|%{content_type}' "$RESOLVED" 2>>"$LOG_FILE")
+              CODE="${R%%|*}"; CT="${R#*|}"
+              SZ=$(stat -c%s "$WORK/dl.bin" 2>/dev/null || echo 0)
+              echo "  retry http=$CODE ct=$CT bytes=$SZ"
+            fi
 
             if [[ "$RESOLVED" == *.m3u8* || "$CT" == *mpegurl* ]]; then
               echo "  HLS stream -> ffmpeg"
