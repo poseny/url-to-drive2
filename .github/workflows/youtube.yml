@@ -119,13 +119,20 @@ jobs:
           #   3) download_url יושב על הדומיין של הספק (*.savenow.to) — אין חיבור ישיר ליוטיוב.
           SAVENOW_API='dfcb6d76f2f6a9894gjkege8a4ab232222'
 
-          # הזרמת-מעבר מודעה: ה-link מפנה תחילה לעמוד מודעה ומחזיר session.
+          # מעבר מודעה: ה-link מפנה לעמוד מודעה (b.php -> רשת מודעות) ואז אמור להיפתח השער.
+          # ניסיונות חוזרים + המתנה — חלק מה-link'ים נפתחים רק אחרי שהמודעה נטענת בפועל.
           ad_walk(){
-            local jar="$WORK/cookies.txt"
-            echo "  walking ad interstitial..."
-            curl -sS -m 25 -A "$UA" -c "$jar" -b "$jar" -o /dev/null -L --max-redirs 5 --max-time 25 "$1" 2>/dev/null
-            sleep 2
-            curl -sS -m 25 -A "$UA" -c "$jar" -b "$jar" -o /dev/null --max-redirs 0 "$1" 2>/dev/null
+            local jar="$WORK/cookies.txt" i
+            for i in 1 2; do
+              echo "  ad walk #$i..."
+              curl -sS -m 30 -A "$UA" -e 'https://loader.to/' -c "$jar" -b "$jar" \
+                   -o "$WORK/ad.html" -L --max-redirs 6 --max-time 30 \
+                   -w '    walk http=%{http_code} eff=%{url_effective}\n' "$1" 2>/dev/null
+              if [[ -s "$WORK/ad.html" && "$(stat -c%s "$WORK/ad.html")" -lt 5000 ]]; then
+                echo "    ad page ($(stat -c%s "$WORK/ad.html")b): $(head -c 300 "$WORK/ad.html" | tr -c '[:print:]' '.')"
+              fi
+              sleep 5
+            done
           }
 
           p_loaderto(){
@@ -169,23 +176,23 @@ jobs:
 
           # ---------- הורדה + ולידציה ----------
           dl_check(){
-            local name="$1" R CODE CT EXT SZ jar="$WORK/cookies.txt"
+            local name="$1" R CODE CT EXT SZ EFF jar="$WORK/cookies.txt"
             echo "  downloading: ${RESOLVED:0:140}"
             R=$(curl -sS -L --max-redirs 8 --max-time 1800 -A "$UA" -e "$VIDEO_URL" -c "$jar" -b "$jar" \
-                -o "$WORK/dl.bin" -w '%{http_code}|%{content_type}' "$RESOLVED" 2>>"$LOG_FILE")
-            CODE="${R%%|*}"; CT="${R#*|}"
+                -o "$WORK/dl.bin" -w '%{http_code}|%{content_type}|%{url_effective}' "$RESOLVED" 2>>"$LOG_FILE")
+            IFS='|' read -r CODE CT EFF <<< "$R"
             SZ=$(stat -c%s "$WORK/dl.bin" 2>/dev/null || echo 0)
-            echo "  http=$CODE ct=$CT bytes=$SZ"
+            echo "  http=$CODE ct=$CT bytes=$SZ eff=${EFF:0:110}"
 
             # קישור של savenow שנחת על עמוד מודעה (HTML) -> פעם אחת מעבר מודעה ואז ניסוי נוסף
             if [[ "$RESOLVED" == *savenow.to* && ( "$SZ" -lt 200000 ) ]] && ! ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$WORK/dl.bin" 2>/dev/null | grep -q video; then
               echo "  landing page instead of media -> ad_walk + retry"
               ad_walk "$RESOLVED"
               R=$(curl -sS -L --max-redirs 10 --max-time 1800 -A "$UA" -e "https://loader.to/" -c "$jar" -b "$jar" \
-                  -o "$WORK/dl.bin" -w '%{http_code}|%{content_type}' "$RESOLVED" 2>>"$LOG_FILE")
-              CODE="${R%%|*}"; CT="${R#*|}"
+                  -o "$WORK/dl.bin" -w '%{http_code}|%{content_type}|%{url_effective}' "$RESOLVED" 2>>"$LOG_FILE")
+              IFS='|' read -r CODE CT EFF <<< "$R"
               SZ=$(stat -c%s "$WORK/dl.bin" 2>/dev/null || echo 0)
-              echo "  retry http=$CODE ct=$CT bytes=$SZ"
+              echo "  retry http=$CODE ct=$CT bytes=$SZ eff=${EFF:0:110}"
             fi
 
             if [[ "$RESOLVED" == *.m3u8* || "$CT" == *mpegurl* ]]; then
@@ -214,27 +221,32 @@ jobs:
             fi
 
             row "$name" "$CODE" "${CT:-?}" "$SZ" "not-video"
-            echo "  ⚠️ not a video file -> next resolver"
+            echo "  ⚠️ not a video file -> body head:"
+            head -c 600 "$WORK/dl.bin" 2>/dev/null | tr -c '[:print:]' '.'; echo
             rm -f "$WORK/dl.bin"
             return 1
           }
 
-          try_one(){
-            local name="$1" fn="$2"
-            echo ""; echo "-------- $name --------"
+          # כל ניסיון יוצר job חדש אצל הספק — שער המודעה נפתח חלקית, ניסוי חוזר מגדיל את הסיכוי
+          attempt_loaderto(){
+            local n="$1"
+            echo ""; echo "======== loader.to attempt $n ========"
             RESOLVED=""
-            "$fn"
-            [[ "$RESOLVED" != http* ]] && return 1
+            p_loaderto
+            [[ "$RESOLVED" != http* ]] && { echo "  resolve failed"; return 1; }
             echo "  resolved -> ${RESOLVED:0:130}"
             if [[ "${MODE:-download}" == "probe" ]]; then
               echo "  (probe: לא מוריד)"
               return 0
             fi
-            dl_check "$name"
+            dl_check "loader.to"
           }
 
-          echo "📋 resolver: loader.to (p.savenow.to)"
-          try_one "loader.to" p_loaderto
+          echo "📋 resolver: loader.to (p.savenow.to) — עד 3 ניסיונות"
+          for AT in 1 2 3; do
+            attempt_loaderto "$AT" && break
+            [[ "$AT" -lt 3 ]] && { echo "  fresh job in 5s..."; sleep 5; }
+          done
           [[ -n "$GOT" ]] && { echo ""; echo "🎉 SUCCESS via loader.to"; }
           echo ""
           echo "resolver finished | GOT=${GOT:-none} | mode=${MODE:-download}"
