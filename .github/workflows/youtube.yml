@@ -1,4 +1,4 @@
-name: YouTube → Google Drive (ZIP) — link-resolver sites + proxies + email LOG (v7)
+name: YouTube → Google Drive (ZIP) — loader.to resolver + email LOG (v8)
 
 on:
   workflow_dispatch:
@@ -23,11 +23,6 @@ on:
         options:
           - download
           - probe
-      invidious_instance:
-        description: "instance משלך (אופציונלי, מומלץ)"
-        required: false
-        default: ""
-
 env:
   EMAIL_TO: "p0556722432@gmail.com"
   EMAIL_FROM: "p0556722432@gmail.com"
@@ -53,7 +48,7 @@ jobs:
           SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
           : > "$LOG_FILE"; : > "$SUMMARY_FILE"
           exec >> "$LOG_FILE" 2>&1
-          echo "=== YouTube -> proxy -> Drive (v7: link-resolver sites first) ==="
+          echo "=== YouTube -> loader.to -> Drive (v8) ==="
           echo "Run: ${{ github.run_id }} | Repo: ${{ github.repository }}"
           echo "URL:    ${{ github.event.inputs.url }}"
           echo "Mode:   ${{ github.event.inputs.mode }}"
@@ -88,16 +83,15 @@ jobs:
           echo "✅ rclone configured"
 
       # ============================================================
-      # Strategy 0 - אתרי "הדבק קישור -> קישור חלופי" (ראשון!)
+      # Resolve & download — loader.to / p.savenow.to
       # ============================================================
-      - name: Strategy 0 - link-resolver sites
+      - name: Resolve link & download (loader.to)
         id: res0
         if: ${{ always() && !cancelled() }}
         shell: bash
         env:
           VIDEO_URL: ${{ github.event.inputs.url }}
           MODE: ${{ github.event.inputs.mode }}
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
         run: |
           set +e; set +u; set -o pipefail
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
@@ -106,86 +100,17 @@ jobs:
           exec >> "$LOG_FILE" 2>&1
           mkdir -p "$OUT" "$WORK"; rm -f "$OUT"/* 2>/dev/null
           echo "success=false" >> "$GITHUB_OUTPUT"
-          echo ""; echo "===== Strategy 0: link-resolver sites ====="
+          echo "";          echo "===== Resolver: loader.to (p.savenow.to) ====="
           echo "mode = ${MODE:-download}"
 
           UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-          RESOLVED=""; RESOLVER=""; GOT=""; CANDS=()
-          RAPID_KEY="${RAPIDAPI_KEY:-}"
-          [[ -z "$RAPID_KEY" ]] && echo "⚠️ RAPIDAPI_KEY לא הוגדר — מדלג על שלושת resolvers של RapidAPI"
+          RESOLVED=""; GOT=""
 
           VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*[?&]v=([^?&]+).*#\1#')
           [[ "$VIDEO_ID" == "$VIDEO_URL" || -z "$VIDEO_ID" ]] && VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#')
           echo "VIDEO_ID = ${VIDEO_ID:-none}"
 
           row(){ printf '%s | %s | %s | %s | %s\n' "$1" "${2:--}" "${3:--}" "${4:--}" "${5:-fail}" >> "$SUMMARY_FILE"; }
-
-          # מחלץ URL מתוך JSON לפי מפתחות מוכרים
-          json_url(){
-            jq -r '[.. | objects | to_entries[]? | select(.key | test("^(dUrl|download_url|downloadUrl|downloadLink|d|url|link|file)$")) | .value | select(type=="string") | select(startswith("http"))] | first // empty' 2>/dev/null | head -n1
-          }
-          # מחלץ URL מתוך HTML/טקסט גולמי - כל קישור שנראה קובץ מדיה
-          grab_url(){
-            tr -d '\r' \
-             | sed -e 's#\\/#/#g' -e 's#\\u0026#\&#g' \
-             | grep -Eo "https?://[^\"'<> ]+" \
-             | sed 's/[),;]*$//' \
-             | grep -Eiv 'youtube\.com|ytimg\.|googleusercontent|gstatic|schema\.org|w3\.org|doubleclick' \
-             | grep -Ei '\.(mp4|m4a|webm|mkv|mp3|aac)(\?|$)|videoplayback|googlevideo|/tunnel|durl' \
-             | head -n1
-          }
-
-          # ---------- resolver: RapidAPI (נדרש Secret RAPIDAPI_KEY) ----------
-          # שלושה ספקי RapidAPI שמחזירים קישור חלופי ישירות. נמצאו משימוש אמיתי בקוד פתוח.
-
-          # 1) YouTube Video Downloader Fast — POST /download.php (multipart), תשובה {success, medias[].url}
-          p_rapid_fast(){
-            local r host="youtube-video-downloader-fast.p.rapidapi.com"
-            [[ -z "$RAPID_KEY" ]] && { row "rapid-fast" "-" "no RAPIDAPI_KEY secret" "" "skip"; return 1; }
-            r=$(curl -sS -m 60 -A "$UA" -H "X-RapidAPI-Host: $host" -H "X-RapidAPI-Key: $RAPID_KEY" \
-                -F "url=$VIDEO_URL" "https://$host/download.php" 2>/dev/null)
-            if ! jq -e . <<<"$r" >/dev/null 2>&1; then row "rapid-fast" "-" "${r:0:60}" "" "not-json"; return 1; fi
-            mapfile -t CANDS < <(jq -r '
-              [.medias[]? | .url? // empty | select(startswith("http"))] as $u
-              | ([$u[] | select(test("\\.(mp4|webm)";"i"))] + [$u[] | select((test("\\.(mp4|webm)";"i"))|not)])[]
-              ' <<<"$r" 2>/dev/null | head -8)
-            if [[ ${#CANDS[@]} -eq 0 ]]; then
-              row "rapid-fast" "-" "$(jq -c '{success:.success,msg:(.message//.error//null)}' <<<"$r" 2>/dev/null)" "" "no-medias"
-              return 1
-            fi
-            row "rapid-fast" "200" "${#CANDS[@]} media urls" "" "resolved"
-            return 0
-          }
-
-          # 2) YouTube Media Downloader — GET /v2/video/details?videoId=... , תשובה videos.items[].url
-          p_rapid_ymd(){
-            local r host="youtube-media-downloader.p.rapidapi.com"
-            [[ -z "$RAPID_KEY" ]] && { row "rapid-ytd" "-" "no RAPIDAPI_KEY secret" "" "skip"; return 1; }
-            [[ -z "$VIDEO_ID" ]] && { row "rapid-ytd" "-" "no video id" "" "skip"; return 1; }
-            r=$(curl -sS -m 45 -A "$UA" -H "X-RapidAPI-Host: $host" -H "X-RapidAPI-Key: $RAPID_KEY" \
-                "https://$host/v2/video/details?videoId=$VIDEO_ID&urlAccess=normal&videos=auto&audios=auto" 2>/dev/null)
-            if ! jq -e . <<<"$r" >/dev/null 2>&1; then row "rapid-ytd" "-" "${r:0:60}" "" "not-json"; return 1; fi
-            mapfile -t CANDS < <(jq -r '[.videos.items[]?.url? // empty | select(startswith("http"))] | .[]' <<<"$r" 2>/dev/null | head -6)
-            if [[ ${#CANDS[@]} -eq 0 ]]; then
-              row "rapid-ytd" "-" "$(jq -r '(.message//.error//.status//"?")|tostring' <<<"$r" 2>/dev/null | head -c 50)" "" "no-videos"
-              return 1
-            fi
-            row "rapid-ytd" "200" "${#CANDS[@]} video urls" "" "resolved"
-            return 0
-          }
-
-          # 3) YouTube Download API — GET /<video_id>/mp4
-          p_rapid_dl(){
-            local r du host="youtube-download-api.p.rapidapi.com"
-            [[ -z "$RAPID_KEY" ]] && { row "rapid-dl" "-" "no RAPIDAPI_KEY secret" "" "skip"; return 1; }
-            [[ -z "$VIDEO_ID" ]] && { row "rapid-dl" "-" "no video id" "" "skip"; return 1; }
-            r=$(curl -sS -m 60 -A "$UA" -H "X-RapidAPI-Host: $host" -H "X-RapidAPI-Key: $RAPID_KEY" \
-                "https://$host/$VIDEO_ID/mp4" 2>/dev/null)
-            du=$(json_url <<<"$r"); [[ "$du" != http* ]] && du=$(grab_url <<<"$r")
-            if [[ "$du" == http* ]]; then RESOLVED="$du"; row "rapid-dl" "200" "${du:0:50}" "" "resolved"; return 0; fi
-            row "rapid-dl" "-" "${r:0:60}" "" "no-link"
-            return 1
-          }
 
           # ---------- resolver: loader.to / p.savenow.to ( אותו backend ) ----------
           # זרימת API מלאה שנמצאה בקוד פתוח ומאומתת ידנית:
@@ -242,100 +167,6 @@ jobs:
             return 1
           }
 
-          # ---------- resolver: y2mate ----------
-          p_y2mate(){
-            local r vid q tok j du
-            r=$(curl -sS -m 40 -A "$UA" -H 'Referer: https://www.y2mate.com/' -H 'X-Requested-With: XMLHttpRequest' \
-                --data-urlencode "k_query=$VIDEO_URL" -d "k_page=home&hl=en&q_auto=0&ajax=1" \
-                "https://www.y2mate.com/mates/analyzeV2/ajax" 2>/dev/null)
-            if ! jq -e . <<<"$r" >/dev/null 2>&1; then row "y2mate" "-" "${r:0:60}" "" "analyze-not-json"; return 1; fi
-            vid=$(jq -r '.vid // empty' <<<"$r")
-            q=$(jq -r '( (.links.mp4 // {}) | to_entries | map(select(.key|test("^[0-9]+$"))) | sort_by(.key|tonumber) | last | .key ) // empty' <<<"$r")
-            tok=$(jq -r --arg q "$q" '(.links.mp4[$q].k) // empty' <<<"$r")
-            if [[ -z "$vid" || -z "$tok" ]]; then row "y2mate" "-" "vid=${vid:-?} q=${q:-?}" "" "analyze-fail"; return 1; fi
-            j=$(curl -sS -m 60 -A "$UA" -H 'Referer: https://www.y2mate.com/' -H 'X-Requested-With: XMLHttpRequest' \
-                -d "vid=$vid&c=www.y2mate.com&k=$tok&q=$q&ajax=1" \
-                "https://www.y2mate.com/mates/convertV2/ajax" 2>/dev/null)
-            du=$(jq -r '(.dUrl // empty)' <<<"$j" 2>/dev/null)
-            [[ "$du" != http* ]] && du=$(json_url <<<"$j")
-            [[ "$du" != http* ]] && du=$(grab_url <<<"$j")
-            if [[ "$du" == http* ]]; then RESOLVED="$du"; row "y2mate" "200" "q=$q" "" "resolved"; return 0; fi
-            row "y2mate" "-" "${j:0:60}" "" "convert-fail"
-            return 1
-          }
-
-          # ---------- resolver: savefrom (worker.sf-tools.com) ----------
-          p_savefrom(){
-            local r du
-            r=$(curl -sS -m 40 -A "$UA" -H 'Referer: https://ssyoutube.com/' \
-                -H 'X-Requested-With: XMLHttpRequest' -H 'Accept: text/javascript, */*; q=0.01' \
-                --data-urlencode "murl=$VIDEO_URL" "https://worker.sf-tools.com/savefrom.php" 2>/dev/null)
-            du=$(json_url <<<"$r"); [[ "$du" != http* ]] && du=$(grab_url <<<"$r")
-            if [[ "$du" == http* ]]; then RESOLVED="$du"; row "savefrom" "200" "${du:0:50}" "" "resolved"; return 0; fi
-            row "savefrom" "-" "${r:0:60}" "" "no-link"
-            return 1
-          }
-
-          # ---------- resolver: vevioz ----------
-          p_vevioz(){
-            local r du
-            r=$(curl -sS -m 40 -A "$UA" -H 'Referer: https://vevioz.com/' "https://api.vevioz.com/api/button/videos/$VIDEO_URL" 2>/dev/null)
-            du=$(json_url <<<"$r"); [[ "$du" != http* ]] && du=$(grab_url <<<"$r")
-            if [[ "$du" == http* ]]; then RESOLVED="$du"; row "vevioz" "200" "${du:0:50}" "" "resolved"; return 0; fi
-            row "vevioz" "-" "${r:0:60}" "" "no-link"
-            return 1
-          }
-
-          # ---------- resolver: 9xbuddy ----------
-          p_9xbuddy(){
-            local r du
-            r=$(curl -sS -m 45 -A "$UA" -H 'Accept: application/json' -H 'Referer: https://9xbuddy.com/' \
-                "https://9xbuddy.com/process?url=$VIDEO_URL" 2>/dev/null)
-            du=$(json_url <<<"$r"); [[ "$du" != http* ]] && du=$(grab_url <<<"$r")
-            if [[ "$du" == http* ]]; then RESOLVED="$du"; row "9xbuddy" "200" "${du:0:50}" "" "resolved"; return 0; fi
-            row "9xbuddy" "-" "${r:0:60}" "" "no-link"
-            return 1
-          }
-
-          # ---------- resolver: cobalt instances קהילתיים (לא הרשמי!) ----------
-          # api.cobalt.tools הרשמי דורש Api-Key + הגנת בוטים -> לא משתמשים בו.
-          # כאן מגרדים את רשימת ה-instances הקהילתיים ומנסים כל אחד ב-API v11.
-          p_cobalt(){
-            local LIST="$WORK/cobalt.json" code inst base body st du n=0
-            local -a CAND=()
-            # -k: לתעודת ה-TLS של האתר יש שרשרת לא תקינה, זה מה שנתן 000 בריצות הקודמות
-            code=$(curl -sS -k -m 25 -A "$UA" -o "$LIST" -w '%{http_code}' "https://instances.cobalt.best/api/instances.json" 2>/dev/null)
-            if [[ ! -s "$LIST" ]] || ! jq -e . "$LIST" >/dev/null 2>&1; then
-              row "cobalt-list" "${code:-?}" "instance list unavailable -> hardcoded fallback" "" "fallback"
-              CAND=("cobalt.api.r4sh.net" "capi.3kh0.net" "cobalt-api.kwiatekmiki.com" "cobalt-backend.canine.tools" "api.cobalt.tools" "co.wuk.sh" "api.hypernew.xyz" "cobalt-api.meowing.de")
-            else
-              mapfile -t CAND < <(jq -r '.. | strings' "$LIST" 2>/dev/null \
-                | grep -E '^(https?://[a-z0-9.-]+|([a-z0-9-]+\.)+[a-z]{2,})$' \
-                | sed 's#https\?://##; s#/$##' | sort -u)
-            fi
-            echo "  cobalt candidates: ${#CAND[@]}"
-            [[ ${#CAND[@]} -eq 0 ]] && { row "cobalt-list" "-" "empty list" "" "skip"; return 1; }
-            for inst in "${CAND[@]}"; do
-              n=$((n+1)); [[ $n -gt 15 ]] && break
-              base="$inst"; [[ "$base" != http* ]] && base="https://$base"
-              body=$(curl -sS -m 45 -A "$UA" -H 'Accept: application/json' -H 'Content-Type: application/json' \
-                     -X POST -d "{\"url\":\"$VIDEO_URL\",\"videoQuality\":\"1080\",\"alwaysProxy\":true,\"filenameStyle\":\"pretty\"}" \
-                     "$base/" 2>/dev/null)
-              if ! jq -e . <<<"$body" >/dev/null 2>&1; then
-                row "$base" "-" "$(printf '%s' "$body" | head -c 40)" "" "not-json"
-                continue
-              fi
-              st=$(jq -r '.status // empty' <<<"$body")
-              du=$(jq -r 'if .status=="tunnel" or .status=="redirect" then (.url//"")
-                          elif .status=="local-processing" then (.tunnel[0]//"")
-                          elif .status=="picker" then (.picker[0].url//"")
-                          else "" end' <<<"$body" 2>/dev/null)
-              if [[ "$du" == http* ]]; then RESOLVED="$du"; row "$base" "200" "status=$st" "" "resolved"; return 0; fi
-              row "$base" "-" "status=${st:-?} err=$(jq -r '.error.code // empty' <<<"$body")" "" "fail"
-            done
-            return 1
-          }
-
           # ---------- הורדה + ולידציה ----------
           dl_check(){
             local name="$1" R CODE CT EXT SZ jar="$WORK/cookies.txt"
@@ -345,18 +176,6 @@ jobs:
             CODE="${R%%|*}"; CT="${R#*|}"
             SZ=$(stat -c%s "$WORK/dl.bin" 2>/dev/null || echo 0)
             echo "  http=$CODE ct=$CT bytes=$SZ"
-
-            # googlevideo חותם את הכתובת ל-IP של מי שמיצה אותה. ניסוי: הורדת הפרמטר ip= וניסיון נוסף.
-            if [[ "$CODE" == "403" && "$RESOLVED" == *googlevideo* ]]; then
-              local U2
-              U2=$(printf '%s' "$RESOLVED" | sed -E 's/\?ip=[^&]*&/?/; s/\?ip=[^&]*$//; s/&ip=[^&]*//g')
-              echo "  403 on googlevideo -> retry without ip= param"
-              R=$(curl -sS -L --max-redirs 8 --max-time 1800 -A "$UA" -e "$VIDEO_URL" \
-                  -o "$WORK/dl.bin" -w '%{http_code}|%{content_type}' "$U2" 2>>"$LOG_FILE")
-              CODE="${R%%|*}"; CT="${R#*|}"
-              SZ=$(stat -c%s "$WORK/dl.bin" 2>/dev/null || echo 0)
-              echo "  retry http=$CODE ct=$CT bytes=$SZ"
-            fi
 
             # קישור של savenow שנחת על עמוד מודעה (HTML) -> פעם אחת מעבר מודעה ואז ניסוי נוסף
             if [[ "$RESOLVED" == *savenow.to* && ( "$SZ" -lt 200000 ) ]] && ! ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$WORK/dl.bin" 2>/dev/null | grep -q video; then
@@ -400,219 +219,25 @@ jobs:
             return 1
           }
 
-          # מנסה אחד-אחד את כל המועמדים שה-resolver החזיר, עד שמישהו מתגלה כקובץ וידאו תקין
-          fetch_media(){
-            local name="$1" u n=0
-            local -a urls=()
-            [[ -n "$RESOLVED" ]] && urls+=("$RESOLVED")
-            for u in "${CANDS[@]}"; do urls+=("$u"); done
-            if [[ ${#urls[@]} -eq 0 ]]; then row "$name" "-" "no candidates" "" "fail"; return 1; fi
-            echo "  candidates: ${#urls[@]}"
-            for u in "${urls[@]}"; do
-              n=$((n+1)); [[ $n -gt 6 ]] && { echo "  (max 6 candidates)"; break; }
-              echo "  candidate [$n]: ${u:0:130}"
-              RESOLVED="$u"
-              if dl_check "$name"; then GOT=1; return 0; fi
-            done
-            return 1
-          }
-
           try_one(){
             local name="$1" fn="$2"
             echo ""; echo "-------- $name --------"
-            RESOLVED=""; CANDS=()
+            RESOLVED=""
             "$fn"
-            if [[ ${#CANDS[@]} -eq 0 && "$RESOLVED" != http* ]]; then return 1; fi
-            [[ -n "$RESOLVED" ]] && echo "  resolved -> ${RESOLVED:0:130}"
+            [[ "$RESOLVED" != http* ]] && return 1
+            echo "  resolved -> ${RESOLVED:0:130}"
             if [[ "${MODE:-download}" == "probe" ]]; then
               echo "  (probe: לא מוריד)"
               return 0
             fi
-            fetch_media "$name"
+            dl_check "$name"
           }
 
-          echo "📋 resolver candidates: 9 (rapid-fast, rapid-ytd, rapid-dl, loader.to, y2mate, savefrom, vevioz, 9xbuddy, cobalt-instances)"
-          for spec in "rapid-fast:p_rapid_fast" "rapid-ytd:p_rapid_ymd" "rapid-dl:p_rapid_dl" "loader.to:p_loaderto" "y2mate:p_y2mate" "savefrom:p_savefrom" "vevioz:p_vevioz" "9xbuddy:p_9xbuddy" "cobalt-instances:p_cobalt"; do
-            nm="${spec%%:*}"; fn="${spec##*:}"
-            try_one "$nm" "$fn"
-            [[ -n "$GOT" ]] && { echo ""; echo "🎉 SUCCESS via $nm"; break; }
-          done
+          echo "📋 resolver: loader.to (p.savenow.to)"
+          try_one "loader.to" p_loaderto
+          [[ -n "$GOT" ]] && { echo ""; echo "🎉 SUCCESS via loader.to"; }
           echo ""
-          echo "Strategy 0 finished | GOT=${GOT:-none} | mode=${MODE:-download}"
-
-      # ============================================================
-      # Strategy A - Invidious  (fallback)
-      # ============================================================
-      - name: Strategy A - Invidious
-        id: inv
-        if: ${{ always() && steps.res0.outputs.success != 'true' && github.event.inputs.mode != 'probe' }}
-        shell: bash
-        env:
-          VIDEO_URL: ${{ github.event.inputs.url }}
-          USER_INST: ${{ github.event.inputs.invidious_instance }}
-        run: |
-          set +e; set +u; set -o pipefail
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
-          OUT="$RUNNER_TEMP/success"; WORK="$RUNNER_TEMP/inv"
-          exec >> "$LOG_FILE" 2>&1
-          mkdir -p "$OUT" "$WORK"; rm -f "$OUT"/* 2>/dev/null
-          echo "success=false" >> "$GITHUB_OUTPUT"
-          echo ""; echo "===== Strategy A: Invidious ====="
-
-          VIDEO_ID=""
-          case "$VIDEO_URL" in
-            *youtu.be/*) VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*youtu\.be/([^?&/]+).*#\1#') ;;
-            *shorts/*|*embed/*) VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#') ;;
-            *) VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*[?&]v=([^?&]+).*#\1#') ;;
-          esac
-          [[ -z "$VIDEO_ID" || "$VIDEO_ID" == "$VIDEO_URL" ]] && VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#')
-          echo "VIDEO_ID = ${VIDEO_ID:-none}"
-          [[ -z "$VIDEO_ID" ]] && { echo "no video id"; exit 0; }
-
-          INST=()
-          add_i() { local v="${1:-}"; v="${v#http://}"; v="${v#https://}"; v="${v%%/*}"; v="${v%%:*}"; [[ -z "$v" || "$v" != *.* ]] && return 0; [[ "$v" == *onion* ]] && return 0; for e in "${INST[@]}"; do [[ "$e" == "$v" ]] && return 0; done; INST+=("$v"); }
-          [[ -n "${USER_INST:-}" ]] && add_i "$USER_INST"
-          for h in invidious.nerdvpn.de vid.priv.au invidious.f5.si invidious.tiekoetter.com yt.chocolatemoo53.com inv.nadeko.net invidious.materialio.us invidious.jing.rocks iv.datura.network; do add_i "$h"; done
-          BODY="$WORK/list.json"
-          curl -sS --max-time 25 -o "$BODY" -w '%{http_code}' "https://api.invidious.io/instances.json" > "$WORK/lc" 2>/dev/null
-          if [[ -s "$BODY" ]] && jq -e . "$BODY" >/dev/null 2>&1; then
-            mapfile -t D < <(jq -r '.[]? | (.[1].uri? // empty)' "$BODY" 2>/dev/null | grep -Eo '([a-z0-9-]+\.)+[a-z]{2,}' | sort -u)
-            for d in "${D[@]}"; do add_i "$d"; done
-            echo "discovered ${#D[@]} from registry"
-          else
-            echo "registry unavailable — seeds only"
-          fi
-          echo "📋 Invidious candidates: ${#INST[@]}"
-
-          tried=0
-          for H in "${INST[@]}"; do
-            [[ "$tried" -ge 20 ]] && break
-            tried=$((tried+1))
-            echo ""; echo "-------- [$tried] $H --------"
-            INFO="$WORK/info-$tried.json"
-            HCODE=$(curl -sS --max-time 30 -H 'Accept: application/json' -o "$INFO" -w '%{http_code}' "https://$H/api/v1/videos/$VIDEO_ID" 2>/dev/null)
-            if [[ ! -s "$INFO" ]] || ! jq -e . "$INFO" >/dev/null 2>&1; then
-              echo "  api not JSON (http=${HCODE:-?}) -> skip"
-              printf '%s | %s | - | - | api(%s)\n' "$H" "${HCODE:-?}" "${HCODE:-?}" >> "$SUMMARY_FILE"; continue
-            fi
-            NI=$(jq -r '(.adaptiveFormats // []) | length' "$INFO" 2>/dev/null); NM=$(jq -r '(.formatStreams // []) | length' "$INFO" 2>/dev/null)
-            echo "  formats: adaptive=${NI:-0} muxed=${NM:-0}"
-            if [[ "${NI:-0}" -eq 0 && "${NM:-0}" -eq 0 ]]; then echo "  no formats -> skip"; printf '%s | %s | - | - | no-formats\n' "$H" "${HCODE:-?}" >> "$SUMMARY_FILE"; continue; fi
-
-            VITAG=$(jq -r '[ (.adaptiveFormats // [])[] | select((.type//"")|test("video/")) | {itag:(.itag|tostring), height:(.height//0), bitrate:(.bitrate//0), avc:(((.type//"")|test("avc1|h264";"i")))} ] | sort_by((if .avc then 1 else 0 end), .height, .bitrate) | last | .itag // empty' "$INFO" 2>/dev/null)
-            AITAG=$(jq -r '[ (.adaptiveFormats // [])[] | select((.type//"")|test("audio/")) | {itag:(.itag|tostring), bitrate:(.bitrate//0), mp4a:(((.type//"")|test("mp4a|aac";"i")))} ] | sort_by((if .mp4a then 1 else 0 end), .bitrate) | last | .itag // empty' "$INFO" 2>/dev/null)
-            echo "  itags: v=${VITAG:-none} a=${AITAG:-none}"
-
-            CTV="-"; CTA="-"; GOT=""
-            if [[ -n "$VITAG" && -n "$AITAG" ]]; then
-              VF="$WORK/v-$tried.bin"; AF="$WORK/a-$tried.bin"
-              RV=$(curl -sS -L --max-redirs 0 --max-time 1800 -o "$VF" -w '%{http_code}|%{content_type}' "https://$H/latest_version?id=$VIDEO_ID&itag=$VITAG&local=true" 2>/dev/null || true)
-              RA=$(curl -sS -L --max-redirs 0 --max-time 900  -o "$AF" -w '%{http_code}|%{content_type}' "https://$H/latest_version?id=$VIDEO_ID&itag=$AITAG&local=true" 2>/dev/null || true)
-              CTV=$(printf '%s' "$RV" | cut -d'|' -f2); CTA=$(printf '%s' "$RA" | cut -d'|' -f2)
-              echo "  download: video=${RV:-none}  audio=${RA:-none}"
-              if [[ "$CTV" == video/* || "$CTV" == application/octet-stream ]] && [[ "$CTA" == audio/* || "$CTA" == application/octet-stream ]]; then
-                ffmpeg -y -loglevel error -i "$VF" -i "$AF" -c copy "$OUT/merged.mp4" 2>>"$LOG_FILE"
-                [[ ! -s "$OUT/merged.mp4" ]] && ffmpeg -y -loglevel error -i "$VF" -i "$AF" -c copy "$OUT/merged.mkv" 2>>"$LOG_FILE"
-                [[ -s "$OUT/merged.mp4" ]] && GOT="$OUT/merged.mp4"
-                [[ -z "$GOT" && -s "$OUT/merged.mkv" ]] && GOT="$OUT/merged.mkv"
-                [[ -n "$GOT" ]] && echo "  ✅ merged: $GOT"
-              else
-                echo "  ⚠️ not media (Anubis/challenge?) -> skip adaptive"
-              fi
-            fi
-
-            if [[ -z "$GOT" ]]; then
-              for MX in 22 18; do
-                R=$(curl -sS -L --max-redirs 0 --max-time 1800 -o "$OUT/muxed.bin" -w '%{http_code}|%{content_type}' "https://$H/latest_version?id=$VIDEO_ID&itag=$MX&local=true" 2>/dev/null || true)
-                CT=$(printf '%s' "$R" | cut -d'|' -f2)
-                echo "  muxed $MX -> ${R:-none}"
-                if [[ "$CT" == video/* || "$CT" == application/octet-stream ]] && ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT/muxed.bin" 2>/dev/null | grep -q video; then
-                  mv "$OUT/muxed.bin" "$OUT/muxed.mp4"; GOT="$OUT/muxed.mp4"; echo "  ✅ muxed OK"; break
-                fi
-                rm -f "$OUT/muxed.bin"
-              done
-            fi
-
-            printf '%s | %s | %s | %s | %s\n' "$H" "${HCODE:-?}" "${CTV:-}" "${CTA:-}" "${GOT:-fail}" >> "$SUMMARY_FILE"
-            if [[ -n "$GOT" ]]; then
-              EXT="${GOT##*.}"; mv "$GOT" "$OUT/video.$EXT"
-              echo "success=true" >> "$GITHUB_OUTPUT"; echo "file=$OUT/video.$EXT" >> "$GITHUB_OUTPUT"
-              echo "🎉 Invidious SUCCESS via $H"; break
-            fi
-          done
-          echo "Invidious tried: $tried"
-
-      # ============================================================
-      # Strategy B - Piped  (fallback)
-      # ============================================================
-      - name: Strategy B - Piped
-        id: piped
-        if: ${{ always() && steps.inv.outputs.success != 'true' && steps.res0.outputs.success != 'true' && github.event.inputs.mode != 'probe' }}
-        shell: bash
-        env:
-          VIDEO_URL: ${{ github.event.inputs.url }}
-        run: |
-          set +e; set +u; set -o pipefail
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
-          OUT="$RUNNER_TEMP/success"; WORK="$RUNNER_TEMP/piped"
-          exec >> "$LOG_FILE" 2>&1
-          mkdir -p "$OUT" "$WORK"; echo ""; echo "===== Strategy B: Piped ====="
-
-          VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*[?&]v=([^?&]+).*#\1#')
-          [[ "$VIDEO_ID" == "$VIDEO_URL" || -z "$VIDEO_ID" ]] && VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#')
-          echo "VIDEO_ID = ${VIDEO_ID:-none}"
-          [[ -z "$VIDEO_ID" ]] && exit 0
-
-          APIS=()
-          add_a() { local v="${1:-}"; v="${v#http://}"; v="${v#https://}"; v="${v%%/*}"; v="${v%%:*}"; [[ -z "$v" || "$v" != *.* ]] && return 0; for e in "${APIS[@]}"; do [[ "$e" == "$v" ]] && return 0; done; APIS+=("$v"); }
-          for a in pipedapi.kavin.rocks piped-api.garudalinux.org pipedapi.adminforge.de pipedapi.drgns.space api.piped.privacy.com.de pipedapi.projectsegfau.lt pipedapi.leptons.xyz; do add_a "$a"; done
-          PL="$WORK/piped-instances.json"
-          curl -sS --max-time 25 -o "$PL" -w '%{http_code}' "https://piped-instances.kavin.rocks/" >/dev/null 2>&1
-          if [[ -s "$PL" ]] && jq -e . "$PL" >/dev/null 2>&1; then
-            mapfile -t DA < <(jq -r '.[]? | (.api_url? // empty)' "$PL" 2>/dev/null | sed -E 's#https?://##' | cut -d/ -f1 | sort -u)
-            for a in "${DA[@]}"; do add_a "$a"; done
-            echo "discovered ${#DA[@]} piped apis"
-          fi
-          echo "📋 Piped candidates: ${#APIS[@]}"
-
-          tried=0
-          for H in "${APIS[@]}"; do
-            [[ "$tried" -ge 12 ]] && break
-            tried=$((tried+1)); echo ""; echo "-------- [$tried] $H --------"
-            JS="$WORK/streams-$tried.json"
-            HC=$(curl -sS --max-time 30 -H 'Accept: application/json' -o "$JS" -w '%{http_code}' "https://$H/streams/$VIDEO_ID" 2>/dev/null)
-            if [[ ! -s "$JS" ]] || ! jq -e . "$JS" >/dev/null 2>&1; then
-              echo "  api not JSON (http=${HC:-?}) -> skip"; printf '%s(P) | %s | - | - | api(%s)\n' "$H" "${HC:-?}" "${HC:-?}" >> "$SUMMARY_FILE"; continue
-            fi
-            VURL=$(jq -r '[ (.videoStreams // [])[] | select((.mimeType//"")|test("video")) | {u:(.proxyUrl // .url), qr:(.qualityRank//0), avc:((.codec//"")|test("avc1|h264";"i"))} ] | sort_by((if .avc then 1 else 0 end), .qr) | last | .u // empty' "$JS" 2>/dev/null)
-            AURL=$(jq -r '[ (.audioStreams // [])[] | {u:(.proxyUrl // .url), br:(.bitrate//0), mp4a:((.codec//"")|test("mp4a|aac";"i"))} ] | sort_by((if .mp4a then 1 else 0 end), .br) | last | .u // empty' "$JS" 2>/dev/null)
-            VHOST=$(printf '%s' "$VURL" | awk -F/ '{print $3}'); AHOST=$(printf '%s' "$AURL" | awk -F/ '{print $3}')
-            echo "  chosen video host=${VHOST:-none} audio host=${AHOST:-none}"
-            if [[ -z "$VURL" || -z "$AURL" ]]; then echo "  no streams -> skip"; printf '%s(P) | %s | - | - | no-streams\n' "$H" "${HC:-?}" >> "$SUMMARY_FILE"; continue; fi
-            if printf '%s %s' "$VHOST" "$AHOST" | grep -qi googlevideo; then echo "  stream url points to googlevideo (no proxy) -> skip"; printf '%s(P) | %s | - | - | googlevideo\n' "$H" "${HC:-?}" >> "$SUMMARY_FILE"; continue; fi
-
-            VF="$WORK/v-$tried.bin"; AF="$WORK/a-$tried.bin"
-            RV=$(curl -sS -L --max-redirs 5 --max-time 1800 -o "$VF" -w '%{http_code}|%{content_type}' "$VURL" 2>/dev/null || true)
-            RA=$(curl -sS -L --max-redirs 5 --max-time 900  -o "$AF" -w '%{http_code}|%{content_type}' "$AURL" 2>/dev/null || true)
-            CTV=$(printf '%s' "$RV" | cut -d'|' -f2); CTA=$(printf '%s' "$RA" | cut -d'|' -f2)
-            echo "  download: video=${RV:-none} audio=${RA:-none}"
-            GOT=""
-            if [[ "$CTV" == video/* || "$CTV" == application/octet-stream ]] && [[ "$CTA" == audio/* || "$CTA" == application/octet-stream ]]; then
-              ffmpeg -y -loglevel error -i "$VF" -i "$AF" -c copy "$OUT/merged.mp4" 2>>"$LOG_FILE"
-              [[ ! -s "$OUT/merged.mp4" ]] && ffmpeg -y -loglevel error -i "$VF" -i "$AF" -c copy "$OUT/merged.mkv" 2>>"$LOG_FILE"
-              [[ -s "$OUT/merged.mp4" ]] && GOT="$OUT/merged.mp4"
-              [[ -z "$GOT" && -s "$OUT/merged.mkv" ]] && GOT="$OUT/merged.mkv"
-            fi
-            printf '%s(P) | %s | %s | %s | %s\n' "$H" "${HC:-?}" "${CTV:-}" "${CTA:-}" "${GOT:-fail}" >> "$SUMMARY_FILE"
-            if [[ -n "$GOT" ]]; then
-              EXT="${GOT##*.}"; mv "$GOT" "$OUT/video.$EXT"
-              echo "success=true" >> "$GITHUB_OUTPUT"; echo "file=$OUT/video.$EXT" >> "$GITHUB_OUTPUT"
-              echo "🎉 Piped SUCCESS via $H"; break
-            fi
-          done
-          echo "Piped tried: $tried"
+          echo "resolver finished | GOT=${GOT:-none} | mode=${MODE:-download}"
 
       - name: Verify result
         id: verify
@@ -715,8 +340,6 @@ jobs:
             printf '%s\n' '===== STEPS (ריק = השלב לא רץ) ====='
             printf 'init       = %s\n' '${{ steps.init.outputs.init }}'
             printf 'res0       = %s\n' '${{ steps.res0.outputs.success }}'
-            printf 'invidious  = %s\n' '${{ steps.inv.outputs.success }}'
-            printf 'piped      = %s\n' '${{ steps.piped.outputs.success }}'
             printf 'verify     = %s\n' '${{ steps.verify.outputs.success }}'
             printf 'upload     = %s\n\n' '${{ steps.upload.outputs.STATUS }}'
             printf '%s\n' '===== PROVIDER SUMMARY ====='; cat "$SUMMARY_FILE" 2>/dev/null
