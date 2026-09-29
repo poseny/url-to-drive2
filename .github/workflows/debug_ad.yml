@@ -1,0 +1,103 @@
+name: debug-ad-walk
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "קישור היוטיוב"
+        required: true
+        default: "https://www.youtube.com/watch?v=UUoM8p1-6gw"
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Walk interstitial
+        shell: bash
+        env:
+          VIDEO_URL: ${{ github.event.inputs.url }}
+        run: |
+          set +e; set +u
+          WORK="$RUNNER_TEMP/ad"; mkdir -p "$WORK"
+          TRACE="$WORK/trace.txt"
+          exec > >(tee "$TRACE") 2>&1
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+          API='dfcb6d76f2f6a9894gjkege8a4ab232222'
+
+          echo "=== 1) create job ==="
+          r=$(curl -sS -m 45 -A "$UA" -H 'Accept: application/json' -H 'Referer: https://loader.to/' -G \
+              --data-urlencode "url=$VIDEO_URL" --data-urlencode "copyright=0" \
+              --data-urlencode "allow_extended_duration=1" --data-urlencode "add_info=1" \
+              --data-urlencode "no_merge=0" --data-urlencode "format=720" \
+              --data-urlencode "api=$API" "https://p.savenow.to/ajax/download.php")
+          echo "ajax: ${r:0:400}"
+          id=$(jq -r '.id // empty' <<<"$r"); pu=$(jq -r '.progress_url // empty' <<<"$r")
+          [[ -z "$pu" ]] && pu="https://p.savenow.to/api/progress?id=$id"
+          du=""
+          for i in $(seq 1 40); do
+            j=$(curl -sS -m 30 -A "$UA" -H 'Accept: application/json' "$pu")
+            du=$(jq -r '.download_url // empty' <<<"$j")
+            [[ "$du" == http* ]] && break
+            sleep 3
+          done
+          echo "download_url=$du"
+          [[ "$du" != http* ]] && { echo "NO URL - stop"; exit 1; }
+
+          jar="$WORK/cookies.txt"; rm -f "$jar"
+
+          fetch(){ # $1=url $2=tag
+            local code ct eff
+            code=$(curl -sS -L --max-redirs 8 -m 60 -A "$UA" -c "$jar" -b "$jar" \
+              -e "${3:-https://loader.to/}" -o "$WORK/$2.html" -D "$WORK/$2.hdr" \
+              -w '%{http_code}|%{content_type}|%{url_effective}' "$1")
+            IFS='|' read -r C CT EFF <<<"$code"
+            local sz; sz=$(stat -c%s "$WORK/$2.html" 2>/dev/null || echo 0)
+            echo "[$2] http=$C ct=$CT bytes=$sz url=${EFF:0:140}"
+            echo "$EFF" > "$WORK/$2.eff"
+          }
+
+          echo ""
+          echo "=== 2) first GET of token (fresh jar) ==="
+          fetch "$du" step0
+
+          echo ""
+          echo "=== 3) hop walk from token ==="
+          cur="$du"
+          for h in 1 2 3 4 5 6 7 8; do
+            fetch "$cur" "h$h"
+            body="$WORK/h$h.html"; eff=$(cat "$WORK/h$h.eff")
+            sz=$(stat -c%s "$body" 2>/dev/null || echo 0)
+            # וידאו? סיימנו
+            if [[ "$sz" -gt 200000 ]] || head -c 4 "$body" | grep -q 'ftyp\|RIFF'; then
+              echo "-> looks like media, stop hop walk"; break
+            fi
+            mref=$(grep -oiE 'http-equiv=[^>]*refresh[^>]*url=[^" >]+' "$body" | grep -oiE 'url=[^" >]+' | head -1 | sed 's/^url=//I')
+            push=$(grep -oE '"/partitial/[^"]+' "$body" | head -1 | tr -d '"')
+            echo "  meta-refresh=${mref:-none}  pushState=${push:-none}"
+            echo "  body: $(tr -c '[:print:]' '.' < "$body" | head -c 400)"
+            if [[ -n "$mref" ]]; then
+              case "$mref" in http*) cur="$mref" ;; //*) cur="https:$mref" ;; /*) cur="$(printf '%s' "$eff" | sed 's#\(https\?://[^/]*\).*#\1#')$mref" ;; *) cur="$(dirname "$eff")/$mref" ;; esac
+              continue
+            fi
+            if [[ -n "$push" ]]; then
+              cur="$(printf '%s' "$eff" | sed 's#\(https\?://[^/]*\).*#\1#')$push"
+              continue
+            fi
+            echo "-> no next hop found"; break
+          done
+
+          echo ""
+          echo "=== 4) GET token again with jar ==="
+          fetch "$du" after
+
+          echo ""
+          echo "=== cookies ==="; cat "$jar" 2>/dev/null | grep -v '^#' | head -20
+
+      - name: Upload trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ad-trace-${{ github.run_id }}
+          path: ${{ runner.temp }}/ad/
+          retention-days: 7
