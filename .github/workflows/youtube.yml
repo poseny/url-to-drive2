@@ -124,11 +124,12 @@ jobs:
           echo "quality = $Q_IN | ladder: ${QS[*]}"
 
           UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-          RESOLVED=""; GOT=""
+          RESOLVED=""; GOT=""; TITLE=""
 
           VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*[?&]v=([^?&]+).*#\1#')
           [[ "$VIDEO_ID" == "$VIDEO_URL" || -z "$VIDEO_ID" ]] && VIDEO_ID=$(printf '%s' "$VIDEO_URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#')
           echo "VIDEO_ID = ${VIDEO_ID:-none}"
+          echo "video_id=$VIDEO_ID" >> "$GITHUB_OUTPUT"
 
           row(){ printf '%s | %s | %s | %s | %s\n' "$1" "${2:--}" "${3:--}" "${4:--}" "${5:-fail}" >> "$SUMMARY_FILE"; }
 
@@ -165,6 +166,8 @@ jobs:
                 --data-urlencode "format=$fmt" --data-urlencode "api=$SAVENOW_API" \
                 "https://p.savenow.to/ajax/download.php" 2>/dev/null)
             if ! jq -e . <<<"$r" >/dev/null 2>&1; then row "savenow" "-" "${r:0:70}" "" "not-json"; return 1; fi
+            # כותרת הסרטון מה-api (add_info=1) — אם הספק מחזיר, היא מקור מועדף לשם הקובץ
+            [[ -z "$TITLE" ]] && TITLE=$(jq -r '.title // .info.title // empty' <<<"$r" 2>/dev/null)
             id=$(jq -r '.id // empty' <<<"$r")
             du=$(jq -r '.url // .download_url // empty' <<<"$r")
             if [[ -z "$id" && "$du" != http* ]]; then
@@ -273,6 +276,18 @@ jobs:
           echo ""
           echo "resolver finished | GOT=${GOT:-none} | mode=${MODE:-download}"
 
+          # ---- שם קובץ ברירת מחדל: כותרת הסרטון, ואם לא הצלחנו לחלץ → מזהה הסרטון ----
+          if [[ -z "$TITLE" && -n "$VIDEO_ID" ]]; then
+            TITLE=$(curl -sS -m 20 -A "$UA" "https://www.youtube.com/oembed?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D${VIDEO_ID}&format=json" 2>/dev/null | jq -r '.title // empty' 2>/dev/null)
+          fi
+          if [[ -z "$TITLE" && -n "$VIDEO_ID" ]]; then
+            TITLE=$(curl -sS -m 20 -A "$UA" "https://noembed.com/embed?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D${VIDEO_ID}" 2>/dev/null | jq -r '.title // empty' 2>/dev/null)
+          fi
+          TITLE_S=$(printf '%s' "$TITLE" | tr '\r\n\t' '   ' | sed -E 's#[\\/:*?"<>|]#_#g; s/^[ .]+//; s/[ .]+$//; s/_{2,}/_/g' | head -c 300 | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null)
+          [[ -z "$TITLE_S" ]] && TITLE_S="${VIDEO_ID:-video}"
+          echo "title = $TITLE_S"
+          echo "title=$TITLE_S" >> "$GITHUB_OUTPUT"
+
       - name: Verify result
         id: verify
         if: always()
@@ -305,23 +320,34 @@ jobs:
           INPUT_FILE: ${{ steps.verify.outputs.file }}
           FOLDER: ${{ github.event.inputs.folder }}
           USER_FILENAME: ${{ github.event.inputs.filename }}
+          TITLE: ${{ steps.res0.outputs.title }}
+          VIDEO_ID: ${{ steps.res0.outputs.video_id }}
         run: |
           set +e; set +u
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
           TMP_DIR="$(mktemp -d)"; INPUT_EXT="${INPUT_FILE##*.}"
-          if [[ -n "$USER_FILENAME" ]]; then BASE_NAME="$USER_FILENAME"; else BASE_NAME="$(basename "${INPUT_FILE%.*}")"; fi
-          BASE_NAME="$(printf '%s' "$BASE_NAME" | tr '/\\' '__' | tr -cd '[:alnum:] ._-')"
-          BASE_NAME="${BASE_NAME:0:180}"; [[ -n "$BASE_NAME" ]] || BASE_NAME="youtube_video"
+          if [[ -n "$USER_FILENAME" ]]; then BASE_NAME="$USER_FILENAME"
+          elif [[ -n "${TITLE:-}" ]]; then BASE_NAME="$TITLE"
+          elif [[ -n "${VIDEO_ID:-}" ]]; then BASE_NAME="$VIDEO_ID"
+          else BASE_NAME="video"; fi
+          # סניטיזי שלא קורע אותיות עבריות/יוניקוד, מסיר תווים אסורים בשמות קבצים
+          BASE_NAME="$(printf '%s' "$BASE_NAME" | tr '\r\n\t' '   ' | sed -E 's#[\\/:*?"<>|]#_#g; s/^[ .]+//; s/[ .]+$//; s/_{2,}/_/g' | head -c 180 | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null)"
+          [[ -n "$BASE_NAME" ]] || BASE_NAME="video"
           ZIP_NAME="${BASE_NAME}.zip"; ZIP_FILE="$TMP_DIR/$ZIP_NAME"; INNER_FILE="$TMP_DIR/$BASE_NAME.$INPUT_EXT"
           cp "$INPUT_FILE" "$INNER_FILE"; zip -j -q "$ZIP_FILE" "$INNER_FILE"
           if [[ ! -s "$ZIP_FILE" ]]; then echo "STATUS=failed" >> "$GITHUB_OUTPUT"; exit 0; fi
           REMOTE_PATH="gdrive:${FOLDER}/${ZIP_NAME}"
-          rclone lsf "$REMOTE_PATH" >/dev/null 2>&1 && rclone delete "$REMOTE_PATH"
-          rclone copy "$ZIP_FILE" "$REMOTE_PATH" --progress
+          echo "upload -> $REMOTE_PATH"
+          # rclone copy לנתיב קובץ יוצר תיקייה בשם הקובץ — משתמשים ב-copyto + purge של הישן
+          rclone purge "$REMOTE_PATH" 2>/dev/null
+          rclone purge "gdrive:${FOLDER}/video.zip" 2>/dev/null   # שארית הבאג ההיסטורי (תיקייה בתוך תיקייה)
+          rclone copyto "$ZIP_FILE" "$REMOTE_PATH" --progress
           if [[ $? -eq 0 ]]; then
             echo "STATUS=success" >> "$GITHUB_OUTPUT"; echo "FILE_NAME=$ZIP_NAME" >> "$GITHUB_OUTPUT"
             echo "FILE_SIZE=$(stat -c%s "$ZIP_FILE" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
+            echo "---- listing gdrive:${FOLDER}/ ----"
+            rclone lsf "gdrive:${FOLDER}/" 2>/dev/null | head -20
           else
             echo "STATUS=failed" >> "$GITHUB_OUTPUT"
           fi
