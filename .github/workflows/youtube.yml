@@ -1,4 +1,4 @@
-name: YouTube → Google Drive (ZIP) — loader.to resolver + email LOG (v9)
+name: YouTube → Google Drive (ZIP) — loader.to resolver + email LOG (v10)
 
 on:
   workflow_dispatch:
@@ -59,7 +59,7 @@ jobs:
           SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
           : > "$LOG_FILE"; : > "$SUMMARY_FILE"
           exec >> "$LOG_FILE" 2>&1
-          echo "=== YouTube -> loader.to -> Drive (v9: quality) ==="
+          echo "=== YouTube -> loader.to -> Drive (v10: fast-init + custom rclone client) ==="
           echo "Run: ${{ github.run_id }} | Repo: ${{ github.repository }}"
           echo "URL:     ${{ github.event.inputs.url }}"
           echo "Mode:    ${{ github.event.inputs.mode }}"
@@ -67,8 +67,10 @@ jobs:
           echo "Started: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "=========================================="
           curl -fsSL https://rclone.org/install.sh | sudo bash; echo "rclone exit=$?"
+          # v10: מתקינים רק msmtp — ffmpeg/zip/jq/curl/mediainfo/file/unzip כבר מותקנות מראש ב-ubuntu-24.04
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg zip jq msmtp msmtp-mta curl; echo "deps exit=$?"
+          sudo apt-get install -y -qq msmtp msmtp-mta; echo "deps exit=$?"
+          for t in jq curl zip unzip mediainfo file msmtp ffmpeg; do command -v "$t" >/dev/null 2>&1 && echo "have: $t" || echo "no:   $t"; done
           echo "provider | http | detail | detail2 | result" > "$SUMMARY_FILE"
           echo "✅ dependencies installed"
           # פורמט GITHUB_OUTPUT הוא name=value — מחרוזת חופשית גורמת לשלב להיכשל
@@ -80,17 +82,25 @@ jobs:
         shell: bash
         env:
           RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_TOKEN: ${{ secrets.GDRIVE_TOKEN }}
         run: |
           set +e; set +u
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
           exec >> "$LOG_FILE" 2>&1
           mkdir -p "$HOME/.config/rclone"
+          # v10: client_id מותאם לפרויקט שלנו — ה-403 came ממכסת ה-client המשותף (project 202264815644)
+          TOK="${GDRIVE_TOKEN:-$RCLONE_GDRIVE_TOKEN}"
           cat > "$HOME/.config/rclone/rclone.conf" <<EOF
           [gdrive]
           type = drive
-          scope = drive.file
-          token = $RCLONE_GDRIVE_TOKEN
+          scope = drive
+          ${GDRIVE_CLIENT_ID:+client_id = $GDRIVE_CLIENT_ID}
+          ${GDRIVE_CLIENT_SECRET:+client_secret = $GDRIVE_CLIENT_SECRET}
+          token = $TOK
           EOF
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
           rclone lsd gdrive: | head -5
           echo "✅ rclone configured"
 
@@ -132,6 +142,17 @@ jobs:
           echo "video_id=$VIDEO_ID" >> "$GITHUB_OUTPUT"
 
           row(){ printf '%s | %s | %s | %s | %s\n' "$1" "${2:--}" "${3:--}" "${4:--}" "${5:-fail}" >> "$SUMMARY_FILE"; }
+
+          # ולידציה "האם זה וידאו" בלי ffprobe (לא קיים ב-ubuntu-24.04) — mediainfo + file מותקנות מראש
+          is_video(){
+            local f="$1"
+            [[ -s "$f" ]] || return 1
+            if command -v mediainfo >/dev/null 2>&1; then
+              mediainfo --Output=JSON "$f" 2>/dev/null | jq -e '.media.track[]? | select(."@type"? == "Video")' >/dev/null 2>&1 && return 0
+            fi
+            file -b "$f" 2>/dev/null | grep -qiE 'ISO Media|Matroska|WebM|MP4|video' && return 0
+            return 1
+          }
 
           # ---------- resolver: loader.to / p.savenow.to ( אותו backend ) ----------
           # זרימת API מלאה שנמצאה בקוד פתוח ומאומתת ידנית:
@@ -209,7 +230,7 @@ jobs:
             echo "  http=$CODE ct=$CT bytes=$SZ eff=${EFF:0:110}"
 
             # קישור של savenow שנחת על עמוד מודעה (HTML) -> פעם אחת מעבר מודעה ואז ניסוי נוסף
-            if [[ "$RESOLVED" == *savenow.to* && ( "$SZ" -lt 200000 ) ]] && ! ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$WORK/dl.bin" 2>/dev/null | grep -q video; then
+            if [[ "$RESOLVED" == *savenow.to* && ( "$SZ" -lt 200000 ) ]] && ! is_video "$WORK/dl.bin"; then
               echo "  landing page instead of media -> ad_walk + retry"
               ad_walk "$RESOLVED"
               R=$(curl -sS -L --max-redirs 10 --max-time 1800 -A "$UA" -e "https://loader.to/" -c "$jar" -b "$jar" \
@@ -220,7 +241,10 @@ jobs:
             fi
 
             if [[ "$RESOLVED" == *.m3u8* || "$CT" == *mpegurl* ]]; then
-              echo "  HLS stream -> ffmpeg"
+              echo "  HLS stream -> ffmpeg (התקנה על-דרישה, לא ב-init)"
+              if ! command -v ffmpeg >/dev/null 2>&1; then
+                sudo apt-get install -y -qq ffmpeg || { sudo apt-get update -qq; sudo apt-get install -y -qq ffmpeg; }
+              fi
               ffmpeg -y -loglevel error -i "$RESOLVED" -c copy "$OUT/video.mp4" 2>>"$LOG_FILE"
               if [[ -s "$OUT/video.mp4" ]]; then
                 echo "success=true" >> "$GITHUB_OUTPUT"; echo "file=$OUT/video.mp4" >> "$GITHUB_OUTPUT"
@@ -231,7 +255,7 @@ jobs:
               return 1
             fi
 
-            if ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$WORK/dl.bin" 2>/dev/null | grep -q video; then
+            if is_video "$WORK/dl.bin"; then
               case "$CT" in
                 video/webm*)      EXT=webm ;;
                 video/x-matroska*) EXT=mkv ;;
@@ -342,7 +366,8 @@ jobs:
           # rclone copy לנתיב קובץ יוצר תיקייה בשם הקובץ — משתמשים ב-copyto + purge של הישן
           rclone purge "$REMOTE_PATH" 2>/dev/null
           rclone purge "gdrive:${FOLDER}/video.zip" 2>/dev/null   # שארית הבאג ההיסטורי (תיקייה בתוך תיקייה)
-          rclone copyto "$ZIP_FILE" "$REMOTE_PATH" --progress
+          # v10: 256M chunk -> פחות בקשות רשת ל-Drive (מכסת requests/דקה של rclone) + client_id מותאם לעיל
+          rclone copyto "$ZIP_FILE" "$REMOTE_PATH" --progress --drive-chunk-size 256M
           if [[ $? -eq 0 ]]; then
             echo "STATUS=success" >> "$GITHUB_OUTPUT"; echo "FILE_NAME=$ZIP_NAME" >> "$GITHUB_OUTPUT"
             echo "FILE_SIZE=$(stat -c%s "$ZIP_FILE" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
