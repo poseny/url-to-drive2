@@ -119,7 +119,8 @@ jobs:
           curl -fsSL https://rclone.org/install.sh | sudo bash 2>&1 | tee -a "${BATCH_LOG}"
           sudo apt-get update -qq 2>&1 | tee -a "${BATCH_LOG}"
           # v10: ubuntu-24.04 comes with ffmpeg/zip/jq/curl/mediainfo/file/unzip pre-installed
-          sudo apt-get install -y -qq msmtp msmtp-mta 2>&1 | tee -a "${BATCH_LOG}"
+          sudo apt-get install -y -qq msmtp msmtp-mta python3 python3-pip 2>&1 | tee -a "${BATCH_LOG}"
+          pip3 install -q yt-dlp 2>&1 | tee -a "${BATCH_LOG}"
           for t in jq curl zip unzip mediainfo file msmtp ffmpeg; do command -v "$t" >/dev/null 2>&1 && echo "have: $t" || echo "no:   $t"; done
           echo "✅ Dependencies ready" | tee -a "${BATCH_LOG}"
 
@@ -260,7 +261,7 @@ jobs:
                 "https://p.savenow.to/ajax/download.php" 2>/dev/null)
             
             if ! jq -e . <<<"$r" >/dev/null 2>&1; then
-              echo "  ❌ Not JSON response: ${r:0:70}"
+              echo "  ❌ Not JSON response: ${r:0:70}" >> "${BATCH_LOG}"
               return 1
             fi
             
@@ -269,7 +270,7 @@ jobs:
             du=$(jq -r '.url // .download_url // empty' <<<"$r")
             
             if [[ -z "$id" && "$du" != http* ]]; then
-              echo "  ❌ No job ID and no direct URL"
+              echo "  ❌ No job ID and no direct URL" >> "${BATCH_LOG}"
               return 1
             fi
             
@@ -290,38 +291,38 @@ jobs:
                   return 0
                 fi
                 if [[ "$(jq -r '.progress // 0' <<<"$j")" == "1000" ]]; then
-                  echo "  ❌ Job failed: $(jq -c '{success,text,message}' <<<"$j" 2>/dev/null | head -c 70)"
+                  echo "  ❌ Job failed: $(jq -c '{success,text,message}' <<<"$j" 2>/dev/null | head -c 70)" >> "${BATCH_LOG}"
                   return 1
                 fi
               fi
               sleep 3
             done
-            echo "  ❌ Timeout waiting for download URL"
+            echo "  ❌ Timeout waiting for download URL" >> "${BATCH_LOG}"
             return 1
           }
-
+          
           # Download and validate
           download_and_validate(){
             local RESOLVED="$1" VIDEO_URL="$2" WORK_DIR="$3"
             local R CODE CT EFF SZ EXT jar="$WORK_DIR/cookies.txt"
             
-            echo "  downloading: ${RESOLVED:0:140}"
+            echo "  downloading: ${RESOLVED:0:140}" >> "${BATCH_LOG}"
             R=$(curl -sS -L --max-redirs 8 --max-time 1800 -A "$UA" -e "$VIDEO_URL" -c "$jar" -b "$jar" \
                 -o "$WORK_DIR/dl.bin" -w '%{http_code}|%{content_type}|%{url_effective}' "$RESOLVED" 2>>"${BATCH_LOG}")
             IFS='|' read -r CODE CT EFF <<< "$R"
             SZ=$(stat -c%s "$WORK_DIR/dl.bin" 2>/dev/null || echo 0)
-            echo "  http=$CODE ct=$CT bytes=$SZ eff=${EFF:0:110}"
+            echo "  http=$CODE ct=$CT bytes=$SZ eff=${EFF:0:110}" >> "${BATCH_LOG}"
 
             # If savenow.to landing page instead of media, try ad walk once
             if [[ "$RESOLVED" == *savenow.to* && ( "$SZ" -lt 200000 ) ]] && ! is_video "$WORK_DIR/dl.bin"; then
-              echo "  landing page instead of media -> ad_walk + retry"
+              echo "  landing page instead of media -> ad_walk + retry" >> "${BATCH_LOG}"
               # ad walk
               for i in 1 2; do
                 curl -sS -m 30 -A "$UA" -e 'https://loader.to/' -c "$jar" -b "$jar" \
                      -o "$WORK_DIR/ad.html" -L --max-redirs 6 --max-time 30 \
                      -w '    walk http=%{http_code} eff=%{url_effective}\n' "$RESOLVED" 2>/dev/null
                 if [[ -s "$WORK_DIR/ad.html" && "$(stat -c%s "$WORK_DIR/ad.html")" -lt 5000 ]]; then
-                  echo "    ad page ($(stat -c%s "$WORK_DIR/ad.html")b): $(head -c 300 "$WORK_DIR/ad.html" | tr -c '[:print:]' '.')"
+                  echo "    ad page ($(stat -c%s "$WORK_DIR/ad.html")b): $(head -c 300 "$WORK_DIR/ad.html" | tr -c '[:print:]" '.'')" >> "${BATCH_LOG}"
                 fi
                 sleep 5
               done
@@ -329,11 +330,11 @@ jobs:
                   -o "$WORK_DIR/dl.bin" -w '%{http_code}|%{content_type}|%{url_effective}' "$RESOLVED" 2>>"${BATCH_LOG}")
               IFS='|' read -r CODE CT EFF <<< "$R"
               SZ=$(stat -c%s "$WORK_DIR/dl.bin" 2>/dev/null || echo 0)
-              echo "  retry http=$CODE ct=$CT bytes=$SZ eff=${EFF:0:110}"
+              echo "  retry http=$CODE ct=$CT bytes=$SZ eff=${EFF:0:110}" >> "${BATCH_LOG}"
             fi
 
             if [[ "$RESOLVED" == *.m3u8* || "$CT" == *mpegurl* ]]; then
-              echo "  HLS stream -> ffmpeg"
+              echo "  HLS stream -> ffmpeg" >> "${BATCH_LOG}"
               if ! command -v ffmpeg >/dev/null 2>&1; then
                 sudo apt-get install -y -qq ffmpeg || { sudo apt-get update -qq; sudo apt-get install -y -qq ffmpeg; }
               fi
@@ -356,8 +357,8 @@ jobs:
               return 0
             fi
 
-            echo "  ⚠️ not a video file -> body head:"
-            head -c 600 "$WORK_DIR/dl.bin" 2>/dev/null | tr -c '[:print:]' '.'; echo
+            echo "  ⚠️ not a video file -> body head:" >> "${BATCH_LOG}"
+            head -c 600 "$WORK_DIR/dl.bin" 2>/dev/null | tr -c '[:print:]" '.'; echo >> "${BATCH_LOG}"
             rm -f "$WORK_DIR/dl.bin"
             return 1
           }
@@ -430,8 +431,23 @@ jobs:
               ((CURRENT_ZIP_SIZE+=FSIZE))
               ((SUCCESS++))
             else
-              log "❌ All quality attempts failed for: $URL"
-              ((FAILED++))
+              log "❌ All loader.to quality attempts failed for: $URL"
+              log "  🔄 Falling back to yt-dlp..."
+              YT_DLP_FILE=$(mktemp -p "$WORK_DIR" ytdlp_XXXXXX.mp4)
+              yt-dlp --no-playlist -f "best[ext=mp4]/best" -o "$YT_DLP_FILE" "$URL" >> "${BATCH_LOG}" 2>&1
+              YT_DLP_EXIT=$?
+              if [[ $YT_DLP_EXIT -eq 0 && -s "$YT_DLP_FILE" ]]; then
+                DOWNLOADED_FILE="$YT_DLP_FILE"
+                log "  ✅ yt-dlp downloaded: $(basename "$YT_DLP_FILE") ($(stat -c%s "$YT_DLP_FILE" 2>/dev/null || echo 0) bytes)"
+              else
+                log "  ❌ yt-dlp also failed (exit=$YT_DLP_EXIT)"
+                log "--- Last 10 lines of yt-dlp output ---"
+                tail -10 "${BATCH_LOG}" | tee -a "${BATCH_LOG}"
+                ((FAILED++))
+                rm -rf "$WORK_DIR"
+                sleep 1
+                continue
+              fi
             fi
 
             rm -rf "$WORK_DIR"
