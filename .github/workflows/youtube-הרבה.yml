@@ -118,9 +118,9 @@ jobs:
           echo "🔧 Installing system packages..." | tee -a "${BATCH_LOG}"
           curl -fsSL https://rclone.org/install.sh | sudo bash 2>&1 | tee -a "${BATCH_LOG}"
           sudo apt-get update -qq 2>&1 | tee -a "${BATCH_LOG}"
-          sudo apt-get install -y -qq zip curl jq python3 python3-pip 2>&1 | tee -a "${BATCH_LOG}"
-          echo "🔧 Installing yt-dlp..." | tee -a "${BATCH_LOG}"
-          pip3 install -q yt-dlp 2>&1 | tee -a "${BATCH_LOG}"
+          # v10: ubuntu-24.04 comes with ffmpeg/zip/jq/curl/mediainfo/file/unzip pre-installed
+          sudo apt-get install -y -qq msmtp msmtp-mta 2>&1 | tee -a "${BATCH_LOG}"
+          for t in jq curl zip unzip mediainfo file msmtp ffmpeg; do command -v "$t" >/dev/null 2>&1 && echo "have: $t" || echo "no:   $t"; done
           echo "✅ Dependencies ready" | tee -a "${BATCH_LOG}"
 
       - name: Configure rclone
@@ -183,9 +183,11 @@ jobs:
       # ----------------------------------------------------------
       # 3. 🚀 הלולאה הראשית — עם הגנה מלאה על קריסות
       # ----------------------------------------------------------
-      - name: Process all URLs in loop (crash-proof)
+      - name: Process all URLs in loop (loader.to resolver)
         id: batch_loop
         shell: bash
+        env:
+          SAVENOW_API: "dfcb6d76f2f6a9894gjkege8a4ab232222"
         run: |
           set +e
           set +o pipefail
@@ -231,6 +233,135 @@ jobs:
           CURRENT_ZIP_DIR=$(mktemp -d -p "$TMP_ROOT")
           CURRENT_ZIP_SIZE=0
 
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+          SAVENOW_API="${SAVENOW_API}"
+
+          # Validate if file is a video
+          is_video(){
+            local f="$1"
+            [[ -s "$f" ]] || return 1
+            if command -v mediainfo >/dev/null 2>&1; then
+              mediainfo --Output=JSON "$f" 2>/dev/null | jq -e '.media.track[]? | select(."@type"? == "Video")' >/dev/null 2>&1 && return 0
+            fi
+            file -b "$f" 2>/dev/null | grep -qiE 'ISO Media|Matroska|WebM|MP4|video' && return 0
+            return 1
+          }
+
+          # loader.to / p.savenow.to resolver
+          resolve_loaderto(){
+            local VIDEO_URL="$1" Q="$2"
+            local r id du pu j i
+            
+            r=$(curl -sS -m 45 -A "$UA" -H 'Accept: application/json' -H 'Referer: https://loader.to/' -G \
+                --data-urlencode "url=$VIDEO_URL" \
+                --data-urlencode "copyright=0" --data-urlencode "allow_extended_duration=1" \
+                --data-urlencode "add_info=1" --data-urlencode "no_merge=0" \
+                --data-urlencode "format=$Q" --data-urlencode "api=$SAVENOW_API" \
+                "https://p.savenow.to/ajax/download.php" 2>/dev/null)
+            
+            if ! jq -e . <<<"$r" >/dev/null 2>&1; then
+              echo "  ❌ Not JSON response: ${r:0:70}"
+              return 1
+            fi
+            
+            TITLE=$(jq -r '.title // .info.title // empty' <<<"$r" 2>/dev/null)
+            id=$(jq -r '.id // empty' <<<"$r")
+            du=$(jq -r '.url // .download_url // empty' <<<"$r")
+            
+            if [[ -z "$id" && "$du" != http* ]]; then
+              echo "  ❌ No job ID and no direct URL"
+              return 1
+            fi
+            
+            if [[ "$du" == http* ]]; then
+              echo "$du"
+              return 0
+            fi
+            
+            pu=$(jq -r '.progress_url // empty' <<<"$r")
+            [[ -z "$pu" ]] && pu="https://p.savenow.to/api/progress?id=$id"
+            
+            for i in $(seq 1 40); do
+              j=$(curl -sS -m 30 -A "$UA" -H 'Accept: application/json' "$pu" 2>/dev/null)
+              if jq -e . <<<"$j" >/dev/null 2>&1; then
+                du=$(jq -r '.download_url // empty' <<<"$j")
+                if [[ "$du" == http* ]]; then
+                  echo "$du"
+                  return 0
+                fi
+                if [[ "$(jq -r '.progress // 0' <<<"$j")" == "1000" ]]; then
+                  echo "  ❌ Job failed: $(jq -c '{success,text,message}' <<<"$j" 2>/dev/null | head -c 70)"
+                  return 1
+                fi
+              fi
+              sleep 3
+            done
+            echo "  ❌ Timeout waiting for download URL"
+            return 1
+          }
+
+          # Download and validate
+          download_and_validate(){
+            local RESOLVED="$1" VIDEO_URL="$2" WORK_DIR="$3"
+            local R CODE CT EFF SZ EXT jar="$WORK_DIR/cookies.txt"
+            
+            echo "  downloading: ${RESOLVED:0:140}"
+            R=$(curl -sS -L --max-redirs 8 --max-time 1800 -A "$UA" -e "$VIDEO_URL" -c "$jar" -b "$jar" \
+                -o "$WORK_DIR/dl.bin" -w '%{http_code}|%{content_type}|%{url_effective}' "$RESOLVED" 2>>"${BATCH_LOG}")
+            IFS='|' read -r CODE CT EFF <<< "$R"
+            SZ=$(stat -c%s "$WORK_DIR/dl.bin" 2>/dev/null || echo 0)
+            echo "  http=$CODE ct=$CT bytes=$SZ eff=${EFF:0:110}"
+
+            # If savenow.to landing page instead of media, try ad walk once
+            if [[ "$RESOLVED" == *savenow.to* && ( "$SZ" -lt 200000 ) ]] && ! is_video "$WORK_DIR/dl.bin"; then
+              echo "  landing page instead of media -> ad_walk + retry"
+              # ad walk
+              for i in 1 2; do
+                curl -sS -m 30 -A "$UA" -e 'https://loader.to/' -c "$jar" -b "$jar" \
+                     -o "$WORK_DIR/ad.html" -L --max-redirs 6 --max-time 30 \
+                     -w '    walk http=%{http_code} eff=%{url_effective}\n' "$RESOLVED" 2>/dev/null
+                if [[ -s "$WORK_DIR/ad.html" && "$(stat -c%s "$WORK_DIR/ad.html")" -lt 5000 ]]; then
+                  echo "    ad page ($(stat -c%s "$WORK_DIR/ad.html")b): $(head -c 300 "$WORK_DIR/ad.html" | tr -c '[:print:]' '.')"
+                fi
+                sleep 5
+              done
+              R=$(curl -sS -L --max-redirs 10 --max-time 1800 -A "$UA" -e "https://loader.to/" -c "$jar" -b "$jar" \
+                  -o "$WORK_DIR/dl.bin" -w '%{http_code}|%{content_type}|%{url_effective}' "$RESOLVED" 2>>"${BATCH_LOG}")
+              IFS='|' read -r CODE CT EFF <<< "$R"
+              SZ=$(stat -c%s "$WORK_DIR/dl.bin" 2>/dev/null || echo 0)
+              echo "  retry http=$CODE ct=$CT bytes=$SZ eff=${EFF:0:110}"
+            fi
+
+            if [[ "$RESOLVED" == *.m3u8* || "$CT" == *mpegurl* ]]; then
+              echo "  HLS stream -> ffmpeg"
+              if ! command -v ffmpeg >/dev/null 2>&1; then
+                sudo apt-get install -y -qq ffmpeg || { sudo apt-get update -qq; sudo apt-get install -y -qq ffmpeg; }
+              fi
+              ffmpeg -y -loglevel error -i "$RESOLVED" -c copy "$WORK_DIR/video.mp4" 2>>"${BATCH_LOG}"
+              if [[ -s "$WORK_DIR/video.mp4" ]]; then
+                echo "$WORK_DIR/video.mp4"
+                return 0
+              fi
+              return 1
+            fi
+
+            if is_video "$WORK_DIR/dl.bin"; then
+              case "$CT" in
+                video/webm*)      EXT=webm ;;
+                video/x-matroska*) EXT=mkv ;;
+                *)                EXT=mp4 ;;
+              esac
+              mv "$WORK_DIR/dl.bin" "$WORK_DIR/video.$EXT"
+              echo "$WORK_DIR/video.$EXT"
+              return 0
+            fi
+
+            echo "  ⚠️ not a video file -> body head:"
+            head -c 600 "$WORK_DIR/dl.bin" 2>/dev/null | tr -c '[:print:]' '.'; echo
+            rm -f "$WORK_DIR/dl.bin"
+            return 1
+          }
+
           for i in "${!URLS[@]}"; do
             URL="${URLS[i]}"
             IDX=$((i+1))
@@ -239,58 +370,71 @@ jobs:
             log "[$IDX/$TOTAL] Processing: $URL"
             log "=========================================="
 
-            TWEET_TMP=$(mktemp -d -p "$TMP_ROOT")
-
-            raw_name=$(basename "$URL")
-            raw_name=${raw_name%%\?*}
-            decoded_name=$(printf '%b' "$(echo -e "${raw_name//%/\\x}")")
-            log "🔤 Decoded filename from URL = $decoded_name"
-
-            internal_name="$decoded_name"
-            log "📁 Internal file name in ZIP = $internal_name"
-
-            DOWNLOAD_PATH="${TWEET_TMP}/${internal_name}"
+            WORK_DIR=$(mktemp -d -p "$TMP_ROOT")
             
-            log "⬇️  [$(date -u +%H:%M:%S)] Downloading with yt-dlp..."
-            yt-dlp --no-playlist -f "best[ext=mp4]/best" -o "$DOWNLOAD_PATH" "$URL" >> "${BATCH_LOG}" 2>&1
-            YT_DLP_EXIT=$?
+            # Extract YouTube video ID if applicable
+            VIDEO_ID=$(printf '%s' "$URL" | sed -E 's#.*[?&]v=([^?&]+).*#\1#')
+            [[ "$VIDEO_ID" == "$URL" || -z "$VIDEO_ID" ]] && VIDEO_ID=$(printf '%s' "$URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#')
+            log "VIDEO_ID = ${VIDEO_ID:-none}"
 
-            if [[ $YT_DLP_EXIT -eq 0 ]]; then
-              if [[ ! -s "$DOWNLOAD_PATH" ]]; then
-                log "❌ Downloaded file is empty"
-                ((FAILED++))
-              else
-                FSIZE=$(stat -c%s "$DOWNLOAD_PATH" 2>/dev/null || echo 0)
-                log "✅ Downloaded: $internal_name ($(numfmt --to=iec $FSIZE))"
-                
-                if (( CURRENT_ZIP_SIZE + FSIZE > MAX_ZIP_SIZE_MB * 1024 * 1024 )) || (( FILES_IN_CURRENT_ZIP >= MAX_FILES_PER_ZIP )); then
-                  if (( FILES_IN_CURRENT_ZIP > 0 )); then
-                    ZIP_NAME="${FOLDER}_part${ZIP_COUNTER}_$(date -u +%Y%m%d_%H%M%S).zip"
-                    log "🗜️  Creating ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
-                    (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*) 2>&1 | tee -a "${BATCH_LOG}"
-                    log "🚀 Uploading to Drive..."
-                    rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress 2>&1 | tee -a "${BATCH_LOG}"
-                    ((ZIP_COUNTER++))
-                  fi
-                  FILES_IN_CURRENT_ZIP=0
-                  CURRENT_ZIP_SIZE=0
-                  rm -rf "$CURRENT_ZIP_DIR"
-                  CURRENT_ZIP_DIR=$(mktemp -d -p "$TMP_ROOT")
+            # Quality ladder
+            QLADDER='1080 720 480 360'
+            read -ra QS <<< "$QLADDER"
+            TITLE=""
+
+            RESOLVED=""
+            DOWNLOADED_FILE=""
+
+            for q in "${QS[@]}"; do
+              log "  🔄 Attempting quality: $q"
+              RESOLVED=$(resolve_loaderto "$URL" "$q")
+              if [[ "$RESOLVED" == http* ]]; then
+                log "  ✅ Resolved: ${RESOLVED:0:130}"
+                DOWNLOADED_FILE=$(download_and_validate "$RESOLVED" "$URL" "$WORK_DIR")
+                if [[ -n "$DOWNLOADED_FILE" && -s "$DOWNLOADED_FILE" ]]; then
+                  log "  ✅ Downloaded: $(basename "$DOWNLOADED_FILE") ($(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || echo 0) bytes)"
+                  break
                 fi
-
-                cp "$DOWNLOAD_PATH" "$CURRENT_ZIP_DIR/${internal_name}" 2>&1 | tee -a "${BATCH_LOG}"
-                ((FILES_IN_CURRENT_ZIP++))
-                ((CURRENT_ZIP_SIZE+=FSIZE))
-                ((SUCCESS++))
               fi
+              log "  ❌ Failed at quality $q"
+              sleep 5
+            done
+
+            if [[ -n "$DOWNLOADED_FILE" && -s "$DOWNLOADED_FILE" ]]; then
+              FSIZE=$(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || echo 0)
+              
+              if (( CURRENT_ZIP_SIZE + FSIZE > MAX_ZIP_SIZE_MB * 1024 * 1024 )) || (( FILES_IN_CURRENT_ZIP >= MAX_FILES_PER_ZIP )); then
+                if (( FILES_IN_CURRENT_ZIP > 0 )); then
+                  ZIP_NAME="${FOLDER}_part${ZIP_COUNTER}_$(date -u +%Y%m%d_%H%M%S).zip"
+                  log "🗜️  Creating ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
+                  (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*) 2>&1 | tee -a "${BATCH_LOG}"
+                  log "🚀 Uploading to Drive..."
+                  rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress 2>&1 | tee -a "${BATCH_LOG}"
+                  ((ZIP_COUNTER++))
+                fi
+                FILES_IN_CURRENT_ZIP=0
+                CURRENT_ZIP_SIZE=0
+                rm -rf "$CURRENT_ZIP_DIR"
+                CURRENT_ZIP_DIR=$(mktemp -d -p "$TMP_ROOT")
+              fi
+
+              # Use video ID or title for filename
+              if [[ -n "$TITLE" ]]; then
+                INTERNAL_NAME=$(printf '%s' "$TITLE" | tr '\r\n\t' '   ' | sed -E 's#[\\/:*?"<>|]#_#g; s/^[ .]+//; s/[ .]+$//; s/_{2,}/_/g' | head -c 180)
+              else
+                INTERNAL_NAME="${VIDEO_ID:-video_$IDX}"
+              fi
+              EXT="${DOWNLOADED_FILE##*.}"
+              cp "$DOWNLOADED_FILE" "$CURRENT_ZIP_DIR/${INTERNAL_NAME}.${EXT}" 2>&1 | tee -a "${BATCH_LOG}"
+              ((FILES_IN_CURRENT_ZIP++))
+              ((CURRENT_ZIP_SIZE+=FSIZE))
+              ((SUCCESS++))
             else
-              log "❌ yt-dlp failed with exit code $YT_DLP_EXIT"
-              log "--- Last 20 lines of yt-dlp output ---"
-              tail -20 "${BATCH_LOG}" | tee -a "${BATCH_LOG}"
+              log "❌ All quality attempts failed for: $URL"
               ((FAILED++))
             fi
 
-            rm -rf "$TWEET_TMP"
+            rm -rf "$WORK_DIR"
             sleep 1
           done
 
