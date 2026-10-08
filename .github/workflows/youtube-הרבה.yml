@@ -139,6 +139,12 @@ jobs:
       # ----------------------------------------------------------
       # 2. הכנת רשימת URLs
       # ----------------------------------------------------------
+      - name: Download URLs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: urls-txt
+          path: /tmp/urls_input
+
       - name: Prepare URLs list
         id: prepare_urls
         shell: bash
@@ -146,10 +152,10 @@ jobs:
           set -e
           URLS_FILE="/tmp/urls_list.txt"
           
-          echo "📝 Batch mode - downloading URLs artifact"
+          echo "📝 Batch mode - reading URLs artifact"
           ARTIFACT_PATH="/tmp/urls_input/${URLS_FILE_INPUT}"
           
-          echo "📥 Downloading artifact..." | tee -a "${BATCH_LOG}"
+          echo "📥 Reading artifact..." | tee -a "${BATCH_LOG}"
           
           if [[ -f "$ARTIFACT_PATH" ]]; then
             echo "✅ Artifact found at $ARTIFACT_PATH" | tee -a "${BATCH_LOG}"
@@ -171,12 +177,6 @@ jobs:
           fi
           
           echo "urls_file=$URLS_FILE" >> $GITHUB_OUTPUT
-
-      - name: Download URLs artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: urls-txt
-          path: /tmp/urls_input
 
       # ----------------------------------------------------------
       # 3. 🚀 הלולאה הראשית — עם הגנה מלאה על קריסות
