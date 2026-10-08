@@ -118,7 +118,9 @@ jobs:
           echo "🔧 Installing system packages..." | tee -a "${BATCH_LOG}"
           curl -fsSL https://rclone.org/install.sh | sudo bash 2>&1 | tee -a "${BATCH_LOG}"
           sudo apt-get update -qq 2>&1 | tee -a "${BATCH_LOG}"
-          sudo apt-get install -y -qq zip curl jq 2>&1 | tee -a "${BATCH_LOG}"
+          sudo apt-get install -y -qq zip curl jq python3 python3-pip 2>&1 | tee -a "${BATCH_LOG}"
+          echo "🔧 Installing yt-dlp..." | tee -a "${BATCH_LOG}"
+          pip3 install -q yt-dlp 2>&1 | tee -a "${BATCH_LOG}"
           echo "✅ Dependencies ready" | tee -a "${BATCH_LOG}"
 
       - name: Configure rclone
@@ -249,11 +251,11 @@ jobs:
 
             DOWNLOAD_PATH="${TWEET_TMP}/${internal_name}"
             
-            log "⬇️  [$(date -u +%H:%M:%S)] Downloading with curl..."
-            curl -L -s --max-time 300 --retry 3 --retry-delay 5 -o "$DOWNLOAD_PATH" "$URL" >> "${BATCH_LOG}" 2>&1
-            CURL_EXIT=$?
+            log "⬇️  [$(date -u +%H:%M:%S)] Downloading with yt-dlp..."
+            yt-dlp --no-playlist -f "best[ext=mp4]/best" -o "$DOWNLOAD_PATH" "$URL" >> "${BATCH_LOG}" 2>&1
+            YT_DLP_EXIT=$?
 
-            if [[ $CURL_EXIT -eq 0 ]]; then
+            if [[ $YT_DLP_EXIT -eq 0 ]]; then
               if [[ ! -s "$DOWNLOAD_PATH" ]]; then
                 log "❌ Downloaded file is empty"
                 ((FAILED++))
@@ -282,8 +284,8 @@ jobs:
                 ((SUCCESS++))
               fi
             else
-              log "❌ curl failed with exit code $CURL_EXIT"
-              log "--- Last 20 lines of curl output ---"
+              log "❌ yt-dlp failed with exit code $YT_DLP_EXIT"
+              log "--- Last 20 lines of yt-dlp output ---"
               tail -20 "${BATCH_LOG}" | tee -a "${BATCH_LOG}"
               ((FAILED++))
             fi
