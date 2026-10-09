@@ -91,6 +91,10 @@ jobs:
       RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
       RUN_ID: ${{ github.run_id }}
       URLS_FILE_INPUT: ${{ github.event.inputs.urls_file }}
+      # Video ID extraction patterns (avoid YAML bracket parsing)
+      VID_PAT1: "s#.*[?&]v=([^?&]+).*#\\1#"
+      VID_PAT2: "s#.*/(shorts|embed|v)/([^?&/]+).*#\\2#"
+      SANITIZE_PAT: "s#[\\\\/:*?\"<>|]#_#g; s/^[ .]+//; s/[ .]+$//; s/_{2,}/_/g"
 
     steps:
       # ----------------------------------------------------------
@@ -373,9 +377,7 @@ jobs:
 
             WORK_DIR=$(mktemp -d -p "$TMP_ROOT")
             
-            # Extract YouTube video ID if applicable (patterns generated at runtime to avoid YAML bracket parsing)
-            VID_PAT1=$(printf 's#.*[?&]v=([^?&]+).*#\\1#')
-            VID_PAT2=$(printf 's#.*/(shorts|embed|v)/([^?&/]+).*#\\2#')
+            # Extract YouTube video ID if applicable (patterns from env to avoid YAML bracket parsing)
             VIDEO_ID=$(printf '%s' "$URL" | sed -E "$VID_PAT1")
             [[ "$VIDEO_ID" == "$URL" || -z "$VIDEO_ID" ]] && VIDEO_ID=$(printf '%s' "$URL" | sed -E "$VID_PAT2")
             log "VIDEO_ID = ${VIDEO_ID:-none}"
@@ -423,7 +425,6 @@ jobs:
 
               # Use video ID or title for filename
               if [[ -n "$TITLE" ]]; then
-                SANITIZE_PAT=$(printf 's#[\\\\/:*?"<>|]#_#g; s/^[ .]+//; s/[ .]+$//; s/_{2,}/_/g')
                 INTERNAL_NAME=$(printf '%s' "$TITLE" | tr '\r\n\t' '   ' | sed -E "$SANITIZE_PAT" | head -c 180)
               else
                 INTERNAL_NAME="${VIDEO_ID:-video_$IDX}"
