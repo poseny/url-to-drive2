@@ -374,10 +374,8 @@ jobs:
             WORK_DIR=$(mktemp -d -p "$TMP_ROOT")
             
             # Extract YouTube video ID if applicable
-            VID_PATTERN1=$(printf 's#.*[?&]v=([^?&]+).*#\\1#')
-            VID_PATTERN2=$(printf 's#.*/(shorts|embed|v)/([^?&/]+).*#\\2#')
-            VIDEO_ID=$(printf '%s' "$URL" | sed -E "$VID_PATTERN1")
-            [[ "$VIDEO_ID" == "$URL" || -z "$VIDEO_ID" ]] && VIDEO_ID=$(printf '%s' "$URL" | sed -E "$VID_PATTERN2")
+            VIDEO_ID=$(printf '%s' "$URL" | sed -E 's#.*[?&]v=([^?&]+).*#\1#')
+            [[ "$VIDEO_ID" == "$URL" || -z "$VIDEO_ID" ]] && VIDEO_ID=$(printf '%s' "$URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#')
             log "VIDEO_ID = ${VIDEO_ID:-none}"
 
             # Quality ladder
