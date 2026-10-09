@@ -373,9 +373,11 @@ jobs:
 
             WORK_DIR=$(mktemp -d -p "$TMP_ROOT")
             
-            # Extract YouTube video ID if applicable
-            VIDEO_ID=$(printf '%s' "$URL" | sed -E 's#.*[?&]v=([^?&]+).*#\1#')
-            [[ "$VIDEO_ID" == "$URL" || -z "$VIDEO_ID" ]] && VIDEO_ID=$(printf '%s' "$URL" | sed -E 's#.*/(shorts|embed|v)/([^?&/]+).*#\2#')
+            # Extract YouTube video ID if applicable (patterns generated at runtime to avoid YAML bracket parsing)
+            VID_PAT1=$(printf 's#.*[?&]v=([^?&]+).*#\\1#')
+            VID_PAT2=$(printf 's#.*/(shorts|embed|v)/([^?&/]+).*#\\2#')
+            VIDEO_ID=$(printf '%s' "$URL" | sed -E "$VID_PAT1")
+            [[ "$VIDEO_ID" == "$URL" || -z "$VIDEO_ID" ]] && VIDEO_ID=$(printf '%s' "$URL" | sed -E "$VID_PAT2")
             log "VIDEO_ID = ${VIDEO_ID:-none}"
 
             # Quality ladder
@@ -421,7 +423,8 @@ jobs:
 
               # Use video ID or title for filename
               if [[ -n "$TITLE" ]]; then
-                INTERNAL_NAME=$(printf '%s' "$TITLE" | tr '\r\n\t' '   ' | sed -E 's#[\\/:*?"<>|]#_#g; s/^[ .]+//; s/[ .]+$//; s/_{2,}/_/g' | head -c 180)
+                SANITIZE_PAT=$(printf 's#[\\\\/:*?"<>|]#_#g; s/^[ .]+//; s/[ .]+$//; s/_{2,}/_/g')
+                INTERNAL_NAME=$(printf '%s' "$TITLE" | tr '\r\n\t' '   ' | sed -E "$SANITIZE_PAT" | head -c 180)
               else
                 INTERNAL_NAME="${VIDEO_ID:-video_$IDX}"
               fi
