@@ -1,4 +1,4 @@
-name: ניסויDownload YouTube URLs from link.txt → Google Drive (Batch Zip)
+﻿name: ניסויDownload YouTube URLs from link.txt → Google Drive (Batch Zip)
 
 on:
   workflow_dispatch:
@@ -92,9 +92,6 @@ jobs:
       RUN_ID: ${{ github.run_id }}
       URLS_FILE_INPUT: ${{ github.event.inputs.urls_file }}
       # Video ID extraction patterns (avoid YAML bracket parsing)
-      VID_PAT1: "s#.*[?&]v=([^?&]+).*#\\1#"
-      VID_PAT2: "s#.*/(shorts|embed|v)/([^?&/]+).*#\\2#"
-      SANITIZE_PAT: "s#[\\\\/:*?\"<>|]#_#g; s/^[ .]+//; s/[ .]+$//; s/_{2,}/_/g"
 
     steps:
       # ----------------------------------------------------------
@@ -378,8 +375,7 @@ jobs:
             WORK_DIR=$(mktemp -d -p "$TMP_ROOT")
             
             # Extract YouTube video ID if applicable (patterns from env to avoid YAML bracket parsing)
-            VIDEO_ID=$(printf '%s' "$URL" | sed -E "$VID_PAT1")
-            [[ "$VIDEO_ID" == "$URL" || -z "$VIDEO_ID" ]] && VIDEO_ID=$(printf '%s' "$URL" | sed -E "$VID_PAT2")
+            VIDEO_ID=$(python "$GITHUB_WORKSPACE/.github/scripts/extract_youtube_id.py" "$URL")
             log "VIDEO_ID = ${VIDEO_ID:-none}"
 
             # Quality ladder
