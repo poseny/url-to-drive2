@@ -375,7 +375,7 @@ jobs:
             WORK_DIR=$(mktemp -d -p "$TMP_ROOT")
             
             # Extract YouTube video ID if applicable (patterns from env to avoid YAML bracket parsing)
-            VIDEO_ID=$(python3 2>/dev/null || python "$GITHUB_WORKSPACE/.github/scripts/extract_youtube_id.py" "$URL")
+            VIDEO_ID=$(python3 "$GITHUB_WORKSPACE/.github/scripts/extract_youtube_id.py" "$URL" 2>/dev/null || python "$GITHUB_WORKSPACE/.github/scripts/extract_youtube_id.py" "$URL")
             log "VIDEO_ID = ${VIDEO_ID:-none}"
 
             # Quality ladder
