@@ -323,7 +323,7 @@ jobs:
                      -o "$WORK_DIR/ad.html" -L --max-redirs 6 --max-time 30 \
                      -w '    walk http=%{http_code} eff=%{url_effective}\n' "$RESOLVED" 2>/dev/null
                 if [[ -s "$WORK_DIR/ad.html" && "$(stat -c%s "$WORK_DIR/ad.html")" -lt 5000 ]]; then
-                  echo "    ad page ($(stat -c%s "$WORK_DIR/ad.html")b): $(head -c 300 "$WORK_DIR/ad.html" | tr -c '[:print:]" '.'')" >> "${BATCH_LOG}"
+                  echo "    ad page ($(stat -c%s "$WORK_DIR/ad.html")b): $(head -c 300 "$WORK_DIR/ad.html" | tr -c '[:print:]' '.'')" >> "${BATCH_LOG}"
                 fi
                 sleep 5
               done
@@ -359,7 +359,7 @@ jobs:
             fi
 
             echo "  ⚠️ not a video file -> body head:" >> "${BATCH_LOG}"
-            head -c 600 "$WORK_DIR/dl.bin" 2>/dev/null | tr -c '[:print:]" '.'; echo >> "${BATCH_LOG}"
+            head -c 600 "$WORK_DIR/dl.bin" 2>/dev/null | tr -c '[:print:]' '.'; echo >> "${BATCH_LOG}"
             rm -f "$WORK_DIR/dl.bin"
             return 1
           }
