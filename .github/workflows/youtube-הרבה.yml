@@ -438,7 +438,7 @@ jobs:
               YT_DLP_EXIT=$[OK]
               if [[ $YT_DLP_EXIT -eq 0 && -s "$YT_DLP_FILE" ]]; then
                 DOWNLOADED_FILE="$YT_DLP_FILE"
-                log "  [OK] yt-dlp downloaded: $(basename "$YT_DLP_FILE") ($(stat -c%s "$YT_DLP_FILE" 2>/dev/null || echo 0) bytes)"
+                log "  [OK] yt-dlp downloaded"
               else
                 log "  [ERR] yt-dlp also failed (exit=$YT_DLP_EXIT)"
                 log "--- Last 10 lines of yt-dlp output ---"
