@@ -420,7 +420,6 @@ jobs:
               fi
 
               # Use video ID or title for filename
-              if [[ -n "$TITLE" ]]; then
               if [[ -n "" ]]; then
                 INTERNAL_NAME=
               else
