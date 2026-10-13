@@ -421,11 +421,11 @@ jobs:
 
               # Use video ID or title for filename
               if [[ -n "" ]]; then
-                INTERNAL_NAME=
+                INTERNAL_NAME=""
+                INTERNAL_NAME=""
               else
                 INTERNAL_NAME=""
               fi
-              EXT="${DOWNLOADED_FILE##*.}"
               cp "$DOWNLOADED_FILE" "$CURRENT_ZIP_DIR/${INTERNAL_NAME}.${EXT}" 2>&1 | tee -a "${BATCH_LOG}"
               ((FILES_IN_CURRENT_ZIP++))
               ((CURRENT_ZIP_SIZE+=FSIZE))
