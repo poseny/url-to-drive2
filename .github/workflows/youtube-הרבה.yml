@@ -228,6 +228,7 @@ jobs:
           SKIPPED=0
           FAILED=0
           ZIP_COUNTER=1
+          UPLOADED_ZIPS=()
           FILES_IN_CURRENT_ZIP=0
           MAX_FILES_PER_ZIP=${MAX_FILES_PER_ZIP}
           MAX_ZIP_SIZE_MB=${MAX_ZIP_SIZE_MB}
@@ -411,6 +412,12 @@ jobs:
                   (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*) 2>&1 | tee -a "${BATCH_LOG}"
                   log "🚀 Uploading to Drive..."
                   rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress 2>&1 | tee -a "${BATCH_LOG}"
+                  if rclone lsf "gdrive:${FOLDER}/" --files-only 2>/dev/null | grep -qxF "$ZIP_NAME"; then
+                    log "  ✅ Verified in Drive: $ZIP_NAME"
+                    UPLOADED_ZIPS+=("$ZIP_NAME")
+                  else
+                    log "  ⚠️  Upload NOT found in Drive: $ZIP_NAME"
+                  fi
                   ((ZIP_COUNTER++))
                 fi
                 FILES_IN_CURRENT_ZIP=0
@@ -460,6 +467,12 @@ jobs:
             (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*) 2>&1 | tee -a "${BATCH_LOG}"
             log "🚀 Uploading final ZIP..."
             rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress 2>&1 | tee -a "${BATCH_LOG}"
+            if rclone lsf "gdrive:${FOLDER}/" --files-only 2>/dev/null | grep -qxF "$ZIP_NAME"; then
+              log "  ✅ Verified in Drive: $ZIP_NAME"
+              UPLOADED_ZIPS+=("$ZIP_NAME")
+            else
+              log "  ⚠️  Upload NOT found in Drive: $ZIP_NAME"
+            fi
           fi
 
           rm -rf "$TMP_ROOT"
@@ -469,8 +482,15 @@ jobs:
             echo "SUCCESS=$SUCCESS"
             echo "SKIPPED=$SKIPPED"
             echo "FAILED=$FAILED"
-            echo "ZIP_COUNT=$((ZIP_COUNTER - 1))"
+            echo "ZIP_COUNT=${#UPLOADED_ZIPS[@]}"
           } >> $GITHUB_OUTPUT
+          if (( ${#UPLOADED_ZIPS[@]} > 0 )); then
+            {
+              echo "ZIP_NAMES<<EOF"
+              printf '%s\n' "${UPLOADED_ZIPS[@]}"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          fi
 
           log ""
           log "🎉 PROCESSING COMPLETE"
@@ -478,7 +498,7 @@ jobs:
           log "   Success: $SUCCESS"
           log "   Skipped: $SKIPPED"
           log "   Failed:  $FAILED"
-          log "   ZIPs:    $((ZIP_COUNTER - 1))"
+          log "   ZIPs:    ${#UPLOADED_ZIPS[@]}"
 
       # ----------------------------------------------------------
       # 4. שלב סיום: רק מעביר outputs (רץ תמיד)
@@ -493,12 +513,20 @@ jobs:
           SKIPPED="${{ steps.batch_loop.outputs.SKIPPED }}"
           FAILED="${{ steps.batch_loop.outputs.FAILED }}"
           ZIP_COUNT="${{ steps.batch_loop.outputs.ZIP_COUNT }}"
+          ZIP_NAMES="${{ steps.batch_loop.outputs.ZIP_NAMES }}"
           
           echo "TOTAL=${TOTAL:-0}" >> $GITHUB_OUTPUT
           echo "SUCCESS=${SUCCESS:-0}" >> $GITHUB_OUTPUT
           echo "SKIPPED=${SKIPPED:-0}" >> $GITHUB_OUTPUT
           echo "FAILED=${FAILED:-0}" >> $GITHUB_OUTPUT
           echo "ZIP_COUNT=${ZIP_COUNT:-0}" >> $GITHUB_OUTPUT
+          if [[ -n "${ZIP_NAMES:-}" ]]; then
+            {
+              echo "ZIP_NAMES<<EOF"
+              echo "$ZIP_NAMES"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          fi
 
       # ----------------------------------------------------------
       # 5. 📧 שליחת אימייל סיכום (אופציונלי)
@@ -518,6 +546,7 @@ jobs:
           SKIPPED: ${{ steps.finalize.outputs.SKIPPED }}
           FAILED: ${{ steps.finalize.outputs.FAILED }}
           ZIP_COUNT: ${{ steps.finalize.outputs.ZIP_COUNT }}
+          ZIP_NAMES: ${{ steps.finalize.outputs.ZIP_NAMES }}
           JOB_STATUS: ${{ job.status }}
         run: |
           echo "📧 Preparing email..." | tee -a "${BATCH_LOG}"
@@ -553,6 +582,13 @@ jobs:
           BODY+="  • ⏭️ דולגו: ${SKIPPED:-0}\n"
           BODY+="  • ❌ נכשלו: ${FAILED:-0}\n"
           BODY+="  • 📦 קבצי ZIP שנוצרו: ${ZIP_COUNT:-0}\n"
+          if [[ -n "${ZIP_NAMES:-}" ]]; then
+            BODY+="\n📦 קבצים שהועלו לדרייב:\n"
+            while IFS= read -r zn; do
+              [[ -z "$zn" ]] && continue
+              BODY+="  • $zn\n"
+            done <<< "$ZIP_NAMES"
+          fi
 
           if [[ -f "${BATCH_LOG}" ]]; then
             BODY+="\n📋 זנב הלוג המלא (50 שורות אחרונות):\n"
