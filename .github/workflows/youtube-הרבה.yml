@@ -46,21 +46,21 @@ jobs:
         id: check_file
         run: |
           FILE="${{ github.event.inputs.urls_file }}"
-          echo "🔍 [PREPARE] Looking for file: $FILE"
-          echo "🔍 [PREPARE] Repo root contents:"
+          echo "[SEARCH] [PREPARE] Looking for file: $FILE"
+          echo "[SEARCH] [PREPARE] Repo root contents:"
           ls -la
-          echo "🔍 [PREPARE] File check:"
+          echo "[SEARCH] [PREPARE] File check:"
           if [[ -f "$FILE" ]]; then
             LINES=$(grep -cE '^https[OK]://' "$FILE" 2>/dev/null || echo 0)
-            echo "✅ [PREPARE] Found: $FILE ($LINES valid URLs)"
+            echo "[OK] [PREPARE] Found: $FILE ($LINES valid URLs)"
             echo "lines=$LINES" >> $GITHUB_OUTPUT
-            echo "🔍 [PREPARE] First 3 URLs:"
+            echo "[SEARCH] [PREPARE] First 3 URLs:"
             grep -E '^https[OK]://' "$FILE" | head -3 | sed 's/^/   /'
-            echo "🔍 [PREPARE] File size: $(wc -c < "$FILE") bytes"
-            echo "🔍 [PREPARE] File hex head:"
+            echo "[SEARCH] [PREPARE] File size: $(wc -c < "$FILE") bytes"
+            echo "[SEARCH] [PREPARE] File hex head:"
             head -c 200 "$FILE" | xxd | head -5
           else
-            echo "❌ [PREPARE] NOT FOUND: $FILE"
+            echo "[ERR] [PREPARE] NOT FOUND: $FILE"
             echo "lines=0" >> $GITHUB_OUTPUT
             exit 1
           fi
@@ -108,7 +108,7 @@ jobs:
           echo "Max files per ZIP: ${MAX_FILES_PER_ZIP}" >> "${BATCH_LOG}"
           echo "Max ZIP size (MB): ${MAX_ZIP_SIZE_MB}" >> "${BATCH_LOG}"
           echo "=====================================" >> "${BATCH_LOG}"
-          echo "✅ Persistent log initialized at ${BATCH_LOG}"
+          echo "[OK] Persistent log initialized at ${BATCH_LOG}"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -116,19 +116,19 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: |
-          echo "🔧 Installing system packages..." | tee -a "${BATCH_LOG}"
+          echo "[CFG] Installing system packages..." | tee -a "${BATCH_LOG}"
           curl -fsSL https://rclone.org/install.sh | sudo bash 2>&1 | tee -a "${BATCH_LOG}"
           sudo apt-get update -qq 2>&1 | tee -a "${BATCH_LOG}"
           # v10: ubuntu-24.04 comes with ffmpeg/zip/jq/curl/mediainfo/file/unzip pre-installed
           sudo apt-get install -y -qq msmtp msmtp-mta python3 python3-pip 2>&1 | tee -a "${BATCH_LOG}"
           pip3 install -q yt-dlp 2>&1 | tee -a "${BATCH_LOG}"
           for t in jq curl zip unzip mediainfo file msmtp ffmpeg; do command -v "$t" >/dev/null 2>&1 && echo "have: $t" || echo "no:   $t"; done
-          echo "✅ Dependencies ready" | tee -a "${BATCH_LOG}"
+          echo "[OK] Dependencies ready" | tee -a "${BATCH_LOG}"
 
       - name: Configure rclone
         shell: bash
         run: |
-          echo "🔧 Configuring rclone..." | tee -a "${BATCH_LOG}"
+          echo "[CFG] Configuring rclone..." | tee -a "${BATCH_LOG}"
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf <<EOF
           [gdrive]
@@ -136,9 +136,9 @@ jobs:
           scope = drive.file
           token = $RCLONE_GDRIVE_TOKEN
           EOF
-          echo "🔍 Testing rclone connection..." | tee -a "${BATCH_LOG}"
+          echo "[SEARCH] Testing rclone connection..." | tee -a "${BATCH_LOG}"
           rclone lsd gdrive: | head -5 2>&1 | tee -a "${BATCH_LOG}"
-          echo "✅ rclone configured" | tee -a "${BATCH_LOG}"
+          echo "[OK] rclone configured" | tee -a "${BATCH_LOG}"
 
       # ----------------------------------------------------------
       # 2. הכנת רשימת URLs
@@ -156,26 +156,26 @@ jobs:
           set -e
           URLS_FILE="/tmp/urls_list.txt"
           
-          echo "📝 Batch mode - reading URLs artifact"
+          echo "[NOTE] Batch mode - reading URLs artifact"
           ARTIFACT_PATH="/tmp/urls_input/${URLS_FILE_INPUT}"
           
-          echo "📥 Reading artifact..." | tee -a "${BATCH_LOG}"
+          echo "[DL] Reading artifact..." | tee -a "${BATCH_LOG}"
           
           if [[ -f "$ARTIFACT_PATH" ]]; then
-            echo "✅ Artifact found at $ARTIFACT_PATH" | tee -a "${BATCH_LOG}"
+            echo "[OK] Artifact found at $ARTIFACT_PATH" | tee -a "${BATCH_LOG}"
             grep -E '^https[OK]://' "$ARTIFACT_PATH" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > "$URLS_FILE"
             TOTAL=$(wc -l < "$URLS_FILE")
-            echo "📋 Total valid URLs parsed: $TOTAL" | tee -a "${BATCH_LOG}"
+            echo "[LIST] Total valid URLs parsed: $TOTAL" | tee -a "${BATCH_LOG}"
             echo "TOTAL=$TOTAL" >> $GITHUB_OUTPUT
             
             if [[ $TOTAL -eq 0 ]]; then
-              echo "⚠️ No valid URLs found in file!" | tee -a "${BATCH_LOG}"
-              echo "🔍 File content:" | tee -a "${BATCH_LOG}"
+              echo "[WARN] No valid URLs found in file!" | tee -a "${BATCH_LOG}"
+              echo "[SEARCH] File content:" | tee -a "${BATCH_LOG}"
               cat "$ARTIFACT_PATH" | tee -a "${BATCH_LOG}"
             fi
           else
-            echo "❌ URLs artifact not found at $ARTIFACT_PATH" | tee -a "${BATCH_LOG}"
-            echo "🔍 Contents of /tmp/urls_input:" | tee -a "${BATCH_LOG}"
+            echo "[ERR] URLs artifact not found at $ARTIFACT_PATH" | tee -a "${BATCH_LOG}"
+            echo "[SEARCH] Contents of /tmp/urls_input:" | tee -a "${BATCH_LOG}"
             ls -la /tmp/urls_input/ 2>&1 | tee -a "${BATCH_LOG}"
             echo "TOTAL=0" >> $GITHUB_OUTPUT
           fi
@@ -183,7 +183,7 @@ jobs:
           echo "urls_file=$URLS_FILE" >> $GITHUB_OUTPUT
 
       # ----------------------------------------------------------
-      # 3. 🚀 הלולאה הראשית — עם הגנה מלאה על קריסות
+      # 3. [UPLOAD] הלולאה הראשית — עם הגנה מלאה על קריסות
       # ----------------------------------------------------------
       - name: Process all URLs in loop (loader.to resolver)
         id: batch_loop
@@ -201,8 +201,8 @@ jobs:
           log() { echo "$@" | tee -a "${BATCH_LOG}"; }
 
           log ""
-          log "📁 Work dir: $TMP_ROOT"
-          log "📄 URLs file: $URLS_FILE"
+          log "[DIR] Work dir: $TMP_ROOT"
+          log "[FILE] URLs file: $URLS_FILE"
 
           URLS=()
           while IFS= read -r line; do
@@ -212,10 +212,10 @@ jobs:
           done < "$URLS_FILE"
 
           TOTAL=${#URLS[@]}
-          log "📋 Total valid URLs to process: $TOTAL"
+          log "[LIST] Total valid URLs to process: $TOTAL"
 
           if [[ $TOTAL -eq 0 ]]; then
-            log "⚠️ No valid URLs found."
+            log "[WARN] No valid URLs found."
             echo "TOTAL=0" >> $GITHUB_OUTPUT
             echo "SUCCESS=0" >> $GITHUB_OUTPUT
             echo "SKIPPED=0" >> $GITHUB_OUTPUT
@@ -262,7 +262,7 @@ jobs:
                 "https://p.savenow.to/ajax/download.php" 2>/dev/null)
             
             if ! jq -e . <<<"$r" >/dev/null 2>&1; then
-              echo "  ❌ Not JSON response: ${r:0:70}" >> "${BATCH_LOG}"
+              echo "  [ERR] Not JSON response: ${r:0:70}" >> "${BATCH_LOG}"
               return 1
             fi
             
@@ -271,7 +271,7 @@ jobs:
             du=$(jq -r '.url // .download_url // empty' <<<"$r")
             
             if [[ -z "$id" && "$du" != http* ]]; then
-              echo "  ❌ No job ID and no direct URL" >> "${BATCH_LOG}"
+              echo "  [ERR] No job ID and no direct URL" >> "${BATCH_LOG}"
               return 1
             fi
             
@@ -292,13 +292,13 @@ jobs:
                   return 0
                 fi
                 if [[ "$(jq -r '.progress // 0' <<<"$j")" == "1000" ]]; then
-                  echo "  ❌ Job failed: $(jq -c '{success,text,message}' <<<"$j" 2>/dev/null | head -c 70)" >> "${BATCH_LOG}"
+                  echo "  [ERR] Job failed: $(jq -c '{success,text,message}' <<<"$j" 2>/dev/null | head -c 70)" >> "${BATCH_LOG}"
                   return 1
                 fi
               fi
               sleep 3
             done
-            echo "  ❌ Timeout waiting for download URL" >> "${BATCH_LOG}"
+            echo "  [ERR] Timeout waiting for download URL" >> "${BATCH_LOG}"
             return 1
           }
           
@@ -358,7 +358,7 @@ jobs:
               return 0
             fi
 
-            echo "  ⚠️ not a video file -> body head:" >> "${BATCH_LOG}"
+            echo "  [WARN] not a video file -> body head:" >> "${BATCH_LOG}"
             head -c 600 "$WORK_DIR/dl.bin" 2>/dev/null | tr -c '[:print:]' '.'; echo >> "${BATCH_LOG}"
             rm -f "$WORK_DIR/dl.bin"
             return 1
@@ -387,17 +387,17 @@ jobs:
             DOWNLOADED_FILE=""
 
             for q in "${QS[@]}"; do
-              log "  🔄 Attempting quality: $q"
+              log "  [RETRY] Attempting quality: $q"
               RESOLVED=$(resolve_loaderto "$URL" "$q")
               if [[ "$RESOLVED" == http* ]]; then
-                log "  ✅ Resolved: ${RESOLVED:0:130}"
+                log "  [OK] Resolved: ${RESOLVED:0:130}"
                 DOWNLOADED_FILE=$(download_and_validate "$RESOLVED" "$URL" "$WORK_DIR")
                 if [[ -n "$DOWNLOADED_FILE" && -s "$DOWNLOADED_FILE" ]]; then
-                  log "  ✅ Downloaded: $(basename "$DOWNLOADED_FILE") ($(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || echo 0) bytes)"
+                  log "  [OK] Downloaded: $(basename "$DOWNLOADED_FILE") ($(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || echo 0) bytes)"
                   break
                 fi
               fi
-              log "  ❌ Failed at quality $q"
+              log "  [ERR] Failed at quality $q"
               sleep 5
             done
 
@@ -407,9 +407,9 @@ jobs:
               if (( CURRENT_ZIP_SIZE + FSIZE > MAX_ZIP_SIZE_MB * 1024 * 1024 )) || (( FILES_IN_CURRENT_ZIP >= MAX_FILES_PER_ZIP )); then
                 if (( FILES_IN_CURRENT_ZIP > 0 )); then
                   ZIP_NAME="${FOLDER}_part${ZIP_COUNTER}_$(date -u +%Y%m%d_%H%M%S).zip"
-                  log "🗜️  Creating ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
+                  log "[ZIP]  Creating ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
                   (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*) 2>&1 | tee -a "${BATCH_LOG}"
-                  log "🚀 Uploading to Drive..."
+                  log "[UPLOAD] Uploading to Drive..."
                   rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress 2>&1 | tee -a "${BATCH_LOG}"
                   ((ZIP_COUNTER++))
                 fi
@@ -431,16 +431,16 @@ jobs:
               ((CURRENT_ZIP_SIZE+=FSIZE))
               ((SUCCESS++))
             else
-              log "❌ All loader.to quality attempts failed for: $URL"
-              log "  🔄 Falling back to yt-dlp..."
+              log "[ERR] All loader.to quality attempts failed for: $URL"
+              log "  [RETRY] Falling back to yt-dlp..."
               YT_DLP_FILE=$(mktemp -p "$WORK_DIR" ytdlp_XXXXXX.mp4)
               yt-dlp --no-playlist -f "best[ext=mp4]/best" -o "$YT_DLP_FILE" "$URL" >> "${BATCH_LOG}" 2>&1
               YT_DLP_EXIT=$[OK]
               if [[ $YT_DLP_EXIT -eq 0 && -s "$YT_DLP_FILE" ]]; then
                 DOWNLOADED_FILE="$YT_DLP_FILE"
-                log "  ✅ yt-dlp downloaded: $(basename "$YT_DLP_FILE") ($(stat -c%s "$YT_DLP_FILE" 2>/dev/null || echo 0) bytes)"
+                log "  [OK] yt-dlp downloaded: $(basename "$YT_DLP_FILE") ($(stat -c%s "$YT_DLP_FILE" 2>/dev/null || echo 0) bytes)"
               else
-                log "  ❌ yt-dlp also failed (exit=$YT_DLP_EXIT)"
+                log "  [ERR] yt-dlp also failed (exit=$YT_DLP_EXIT)"
                 log "--- Last 10 lines of yt-dlp output ---"
                 tail -10 "${BATCH_LOG}" | tee -a "${BATCH_LOG}"
                 ((FAILED++))
@@ -456,9 +456,9 @@ jobs:
 
           if (( FILES_IN_CURRENT_ZIP > 0 )); then
             ZIP_NAME="${FOLDER}_part${ZIP_COUNTER}_$(date -u +%Y%m%d_%H%M%S).zip"
-            log "🗜️  Creating final ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
+            log "[ZIP]  Creating final ZIP: $ZIP_NAME ($FILES_IN_CURRENT_ZIP files, $(numfmt --to=iec $CURRENT_ZIP_SIZE))"
             (cd "$CURRENT_ZIP_DIR" && zip -j -q "$TMP_ROOT/$ZIP_NAME" ./*) 2>&1 | tee -a "${BATCH_LOG}"
-            log "🚀 Uploading final ZIP..."
+            log "[UPLOAD] Uploading final ZIP..."
             rclone copy "$TMP_ROOT/$ZIP_NAME" "gdrive:${FOLDER}/" --progress 2>&1 | tee -a "${BATCH_LOG}"
           fi
 
@@ -473,7 +473,7 @@ jobs:
           } >> $GITHUB_OUTPUT
 
           log ""
-          log "🎉 PROCESSING COMPLETE"
+          log "[DONE] PROCESSING COMPLETE"
           log "   Total:   $TOTAL"
           log "   Success: $SUCCESS"
           log "   Skipped: $SKIPPED"
@@ -545,23 +545,23 @@ jobs:
           BODY="סיכום עיבוד אצווה הושלם בסטטוס: ${JOB_STATUS}.\n\n"
           BODY+="🏃 Run: ${{ github.run_id }}\n"
           BODY+="📂 תיקייה בדרייב: ${{ github.event.inputs.folder }}\n"
-          BODY+="📄 קובץ לינקים: ${{ github.event.inputs.urls_file }}\n"
+          BODY+="[FILE] קובץ לינקים: ${{ github.event.inputs.urls_file }}\n"
           BODY+="🔗 לינק לריצה: $RUN_URL\n\n"
           BODY+="📊 סטטיסטיקות:\n"
           BODY+="  • סה\"כ לינקים: ${TOTAL:-0}\n"
-          BODY+="  • ✅ הצליחו: ${SUCCESS:-0}\n"
+          BODY+="  • [OK] הצליחו: ${SUCCESS:-0}\n"
           BODY+="  • ⏭️ דולגו: ${SKIPPED:-0}\n"
-          BODY+="  • ❌ נכשלו: ${FAILED:-0}\n"
+          BODY+="  • [ERR] נכשלו: ${FAILED:-0}\n"
           BODY+="  • 📦 קבצי ZIP שנוצרו: ${ZIP_COUNT:-0}\n"
 
           if [[ -f "${BATCH_LOG}" ]]; then
-            BODY+="\n📋 זנב הלוג המלא (50 שורות אחרונות):\n"
+            BODY+="\n[LIST] זנב הלוג המלא (50 שורות אחרונות):\n"
             TAIL_LOG=$(tail -50 "${BATCH_LOG}" 2>/dev/null | sed 's/^/  /')
             BODY+="$TAIL_LOG\n"
           fi
 
           echo -e "Subject: $SUBJECT\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nContent-Type: text/plain; charset=UTF-8\n\n$BODY" | msmtp -a gmail "$EMAIL_TO" 2>&1 | tee -a "${BATCH_LOG}"
-          echo "✅ Summary email sent" | tee -a "${BATCH_LOG}"
+          echo "[OK] Summary email sent" | tee -a "${BATCH_LOG}"
 
   # ==============================================================
   # 3️⃣  Job סיכום סופי
