@@ -1,0 +1,45 @@
+name: DIAG - list drive
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    env:
+      RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
+    steps:
+      - name: Install rclone
+        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [gdrive]
+          type = drive
+          scope = drive.file
+          token = $RCLONE_GDRIVE_TOKEN
+          EOF
+
+      - name: Show remote info
+        run: |
+          echo "===== rclone version ====="
+          rclone version | head -2 || true
+          echo "===== about (quota) ====="
+          rclone about gdrive: 2>&1 || true
+          echo "===== root dirs (json) ====="
+          rclone lsjson gdrive: --dirs-only --no-mimetype --no-modtime 2>&1 || true
+
+      - name: List MyUploads
+        run: |
+          echo "===== lsl gdrive:MyUploads/ ====="
+          rclone lsl "gdrive:MyUploads/" 2>&1 || true
+          echo "===== lsf gdrive:MyUploads/ ====="
+          rclone lsf "gdrive:MyUploads/" > /tmp/list.txt 2>&1 || true
+          cat /tmp/list.txt || true
+          echo "count: $(wc -l < /tmp/list.txt)"
+          echo "===== look for the zip ====="
+          grep -i "203555" /tmp/list.txt || echo "not found by name"
+          echo "===== size ====="
+          rclone size "gdrive:MyUploads/" 2>&1 || true
