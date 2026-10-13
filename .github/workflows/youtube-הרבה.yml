@@ -421,7 +421,7 @@ jobs:
 
               # Use video ID or title for filename
               if [[ -n "$TITLE" ]]; then
-                INTERNAL_NAME=$(printf '%s' "$TITLE" | tr '\r\n\t' '   ' | sed -E "$SANITIZE_PAT" | head -c 180)
+                INTERNAL_NAME=$(printf '%s' "$TITLE" | tr -d '\r\n\t' | sed -E "$SANITIZE_PAT" | head -c 180)
               else
                 INTERNAL_NAME="${VIDEO_ID:-video_$IDX}"
               fi
