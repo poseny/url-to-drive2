@@ -51,11 +51,11 @@ jobs:
           ls -la
           echo "🔍 [PREPARE] File check:"
           if [[ -f "$FILE" ]]; then
-            LINES=$(grep -cE '^https?://' "$FILE" 2>/dev/null || echo 0)
+            LINES=$(grep -cE '^https[OK]://' "$FILE" 2>/dev/null || echo 0)
             echo "✅ [PREPARE] Found: $FILE ($LINES valid URLs)"
             echo "lines=$LINES" >> $GITHUB_OUTPUT
             echo "🔍 [PREPARE] First 3 URLs:"
-            grep -E '^https?://' "$FILE" | head -3 | sed 's/^/   /'
+            grep -E '^https[OK]://' "$FILE" | head -3 | sed 's/^/   /'
             echo "🔍 [PREPARE] File size: $(wc -c < "$FILE") bytes"
             echo "🔍 [PREPARE] File hex head:"
             head -c 200 "$FILE" | xxd | head -5
@@ -163,7 +163,7 @@ jobs:
           
           if [[ -f "$ARTIFACT_PATH" ]]; then
             echo "✅ Artifact found at $ARTIFACT_PATH" | tee -a "${BATCH_LOG}"
-            grep -E '^https?://' "$ARTIFACT_PATH" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > "$URLS_FILE"
+            grep -E '^https[OK]://' "$ARTIFACT_PATH" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > "$URLS_FILE"
             TOTAL=$(wc -l < "$URLS_FILE")
             echo "📋 Total valid URLs parsed: $TOTAL" | tee -a "${BATCH_LOG}"
             echo "TOTAL=$TOTAL" >> $GITHUB_OUTPUT
@@ -208,7 +208,7 @@ jobs:
           while IFS= read -r line; do
             line=$(echo "$line" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             [[ -z "$line" ]] && continue
-            [[ "$line" =~ ^https?:// ]] && URLS+=("$line")
+            [[ "$line" =~ ^https[OK]:// ]] && URLS+=("$line")
           done < "$URLS_FILE"
 
           TOTAL=${#URLS[@]}
@@ -243,7 +243,7 @@ jobs:
             local f="$1"
             [[ -s "$f" ]] || return 1
             if command -v mediainfo >/dev/null 2>&1; then
-              mediainfo --Output=JSON "$f" 2>/dev/null | jq -e '.media.track[]? | select(."@type"? == "Video")' >/dev/null 2>&1 && return 0
+              mediainfo --Output=JSON "$f" 2>/dev/null | jq -e '.media.track[][OK] | select(."@type"[OK] == "Video")' >/dev/null 2>&1 && return 0
             fi
             file -b "$f" 2>/dev/null | grep -qiE 'ISO Media|Matroska|WebM|MP4|video' && return 0
             return 1
@@ -281,7 +281,7 @@ jobs:
             fi
             
             pu=$(jq -r '.progress_url // empty' <<<"$r")
-            [[ -z "$pu" ]] && pu="https://p.savenow.to/api/progress?id=$id"
+            [[ -z "$pu" ]] && pu="https://p.savenow.to/api/progress[OK]id=$id"
             
             for i in $(seq 1 40); do
               j=$(curl -sS -m 30 -A "$UA" -H 'Accept: application/json' "$pu" 2>/dev/null)
@@ -435,7 +435,7 @@ jobs:
               log "  🔄 Falling back to yt-dlp..."
               YT_DLP_FILE=$(mktemp -p "$WORK_DIR" ytdlp_XXXXXX.mp4)
               yt-dlp --no-playlist -f "best[ext=mp4]/best" -o "$YT_DLP_FILE" "$URL" >> "${BATCH_LOG}" 2>&1
-              YT_DLP_EXIT=$?
+              YT_DLP_EXIT=$[OK]
               if [[ $YT_DLP_EXIT -eq 0 && -s "$YT_DLP_FILE" ]]; then
                 DOWNLOADED_FILE="$YT_DLP_FILE"
                 log "  ✅ yt-dlp downloaded: $(basename "$YT_DLP_FILE") ($(stat -c%s "$YT_DLP_FILE" 2>/dev/null || echo 0) bytes)"
