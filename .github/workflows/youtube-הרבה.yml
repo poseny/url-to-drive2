@@ -323,7 +323,7 @@ jobs:
                      -o "$WORK_DIR/ad.html" -L --max-redirs 6 --max-time 30 \
                      -w '    walk http=%{http_code} eff=%{url_effective}\n' "$RESOLVED" 2>/dev/null
                 if [[ -s "$WORK_DIR/ad.html" && "$(stat -c%s "$WORK_DIR/ad.html")" -lt 5000 ]]; then
-                  echo "    ad page ($(stat -c%s "$WORK_DIR/ad.html")b): $(head -c 300 "$WORK_DIR/ad.html" | tr -c '[:print:]' '.'')" >> "${BATCH_LOG}"
+                  echo "    ad page ($(stat -c%s "$WORK_DIR/ad.html")b): $(head -c 300 "$WORK_DIR/ad.html" | tr -c '[:print:]' '.')" >> "${BATCH_LOG}"
                 fi
                 sleep 5
               done
@@ -421,11 +421,11 @@ jobs:
 
               # Use video ID or title for filename
               if [[ -n "$TITLE" ]]; then
-              if [[ -n "" ]]; then
-                INTERNAL_NAME=
+                INTERNAL_NAME=$(printf '%s' "$TITLE" | tr -d '\r\n\t' | sed 's/[^A-Za-z0-9._-]/_/g' | head -c 180)
               else
-                INTERNAL_NAME=""
+                INTERNAL_NAME="${VIDEO_ID:-video_$IDX}"
               fi
+              EXT="${DOWNLOADED_FILE##*.}"
               cp "$DOWNLOADED_FILE" "$CURRENT_ZIP_DIR/${INTERNAL_NAME}.${EXT}" 2>&1 | tee -a "${BATCH_LOG}"
               ((FILES_IN_CURRENT_ZIP++))
               ((CURRENT_ZIP_SIZE+=FSIZE))
