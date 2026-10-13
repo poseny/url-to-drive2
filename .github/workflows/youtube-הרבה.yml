@@ -421,11 +421,11 @@ jobs:
 
               # Use video ID or title for filename
               if [[ -n "$TITLE" ]]; then
-              if [[ -n "" ]]; then
-                INTERNAL_NAME=
+                INTERNAL_NAME=$(printf '%s' "$TITLE" | tr '\r\n\t' '   ' | sed -E "$SANITIZE_PAT" | head -c 180)
               else
-                INTERNAL_NAME=""
+                INTERNAL_NAME="${VIDEO_ID:-video_$IDX}"
               fi
+              EXT="${DOWNLOADED_FILE##*.}"
               cp "$DOWNLOADED_FILE" "$CURRENT_ZIP_DIR/${INTERNAL_NAME}.${EXT}" 2>&1 | tee -a "${BATCH_LOG}"
               ((FILES_IN_CURRENT_ZIP++))
               ((CURRENT_ZIP_SIZE+=FSIZE))
