@@ -423,8 +423,8 @@ jobs:
               if [[ -n "$TITLE" ]]; then
               if [[ -n "" ]]; then
                 INTERNAL_NAME=
-'s/[^A-Za-z0-9._-]/_/g'              else
-                INTERNAL_NAME="${VIDEO_ID:-video_$IDX}"
+              else
+                INTERNAL_NAME=""
               fi
               EXT="${DOWNLOADED_FILE##*.}"
               cp "$DOWNLOADED_FILE" "$CURRENT_ZIP_DIR/${INTERNAL_NAME}.${EXT}" 2>&1 | tee -a "${BATCH_LOG}"
