@@ -243,7 +243,7 @@ jobs:
             local f="$1"
             [[ -s "$f" ]] || return 1
             if command -v mediainfo >/dev/null 2>&1; then
-              mediainfo --Output=JSON "$f" 2>/dev/null | jq -e '.media.track[][OK] | select(."@type"[OK] == "Video")' >/dev/null 2>&1 && return 0
+              mediainfo --Output=JSON "$f" 2>/dev/null | jq -e '.media.track[]? | select(."@type"? == "Video")' >/dev/null 2>&1 && return 0
             fi
             file -b "$f" 2>/dev/null | grep -qiE 'ISO Media|Matroska|WebM|MP4|video' && return 0
             return 1
