@@ -268,6 +268,7 @@ jobs:
             fi
             
             TITLE=$(jq -r '.title // .info.title // empty' <<<"$r" 2>/dev/null)
+            [[ -n "$TITLE" ]] && printf '%s' "$TITLE" > "$TITLE_FILE"
             id=$(jq -r '.id // empty' <<<"$r")
             du=$(jq -r '.url // .download_url // empty' <<<"$r")
             
@@ -374,6 +375,7 @@ jobs:
             log "=========================================="
 
             WORK_DIR=$(mktemp -d -p "$TMP_ROOT")
+            TITLE_FILE="$WORK_DIR/title.txt"
             
             # Extract YouTube video ID if applicable (patterns from env to avoid YAML bracket parsing)
             VIDEO_ID=$(python3 "$GITHUB_WORKSPACE/.github/scripts/extract_youtube_id.py" "$URL" 2>/dev/null || python "$GITHUB_WORKSPACE/.github/scripts/extract_youtube_id.py" "$URL")
@@ -383,6 +385,7 @@ jobs:
             QLADDER='1080 720 480 360'
             read -ra QS <<< "$QLADDER"
             TITLE=""
+            : > "$TITLE_FILE"
 
             RESOLVED=""
             DOWNLOADED_FILE=""
@@ -390,6 +393,7 @@ jobs:
             for q in "${QS[@]}"; do
               log "  🔄 Attempting quality: $q"
               RESOLVED=$(resolve_loaderto "$URL" "$q")
+              TITLE=$(cat "$TITLE_FILE" 2>/dev/null || true)
               if [[ "$RESOLVED" == http* ]]; then
                 log "  ✅ Resolved: ${RESOLVED:0:130}"
                 DOWNLOADED_FILE=$(download_and_validate "$RESOLVED" "$URL" "$WORK_DIR")
