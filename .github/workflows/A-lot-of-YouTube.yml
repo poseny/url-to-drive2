@@ -1,4 +1,4 @@
-name: ניסוי23Download YouTube URLs from link.txt → Google Drive (Batch Zip)
+name: ניסויDownload YouTube URLs from link.txt → Google Drive (Batch Zip)
 
 on:
   workflow_dispatch:
@@ -455,6 +455,15 @@ jobs:
             echo "FAILED=$FAILED"
             echo "ZIP_COUNT=${#UPLOADED_ZIPS[@]}"
           } >> $GITHUB_OUTPUT
+          # Save to files for finalize step (avoids steps context warning)
+          echo "$TOTAL" > $RUNNER_TEMP/batch_TOTAL
+          echo "$SUCCESS" > $RUNNER_TEMP/batch_SUCCESS
+          echo "$SKIPPED" > $RUNNER_TEMP/batch_SKIPPED
+          echo "$FAILED" > $RUNNER_TEMP/batch_FAILED
+          echo "${#UPLOADED_ZIPS[@]}" > $RUNNER_TEMP/batch_ZIP_COUNT
+          if (( ${#UPLOADED_ZIPS[@]} > 0 )); then
+            printf '%s\n' "${UPLOADED_ZIPS[@]}" > $RUNNER_TEMP/batch_ZIP_NAMES
+          fi
           if (( ${#UPLOADED_ZIPS[@]} > 0 )); then
             {
               echo "ZIP_NAMES<<EOF"
@@ -479,12 +488,12 @@ jobs:
         if: always()
         shell: bash
         run: |
-          TOTAL="${{ steps.batch_loop.outputs.TOTAL }}"
-          SUCCESS="${{ steps.batch_loop.outputs.SUCCESS }}"
-          SKIPPED="${{ steps.batch_loop.outputs.SKIPPED }}"
-          FAILED="${{ steps.batch_loop.outputs.FAILED }}"
-          ZIP_COUNT="${{ steps.batch_loop.outputs.ZIP_COUNT }}"
-          ZIP_NAMES="${{ steps.batch_loop.outputs.ZIP_NAMES }}"
+          TOTAL="$(cat $RUNNER_TEMP/batch_TOTAL 2>/dev/null || echo 0)"
+          SUCCESS="$(cat $RUNNER_TEMP/batch_SUCCESS 2>/dev/null || echo 0)"
+          SKIPPED="$(cat $RUNNER_TEMP/batch_SKIPPED 2>/dev/null || echo 0)"
+          FAILED="$(cat $RUNNER_TEMP/batch_FAILED 2>/dev/null || echo 0)"
+          ZIP_COUNT="$(cat $RUNNER_TEMP/batch_ZIP_COUNT 2>/dev/null || echo 0)"
+          ZIP_NAMES="$(cat $RUNNER_TEMP/batch_ZIP_NAMES 2>/dev/null || true)"
           
           echo "TOTAL=${TOTAL:-0}" >> $GITHUB_OUTPUT
           echo "SUCCESS=${SUCCESS:-0}" >> $GITHUB_OUTPUT
@@ -503,7 +512,7 @@ jobs:
       # 5. 📧 שליחת אימייל סיכום (אופציונלי)
       # ----------------------------------------------------------
       - name: Send summary email
-        if: always() && env.EMAIL_PASSWORD != ''
+        if: always()
         shell: bash
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
