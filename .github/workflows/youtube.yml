@@ -23,14 +23,6 @@ on:
         options:
           - download
           - probe
-      subtitles:
-        description: "כתוביות עברית: hebrew = אם קיימות בעברית ייכנסו ל-ZIP, ואם לא — יתורגמו מהקיימות | none = בלי כתוביות"
-        required: false
-        default: "none"
-        type: choice
-        options:
-          - none
-          - hebrew
       quality:
         description: "איכות וידאו (best = מהגבוהה ביותר הזמינה ולמטה)"
         required: false
@@ -344,187 +336,6 @@ jobs:
             echo "success=false" >> "$GITHUB_OUTPUT"; echo "❌ no output file"
           fi
 
-      # ============================================================
-      # כתוביות עברית (אופציונלי) — דרך השירות המתווך (loader.to / p.savenow.to)
-      # ה-IP של גיטהב חסום ביוטיוב, אז לא משתמשים ב-yt-dlp.
-      # ל-service יש endpoint ייעודי לכתוביות (מתועד רשמית):
-      #   GET /ajax/subtitles?url=..&api=..&lang=he&format=srt
-      #   -> {success,id,progress_url} ואז poll עד progress=1000 + download_url
-      # זרימת ה-polling זהה ל-download.php שכבר עובד אצלנו.
-      # אין עברית אצל הספק -> מורידים en ומתרגם ע"י translate.googleapis.com.
-      # ============================================================
-      - name: Hebrew subtitles (optional)
-        id: subs
-        if: ${{ always() && !cancelled() && github.event.inputs.subtitles == 'hebrew' && github.event.inputs.mode == 'download' }}
-        shell: bash
-        env:
-          VIDEO_URL: ${{ github.event.inputs.url }}
-          VIDEO_ID: ${{ steps.res0.outputs.video_id }}
-        run: |
-          set +e; set +u; set -o pipefail
-          LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
-          SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
-          exec >> "$LOG_FILE" 2>&1
-          WORK="$RUNNER_TEMP/subwork"; SUBD="$RUNNER_TEMP/subtitles"
-          mkdir -p "$WORK" "$SUBD"
-          echo "subs=none" >> "$GITHUB_OUTPUT"
-          echo ""; echo "===== Hebrew subtitles (via savenow subtitles API) ====="
-          echo "video id = ${VIDEO_ID:-none} | url = ${VIDEO_URL:0:80}"
-
-          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-          SAVENOW_API='dfcb6d76f2f6a9894gjkege8a4ab232222'
-          SUB_URL=""; SRT=""; TRANSLATED="false"
-
-          row(){ printf '%s | %s | %s | %s | %s\n' "$1" "${2:--}" "${3:--}" "${4:--}" "${5:-fail}" >> "$SUMMARY_FILE"; }
-
-          # ---- שליחת job כתוביות לספק + polling (כמו p_loaderto, רק endpoint אחר) ----
-          sub_job(){
-            local lang="$1" r id du pu i j
-            echo "  subtitle job: lang=$lang format=srt"
-            r=$(curl -sS -m 45 -A "$UA" -H 'Accept: application/json' -H 'Referer: https://loader.to/' -G \
-                --data-urlencode "url=$VIDEO_URL" \
-                --data "api=$SAVENOW_API" --data "lang=$lang" --data "format=srt" \
-                "https://p.savenow.to/ajax/subtitles" 2>/dev/null)
-            if ! jq -e . <<<"$r" >/dev/null 2>&1; then
-              row "subs[$lang]" "-" "${r:0:70}" "" "not-json"; return 1
-            fi
-            id=$(jq -r '.id // empty' <<<"$r")
-            du=$(jq -r '.download_url // .url // empty' <<<"$r")
-            pu=$(jq -r '.progress_url // empty' <<<"$r")
-            [[ -z "$pu" && -n "$id" ]] && pu="https://p.savenow.to/ajax/progress.php?id=$id"
-            if [[ "$du" == http* ]]; then SUB_URL="$du"; row "subs[$lang]" "200" "direct url" "" "ok"; return 0; fi
-            [[ -z "$pu" ]] && { row "subs[$lang]" "-" "$(jq -c '{success,message,errors}' <<<"$r" 2>/dev/null | head -c 70)" "" "no-id"; return 1; }
-            echo "  job id=$id — polling..."
-            for i in $(seq 1 30); do
-              j=$(curl -sS -m 30 -A "$UA" -H 'Accept: application/json' "$pu" 2>/dev/null)
-              if jq -e . <<<"$j" >/dev/null 2>&1; then
-                du=$(jq -r '.download_url // empty' <<<"$j")
-                if [[ "$du" == http* ]]; then
-                  echo "  progress=1000 -> ${du:0:120}"
-                  SUB_URL="$du"; row "subs[$lang]" "200" "progress=1000" "" "ok"; return 0
-                fi
-                if [[ "$(jq -r '.progress // 0' <<<"$j")" == "1000" ]]; then
-                  row "subs[$lang]" "-" "$(jq -c '{success,text,message}' <<<"$j" 2>/dev/null | head -c 70)" "" "job-failed"
-                  return 1
-                fi
-              fi
-              sleep 3
-            done
-            row "subs[$lang]" "-" "timeout: ${j:0:60}" "" "no-url"; return 1
-          }
-
-          # ---- הורדת קובץ הכתוביות + ולידציה + תיקון VTT->SRT אם צריך ----
-          dl_sub(){
-            local f="$1" sz
-            curl -sS -L -m 120 -A "$UA" -e "https://loader.to/" -o "$f" "$SUB_URL" 2>>"$LOG_FILE"
-            sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
-            if [[ "$sz" -lt 20 ]]; then echo "  sub file too small ($sz b)"; rm -f "$f"; return 1; fi
-            # ספק יכול להחזיר VTT גם כשביקשנו srt — ממירים ל-SRT (נקודה -> פסיק בטיימינג, מסירים WEBVTT)
-            if head -c 6 "$f" | grep -q 'WEBVTT'; then
-              echo "  provider returned vtt — converting to srt"
-              sed -i -E '1{/^WEBVTT$/d}; /^[[:space:]]*$/d; /-->/ { s/\./,/g; s/^([^ ]+)[ ]*-->[ ]*([^ ]+).*$/\1 --> \2/; }' "$f"
-            fi
-            if ! grep -q -- '-->' "$f"; then echo "  not a subtitle file:"; head -c 200 "$f" | tr -c '[:print:]' '.'; echo; rm -f "$f"; return 1; fi
-            echo "  ✅ sub file: $f ($sz b)"; return 0
-          }
-
-          # ---- 1) ניסיון: כתוביות עברית אצל הספק ----
-          echo "trying native hebrew subs via savenow..."
-          if sub_job "he"; then
-            if dl_sub "$WORK/subs.he.srt"; then
-              SRT="$WORK/subs.he.srt"; TRANSLATED="false"
-            else SUB_URL=""; fi
-          fi
-
-          # ---- 2) אין עברית -> מורידים en מהספק ומתרגם לעברית ----
-          if [[ -z "$SRT" ]]; then
-            echo "no hebrew subs -> trying english source subs to translate..."
-            if sub_job "en" && dl_sub "$WORK/subs.en.srt"; then
-              SRT="$WORK/subs.en.srt"; TRANSLATED="true"
-              echo "source subs: $(basename "$SRT") — translating to hebrew..."
-            fi
-          fi
-
-          # ---- לא נמצאו כתוביות כלל / נשלחו אבל לא הורדו ----
-          if [[ -z "$SRT" ]]; then
-            echo "ℹ️ no usable subtitles from provider (he/en) — ממשיך בלי כתוביות"
-            printf 'subtitles | - | none-from-provider | - | skip\n' >> "$SUMMARY_FILE"
-            exit 0
-          fi
-
-          # ---- תרגום לעברית אם הכתוביות שהורדו אינן בעברית ----
-          if [[ "${TRANSLATED:-false}" == "true" ]]; then
-            python3 - "$SRT" "$WORK/sub.he.srt" <<'PY'
-          import re, json, sys, time, urllib.parse, urllib.request
-
-          src, dst = sys.argv[1], sys.argv[2]
-
-          def translate(text):
-              """תרגום חינמי בלי מפתח API (gtx client). מחזיר None בכשל."""
-              if not text.strip():
-                  return text
-              qs = urllib.parse.urlencode({"client": "gtx", "sl": "auto",
-                                           "tl": "he", "dt": "t", "q": text})
-              for attempt in range(3):
-                  try:
-                      req = urllib.request.Request(
-                          "https://translate.googleapis.com/translate_a/single?" + qs,
-                          headers={"User-Agent": "Mozilla/5.0"})
-                      with urllib.request.urlopen(req, timeout=20) as r:
-                          data = json.loads(r.read().decode("utf-8"))
-                      return "".join(seg[0] for seg in data[0] if seg and seg[0])
-                  except Exception as e:
-                      print("  translate attempt %d failed: %s" % (attempt + 1, e))
-                  time.sleep(2 * (attempt + 1))
-              return None
-
-          raw = open(src, encoding="utf-8-sig", errors="replace").read()
-          # blok srt: מזהה / זמן / שורות טקסט, מופרד בריק
-          blocks = re.split(r"\n\s*\n", raw.strip())
-          out, ok, fail = [], 0, 0
-          for b in blocks:
-              lines = [l for l in b.splitlines() if l.strip()]
-              if not lines:
-                  continue
-              ti = next((i for i, l in enumerate(lines) if "-->" in l), None)
-              if ti is None:
-                  continue
-              timing = lines[ti]
-              text_lines = lines[ti + 1:]
-              text = " ".join(text_lines).strip()
-              if not text:
-                  continue
-              tr = translate(text)
-              if tr is None:
-                  fail += 1
-                  continue
-              out.append("%s\n%s\n%s\n" % (lines[ti - 1] if ti > 0 else str(len(out) + 1),
-                                           timing, tr.replace("\n", " ")))
-              ok += 1
-              time.sleep(0.3)  # אל נעמיס על מנוע התרגום
-          if ok == 0:
-              print("translation failed entirely (%d blocks)" % fail)
-              sys.exit(1)
-          open(dst, "w", encoding="utf-8").write("\n\n".join(out) + "\n")
-          print("translated %d cues (%d failed)" % (ok, fail))
-          PY
-            if [[ -s "$WORK/sub.he.srt" ]] && grep -q -- '-->' "$WORK/sub.he.srt"; then
-              SRT="$WORK/sub.he.srt"
-            else
-              echo "⚠️ hebrew translation failed — לא מצרפים כתוביות"
-              printf 'subtitles | - | translate-failed | - | fail\n' >> "$SUMMARY_FILE"
-              exit 0
-            fi
-          else
-            echo "✅ native hebrew subs from provider"
-          fi
-
-          cp "$SRT" "$SUBD/subs.srt"
-          echo "subs=$SUBD/subs.srt" >> "$GITHUB_OUTPUT"
-          echo "subs_translated=$TRANSLATED" >> "$GITHUB_OUTPUT"
-          echo "✅ subtitles ready ($(stat -c%s "$SUBD/subs.srt") bytes, translated=$TRANSLATED)"
-          printf 'subtitles | 200 | %s | translated=%s | SUCCESS\n' "$(basename "$SRT")" "$TRANSLATED" >> "$SUMMARY_FILE"
-
       - name: Zip and upload to Drive
         id: upload
         if: ${{ always() && !cancelled() && steps.verify.outputs.success == 'true' }}
@@ -535,8 +346,6 @@ jobs:
           USER_FILENAME: ${{ github.event.inputs.filename }}
           TITLE: ${{ steps.res0.outputs.title }}
           VIDEO_ID: ${{ steps.res0.outputs.video_id }}
-          SUBS_FILE: ${{ steps.subs.outputs.subs }}
-          SUBS_TRANSLATED: ${{ steps.subs.outputs.subs_translated }}
         run: |
           set +e; set +u
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"
@@ -551,14 +360,6 @@ jobs:
           [[ -n "$BASE_NAME" ]] || BASE_NAME="video"
           ZIP_NAME="${BASE_NAME}.zip"; ZIP_FILE="$TMP_DIR/$ZIP_NAME"; INNER_FILE="$TMP_DIR/$BASE_NAME.$INPUT_EXT"
           cp "$INPUT_FILE" "$INNER_FILE"; zip -j -q "$ZIP_FILE" "$INNER_FILE"
-          # כתוביות עברית — אם שלב הכתוביות הצליח, מצרפים את קובץ ה-SRT ל-ZIP
-          # שם הקובץ: <base>.he.srt אם מתורגם, <base>.he.original.srt אם מקורו כבר בעברית
-          if [[ -n "${SUBS_FILE:-}" && -s "$SUBS_FILE" ]]; then
-            if [[ "${SUBS_TRANSLATED:-false}" == "true" ]]; then SUBS_INNER="$TMP_DIR/$BASE_NAME.he.srt"
-            else SUBS_INNER="$TMP_DIR/$BASE_NAME.he.original.srt"; fi
-            cp "$SUBS_FILE" "$SUBS_INNER" && zip -j -q "$ZIP_FILE" "$SUBS_INNER"
-            echo "subtitles added to zip: $(basename "$SUBS_INNER")"
-          fi
           if [[ ! -s "$ZIP_FILE" ]]; then echo "STATUS=failed" >> "$GITHUB_OUTPUT"; exit 0; fi
           REMOTE_PATH="gdrive:${FOLDER}/${ZIP_NAME}"
           echo "upload -> $REMOTE_PATH"
@@ -585,17 +386,10 @@ jobs:
           FILE_NAME: ${{ steps.upload.outputs.FILE_NAME }}
           FILE_SIZE: ${{ steps.upload.outputs.FILE_SIZE }}
           MODE: ${{ github.event.inputs.mode }}
-          SUBTITLES: ${{ github.event.inputs.subtitles }}
-          SUBS_TRANSLATED: ${{ steps.subs.outputs.subs_translated }}
         run: |
           set +e; set +u
           LOG_FILE="$RUNNER_TEMP/workflow_log.txt"; SUMMARY_FILE="$RUNNER_TEMP/instance_summary.txt"
           [[ -z "${EMAIL_PASSWORD:-}" ]] && { echo "EMAIL_PASSWORD empty"; exit 0; }
-          if [[ "${SUBTITLES:-none}" != "hebrew" ]]; then SUBS_LINE="ללא (subtitles=none)"
-          elif [[ "${SUBS_TRANSLATED:-}" == "true" ]]; then SUBS_LINE="✅ כתוביות עברית (תורגמו מהמקור)"
-          elif [[ "${SUBS_TRANSLATED:-}" == "false" ]]; then SUBS_LINE="✅ כתוביות עברית (קיימות)"
-          else SUBS_LINE="⚠️ לא צורפו (אין כתוביות / תרגום נכשל — ר' לוג)"
-          fi
           mkdir -p "$HOME/.msmtp"
           cat > "$HOME/.msmtprc" <<EOF
           defaults
@@ -627,7 +421,6 @@ jobs:
             printf 'Content-Type: text/plain; charset=UTF-8\n\n'; printf '%s\n\n' "$INTRO"
             printf 'מקור: %s\n' '${{ github.event.inputs.url }}'
             printf 'Run: %s (%s) | mode: %s | quality: %s\n' '${{ github.run_id }}' '${{ github.run_number }}' "$MODE" '${{ github.event.inputs.quality }}'
-            printf 'כתוביות עברית: %s\n' "$SUBS_LINE"
             printf 'זמן: %s\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             printf '%s\n' '===== STEPS (ריק = השלב לא רץ) ====='
             printf 'init       = %s\n' '${{ steps.init.outputs.init }}'
