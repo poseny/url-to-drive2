@@ -288,11 +288,12 @@ jobs:
             local R CODE CT EFF SZ EXT jar="$WORK_DIR/cookies.txt"
             
             echo "  downloading: ${RESOLVED:0:140}" >> "${BATCH_LOG}"
-            R=$(curl -sS -L --max-redirs 8 --max-time 1800 -A "$UA" -e "$VIDEO_URL" -c "$jar" -b "$jar" \
+            R=$(curl -sS -L --max-redirs 8 --max-time 1800 -A "$UA" -e "https://gendownload.com/" -H "Referer: https://gendownload.com/" -c "$jar" -b "$jar" \
                 -o "$WORK_DIR/dl.bin" -w '%{http_code}|%{content_type}|%{url_effective}' "$RESOLVED" 2>>"${BATCH_LOG}")
             IFS='|' read -r CODE CT EFF <<< "$R"
             SZ=$(stat -c%s "$WORK_DIR/dl.bin" 2>/dev/null || echo 0)
             echo "  http=$CODE ct=$CT bytes=$SZ eff=${EFF:0:110}" >> "${BATCH_LOG}"
+            echo "  body head: $(head -c 200 "$WORK_DIR/dl.bin" 2>/dev/null | tr -c [:print:] .)" >> "${BATCH_LOG}"
 
             # GenDownload streams directly (no ad walk needed)
 
