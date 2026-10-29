@@ -182,10 +182,9 @@ jobs:
           
           echo "urls_file=$URLS_FILE" >> $GITHUB_OUTPUT
 
+      # 3. Main loop
       # ----------------------------------------------------------
-      # 3. 🚀 הלולאה הראשית — עם הגנה מלאה על קריסות
-      # ----------------------------------------------------------
-      - name: Process all URLs in loop (loader.to resolver)
+      - name: Process all URLs in loop
         id: batch_loop
         shell: bash
         run: |
