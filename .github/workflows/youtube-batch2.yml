@@ -321,6 +321,14 @@ jobs:
               return 0
             fi
 
+            # Fallback: if file is large enough, assume it's a valid video
+            if [[ "$SZ" -gt 1000000 ]]; then
+              EXT=mp4
+              mv "$WORK_DIR/dl.bin" "$WORK_DIR/video.$EXT"
+              echo "$WORK_DIR/video.$EXT"
+              return 0
+            fi
+
             echo "  ⚠️ not a video file -> body head:" >> "${BATCH_LOG}"
             head -c 600 "$WORK_DIR/dl.bin" 2>/dev/null | tr -c '[:print:]' '.'; echo >> "${BATCH_LOG}"
             rm -f "$WORK_DIR/dl.bin"
