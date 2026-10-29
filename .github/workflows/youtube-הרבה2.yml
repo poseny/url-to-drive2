@@ -1,4 +1,4 @@
-name: ניסוייםDownload YouTube URLs from link.txt → Google Drive (Batch Zip)
+name: ניסוי23Download YouTube URLs from link.txt → Google Drive (Batch Zip)
 
 on:
   workflow_dispatch:
