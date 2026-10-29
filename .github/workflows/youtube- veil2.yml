@@ -188,7 +188,6 @@ jobs:
       - name: Process all URLs in loop (loader.to resolver)
         id: batch_loop
         shell: bash
-        env:
         run: |
           set +e
           set +o pipefail
