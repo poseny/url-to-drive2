@@ -1,0 +1,128 @@
+name: הורדת קבצים ענקיים Upload URL → Google Drive (Zip via temporary file, chunked)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "כתובת URL של הקובץ להורדה"
+        required: true
+        default: "https://upload.wikimedia.org/wikipedia/commons/d/d6/Her_First_Kiss_%281919%29.webm"
+      folder:
+        description: "תיקיית יעד ב‑Drive (ללא שם קובץ)"
+        required: true
+        default: "MyUploads"
+      filename:
+        description: "שם קובץ לפני .zip (אם ריק – ייקח משם הקובץ ב‑URL)"
+        required: false
+        default: ""
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: Write rclone config
+        env:
+          RCLONE_GDRIVE_TOKEN: ${{ secrets.RCLONE_GDRIVE_TOKEN }}
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [gdrive]
+          type = drive
+          scope = drive.file
+          token = $RCLONE_GDRIVE_TOKEN
+          EOF
+
+      - name: Determine file names
+        id: names
+        env:
+          FILE_URL: ${{ github.event.inputs.url }}
+          USER_NAME: ${{ github.event.inputs.filename }}
+        run: |
+          set -e
+          raw_name=$(basename "$FILE_URL")
+          raw_name=${raw_name%%\?*}
+          decoded_name=$(printf '%b' "$(echo -e "${raw_name//%/\\x}")")
+          echo "Decoded name from URL = $decoded_name"
+          if [[ -n "$USER_NAME" ]]; then
+            base_name="$USER_NAME"
+          else
+            base_name="${decoded_name%.*}"
+          fi
+          zip_name="${base_name}.zip"
+          original_name="$decoded_name"
+          echo "ZIP name on Drive      = $zip_name"
+          echo "Internal file name     = $original_name"
+          remote_path="gdrive:${{ github.event.inputs.folder }}/$zip_name"
+          echo "zip_name=$zip_name"          >> $GITHUB_OUTPUT
+          echo "original_name=$original_name" >> $GITHUB_OUTPUT
+          echo "remote_path=$remote_path"    >> $GITHUB_OUTPUT
+          echo "folder=${{ github.event.inputs.folder }}" >> $GITHUB_OUTPUT
+
+      - name: Download in chunks (7 GB) -> zip each -> upload (wait for 7GB free on Drive)
+        env:
+          FILE_URL: ${{ github.event.inputs.url }}
+          ORIGINAL_NAME: ${{ steps.names.outputs.original_name }}
+          FOLDER: ${{ github.event.inputs.folder }}
+          BASE_NAME: ${{ steps.names.outputs.zip_name }}
+        run: |
+          set -e
+          set -o pipefail
+
+          wait_for_space() {
+            local need=$((7*1024*1024*1024))
+            while true; do
+              free=$(rclone about gdrive: --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('free',0))" 2>/dev/null || echo 0)
+              if [ "$free" -ge "$need" ]; then
+                echo "Drive has $((free/1024/1024/1024)) GB free >= 7 GB. Proceeding."
+                break
+              fi
+              echo "Drive free space = $((free/1024/1024/1024)) GB < 7 GB. Waiting 5 minutes..."
+              sleep 300
+            done
+          }
+
+          TMP_DIR=$(mktemp -d)
+          echo "Working directory = $TMP_DIR"
+
+          TOTAL=$(curl -sI -L "$FILE_URL" | grep -i '^content-length:' | tail -1 | awk '{print $2}' | tr -d '\r')
+          if [[ -z "$TOTAL" ]]; then
+            echo "Could not determine file size"; exit 1
+          fi
+          echo "Total size = $TOTAL bytes"
+
+          CHUNK=$((7*1024*1024*1024))
+          PART=0
+          OFF=0
+          while [ "$OFF" -lt "$TOTAL" ]; do
+            END=$((OFF + CHUNK - 1))
+            [ "$END" -ge "$((TOTAL-1))" ] && END=$((TOTAL-1))
+            CHUNK_FILE="${TMP_DIR}/part_${PART}.bin"
+            ZIP_FILE="${TMP_DIR}/part_${PART}.zip"
+
+            echo "Downloading bytes ${OFF}-${END} -> ${CHUNK_FILE}"
+            curl -L -s -r ${OFF}-${END} -o "$CHUNK_FILE" "$FILE_URL"
+            if [[ ! -s "$CHUNK_FILE" ]]; then
+              echo "Download of part $PART failed"; exit 1
+            fi
+
+            echo "Zipping part $PART"
+            cp "$CHUNK_FILE" "${TMP_DIR}/${ORIGINAL_NAME}.part${PART}"
+            (cd "$TMP_DIR" && zip -j -q "$ZIP_FILE" "${ORIGINAL_NAME}.part${PART}")
+
+            wait_for_space
+            PART_REMOTE="gdrive:${FOLDER}/${ORIGINAL_NAME}.part${PART}.zip"
+            echo "Uploading part $PART to ${PART_REMOTE}"
+            rclone copyto "$ZIP_FILE" "$PART_REMOTE" --progress
+
+            rm -f "$CHUNK_FILE" "$ZIP_FILE" "${TMP_DIR}/${ORIGINAL_NAME}.part${PART}"
+
+            OFF=$((END + 1))
+            PART=$((PART + 1))
+          done
+
+          rm -rf "$TMP_DIR"
+          echo "Finished - all parts uploaded as separate ZIPs"
