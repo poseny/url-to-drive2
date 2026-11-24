@@ -1,5 +1,5 @@
 # .github/workflows/upload-url-to-drive.yml
-name: הורדת דפים + פקדים מלאים הכוללת טעינת כל הסרטונים (MHTML → ZIP → Google Drive)
+name: הורדת דפים מלאים + פקדים הכוללת טעינת כל הסרטונים (MHTML → ZIP → Google Drive)
 
 # מוריד דף אינטרנט אחרי שטען את כל הסרטונים על ידי גלילה עד הסוף,
 # ומעלה אותו ל-Google Drive כקובץ MHTML דחוס ל-ZIP.
