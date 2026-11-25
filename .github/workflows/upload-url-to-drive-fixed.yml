@@ -162,7 +162,7 @@ jobs:
             npm install puppeteer@22 --omit=dev > /dev/null 2>&1
 
             # ---- סקריפט Puppeteer: המתנה לכפתור הורדה + לכידת MHTML ----
-            cat > save-mhtml.js <<'ENDOFSCRIPT'
+          cat > save-mhtml.js <<'ENDOFSCRIPT'
           const puppeteer = require('puppeteer');
           const fs = require('fs');
 
