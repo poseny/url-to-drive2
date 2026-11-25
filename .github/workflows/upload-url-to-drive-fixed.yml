@@ -1,22 +1,22 @@
 # .github/workflows/upload-url-to-drive.yml
 name: הורדת דפים מלאים + פקדים הכוללת טעינת כל הסרטונים (MHTML → ZIP → Google Drive)
 
-# ׳׳•׳¨׳™׳“ ׳“׳£ ׳׳™׳ ׳˜׳¨׳ ׳˜ ׳׳—׳¨׳™ ׳©׳˜׳¢׳ ׳׳× ׳›׳ ׳”׳¡׳¨׳˜׳•׳ ׳™׳ ׳¢׳ ׳™׳“׳™ ׳’׳׳™׳׳” ׳¢׳“ ׳”׳¡׳•׳£,
-# ׳•׳׳¢׳׳” ׳׳•׳×׳• ׳-Google Drive ׳›׳§׳•׳‘׳¥ MHTML ׳“׳—׳•׳¡ ׳-ZIP.
+# מוריד דף אינטרנט אחרי שטען את כל הסרטונים על ידי גלילה עד הסוף,
+# ומעלה אותו ל-Google Drive כקובץ MHTML דחוס ל-ZIP.
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "׳›׳×׳•׳‘׳× ׳”-URL ׳©׳ ׳”׳“׳£ ׳׳• ׳”׳§׳•׳‘׳¥ ׳׳”׳•׳¨׳“׳”"
+        description: "כתובת ה-URL של הדף או הקובץ להורדה"
         required: true
         default: "https://commons.wikimedia.org/w/index.php?title=Special%3AMediaSearch&search=home&type=video"
       folder:
-        description: "׳×׳™׳§׳™׳™׳× ׳™׳¢׳“ ׳‘ג€‘Drive (׳׳׳ ׳©׳ ׳§׳•׳‘׳¥)"
+        description: "תיקיית יעד ב‑Drive (ללא שם קובץ)"
         required: true
         default: "MyUploads"
       filename:
-        description: "׳©׳ ׳§׳•׳‘׳¥ ׳׳₪׳ ׳™ .zip (׳׳ ׳¨׳™׳§ ג€“ ׳™׳™׳§׳— ׳׳©׳ ׳”׳§׳•׳‘׳¥ ׳‘ג€‘URL)"
+        description: "שם קובץ לפני .zip (אם ריק – ייקח משם הקובץ ב‑URL)"
         required: false
         default: ""
 
@@ -27,16 +27,15 @@ jobs:
       contents: read
     steps:
       # --------------------------------------------------------------
-      # 1ן¸גƒ£  ׳”׳×׳§׳ ׳× ׳›׳׳™ ׳¢׳‘׳•׳“׳” + msmtp
+      # 1️⃣  התקנת כלי עבודה + msmtp
       # --------------------------------------------------------------
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq rclone chromium-browser zip curl msmtp msmtp-mta > /dev/null
-          echo "ג… Dependencies installed"
-
+          echo "✅ Dependencies installed"
       # --------------------------------------------------------------
-      # 2ן¸גƒ£  ׳§׳•׳ ׳₪׳™׳’ rclone
+      # 2️⃣  קונפיג rclone
       # --------------------------------------------------------------
       - name: Write rclone config
         env:
@@ -49,10 +48,10 @@ jobs:
           scope = drive.file
           token = $RCLONE_GDRIVE_TOKEN
           EOF
-          echo "ג… rclone configured"
+          echo "✅ rclone configured"
 
       # --------------------------------------------------------------
-      # 3ן¸גƒ£  ׳—׳™׳©׳•׳‘ ׳©׳׳•׳× ׳•׳§׳‘׳™׳¢׳× ׳¡׳•׳’ ׳”׳×׳•׳›׳
+      # 3️⃣  חישוב שמות וקביעת סוג התוכן
       # --------------------------------------------------------------
       - name: Determine file names and type
         id: names
@@ -65,7 +64,7 @@ jobs:
           raw_name=$(basename "$FILE_URL")
           raw_name=${raw_name%%\?*}
           decoded_name=$(printf '%b' "$(echo -e "${raw_name//%/\\x}")")
-          echo "נ”₪ Decoded name from URL = $decoded_name"
+          echo "🔤 Decoded name from URL = $decoded_name"
 
           is_html=false
           content_type=$(curl -sI -L "$FILE_URL" | grep -i '^content-type:' | head -1 | cut -d' ' -f2- | tr -d '\r')
@@ -98,28 +97,28 @@ jobs:
           echo "remote_path=$remote_path" >> $GITHUB_OUTPUT
           echo "base_name=$base_name" >> $GITHUB_OUTPUT
 
-          echo "נ“¦ ZIP name on Drive      = $zip_name"
-          echo "נ“ Internal file name     = $original_name"
-          echo "נ Is HTML page          = $is_html"
+          echo "📦 ZIP name on Drive      = $zip_name"
+          echo "📁 Internal file name     = $original_name"
+          echo "🌐 Is HTML page          = $is_html"
 
       # --------------------------------------------------------------
-      # 4ן¸גƒ£  ׳׳—׳™׳§׳× ׳§׳•׳‘׳¥ ׳§׳™׳™׳
+      # 4️⃣  מחיקת קובץ קיים
       # --------------------------------------------------------------
       - name: Delete old ZIP if exists
         env:
           REMOTE_PATH: ${{ steps.names.outputs.remote_path }}
         run: |
           if rclone lsf "$REMOTE_PATH" > /dev/null 2>&1; then
-            echo "נ—‘ן¸ Deleting previous $REMOTE_PATH"
+            echo "🗑️ Deleting previous $REMOTE_PATH"
             rclone delete "$REMOTE_PATH"
           else
-            echo "ג… No previous ZIP found"
+            echo "✅ No previous ZIP found"
           fi
 
       # --------------------------------------------------------------
-      # 5ן¸גƒ£  ׳”׳•׳¨׳“׳” / ׳׳›׳™׳“׳× ׳“׳£ ג†’ ZIP ג†’ ׳”׳¢׳׳׳”
+      # 5️⃣  הורדה / לכידת דף → ZIP → העלאה
       # --------------------------------------------------------------
-      - name: ׳”׳•׳¨׳“׳× ׳“׳£ ׳׳׳ (׳׳׳—׳¨ ׳˜׳¢׳™׳ ׳× ׳›׳ ׳”׳¡׳¨׳˜׳•׳ ׳™׳) ג†’ ZIP ג†’ ׳”׳¢׳׳׳” ׳-Drive
+      - name: הורדת דף מלא (לאחר טעינת כל הסרטונים) → ZIP → העלאה ל-Drive
         id: process
         env:
           FILE_URL: ${{ github.event.inputs.url }}
@@ -141,66 +140,28 @@ jobs:
           LOG_FILE="$RUNNER_TEMP/process.log"
           exec > >(tee -a "$LOG_FILE") 2>&1
 
-          echo "נ€ Starting process at $(date)"
+          echo "🚀 Starting process at $(date)"
           echo "URL: $FILE_URL"
           echo "Is HTML: $IS_HTML"
           echo "Log file: $LOG_FILE"
 
           TMP_DIR=$(mktemp -d)
           TMP_ZIP="${TMP_DIR}/${ZIP_NAME}"
-          echo "נ“‚ Working directory = $TMP_DIR"
+          echo "📂 Working directory = $TMP_DIR"
 
           if [[ "$IS_HTML" == "true" ]]; then
             MHTML_FILE="${TMP_DIR}/${ORIGINAL_NAME}"
-            echo "נ ׳׳•׳¨׳™׳“ ׳׳× ׳”׳“׳£ ׳•׳©׳•׳׳¨ ׳׳•׳×׳• ׳›-MHTML ׳׳—׳¨׳™ ׳˜׳¢׳™׳ ׳× ׳›׳ ׳”׳¡׳¨׳˜׳•׳ ׳™׳ (Puppeteer/Node.js)..."
-            echo "ג³ ׳’׳•׳׳׳™׳ ׳¢׳“ ׳×׳—׳×׳™׳× ׳”׳“׳£ ׳¢׳“ ׳©׳›׳ ׳”׳×׳•׳¦׳׳•׳× ׳ ׳˜׳¢׳ ׳•."
+            echo "🌐 מוריד את הדף ושומר אותו כ-MHTML אחרי טעינת תוכן דינמי (Puppeteer/Node.js)..."
+            echo "⏳ ממתין לכפתור הורדה ולטעינה מלאה של העמוד..."
 
-            # ---- ׳”׳×׳§׳ ׳× Node.js + Puppeteer ----
+            # ---- התקנת Node.js + Puppeteer ----
             curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
             sudo apt-get install -y -qq nodejs > /dev/null
             cd "$TMP_DIR"
             npm init -y > /dev/null
             npm install puppeteer@22 --omit=dev > /dev/null 2>&1
 
-            # ---- ׳¡׳§׳¨׳™׳₪׳˜ Puppeteer: ׳’׳׳™׳׳” ׳¢׳“ ׳¡׳•׳£ ׳”׳×׳•׳¦׳׳•׳× + ׳›׳₪׳×׳•׳¨ "Load more" ----
-          const downloadSelectors = [
-            'a.download-link',
-            'a.start-download',
-            'button.download-btn',
-            'button.start-download',
-            '.download-btn',
-            '.btn-download',
-            '[class*=\"download\"][class*=\"btn\"]',
-            'a[href*=\"download\"]',
-            'button[class*=\"download\"]'
-          ];
-          // Try to find and click download button using selectors
-          const clickDownloadButton = async () => {
-            for (const sel of downloadSelectors) {
-              try {
-                const btn = await page.waitForSelector(sel, { timeout: 8000 });
-                if (btn) {
-                  await btn.click();
-                  console.log('Clicked download button using selector: ' + sel);
-                  return true;
-                }
-              } catch (e) {
-                continue;
-              }
-            }
-            // Fallback: search by text containing download words
-            const found = await page.evaluate(() => {
-              const btns = Array.from(document.querySelectorAll('button, a'));
-              return btns.find(b => /download|הורד|התחל הורדה|start download/i.test(b.textContent || ''));
-            });
-            if (found) {
-              await found.click();
-              console.log('Clicked download button using text match');
-              return true;
-            }
-            return false;
-          };
-          clickDownloadButton();
+            # ---- סקריפט Puppeteer: המתנה לכפתור הורדה + לכידת MHTML ----
             cat > save-mhtml.js <<'ENDOFSCRIPT'
           const puppeteer = require('puppeteer');
           const fs = require('fs');
@@ -211,283 +172,284 @@ jobs:
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
           (async () => {
-            const browser = await puppeteer.launch({
-              headless: 'shell',
-              args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-web-security',
-                '--disable-features=VizDisplayCompositor',
-                '--single-process',
-                '--no-zygote'
-              ]
-            });
+          const browser = await puppeteer.launch({
+          headless: 'new',
+          args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--disable-gpu',
+          '--disable-blink-features=AutomationControlled',
+          '--disable-web-security',
+          '--disable-features=IsolateOrigins,site-per-process'
+          ]
+          });
 
-            try {
-              const page = await browser.newPage();
+          try {
+          const page = await browser.newPage();
 
-              // ---- ׳—׳¡׳™׳׳” ׳¡׳׳§׳˜׳™׳‘׳™׳×: ׳¨׳§ ׳“׳•׳׳™׳™׳ ׳™ ׳˜׳¨׳׳§׳™׳ ׳’/׳₪׳¨׳¡׳•׳׳•׳× ----
-              await page.setRequestInterception(true);
-              page.on('request', (req) => {
-                const reqUrl = req.url();
-                const blockedDomains = [
-                  'googletagmanager', 'google-analytics', 'googlesyndication',
-                  'facebook.net', 'connect.facebook.net',
-                  'taboola', 'outbrain', 'revcontent',
-                  'doubleclick', 'googletagservices',
-                  'adsafeprotected', 'iasds01', 'moatads',
-                  'scorecardresearch', 'quantserve',
-                  'adisruptor', 'adnxs', 'rubiconproject',
-                  'pubmatic', 'openx', 'criteo',
-                  'hotjar', 'fullstory', 'mouseflow',
-                  'optimizely', 'vwo', 'abtest',
-                  'segment', 'mixpanel', 'amplitude',
-                  'intercom', 'drift', 'zendesk',
-                  'recaptcha', 'hcaptcha'
-                ];
-                if (blockedDomains.some((d) => reqUrl.includes(d))) {
-                  return req.abort('blockedbyclient');
-                }
-                req.continue();
-              });
+          // מניעת זיהוי אוטומציה על ידי אתרים
+          await page.evaluateOnNewDocument(() => {
+          Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+          try { delete navigator.__proto__.webdriver; } catch (e) {}
+          window.chrome = { runtime: {} };
+          });
 
-              await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-              await page.setViewport({ width: 1920, height: 1080 });
+          await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+          await page.setViewport({ width: 1920, height: 1080 });
 
-              await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 });
-
-              // ׳׳—׳›׳™׳ ׳©׳”-Vue app ׳™׳‘׳¦׳¢ mount (׳¨׳׳•׳•׳ ׳˜׳™ ׳-MediaSearch)
-              for (const sel of ['.sdms-search-results__list', '.sdms-video-result', '#sdms-app', 'main', 'body']) {
-                try {
-                  await page.waitForSelector(sel, { timeout: 15000 });
-                  console.log('ג… Content mounted: ' + sel);
-                  break;
-                } catch (e) { /* keep trying the next selector */ }
-              }
-              await sleep(2000);
-
-              const scrollToBottom = () => page.evaluate(() => {
-                window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
-              });
-
-              const waitForSettle = async () => {
-                try { await page.waitForNetworkIdle({ idleTime: 1200, timeout: 8000 }); } catch (e) {}
-                await sleep(400);
-              };
-
-              const isMediaSearch = await page.evaluate(() => !!document.querySelector('.sdms-search-results__list'));
-
-              if (isMediaSearch) {
-                console.log('נ–¼ן¸  Detected Wikimedia MediaSearch ג€” scrolling + clicking "Load more" to the end...');
-
-                const resultSelector = '.sdms-video-result, .sdms-image-result, .sdms-audio-result, .sdms-page-result, .sdms-other-result';
-
-                const getState = () => page.evaluate((sel) => {
-                  const results = document.querySelectorAll(sel);
-                  const loadMoreBtn = document.querySelector('.sdms-load-more');
-                  const textLoadMore = Array.from(document.querySelectorAll('button')).find((b) =>
-                    /load more|show more|more results|׳˜׳¢׳ ׳¢׳•׳“|׳¢׳•׳“ ׳×׳•׳¦׳׳•׳×/i.test(b.textContent || '')
-                  );
-                  const endEl = document.querySelector('.sdms-end-of-results');
-                  const textEnd = /no more results|end of results|׳׳™׳ ׳¢׳•׳“ ׳×׳•׳¦׳׳•׳×/i.test(document.body.innerText || '');
-                  const pending = document.querySelector('.sdms-search-results__pending');
-                  return {
-                    count: results.length,
-                    height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
-                    hasLoadMore: !!loadMoreBtn || !!textLoadMore,
-                    ended: !!endEl || textEnd,
-                    loading: !!pending
-                  };
-                }, resultSelector);
-
-                const MAX_ROUNDS = 400;
-                const STABLE_TO_STOP = 3;
-                let lastCount = -1;
-                let lastHeight = -1;
-                let stable = 0;
-
-                for (let i = 0; i < MAX_ROUNDS; i++) {
-                  await scrollToBottom();
-                  await waitForSettle();
-
-                  const s = await getState();
-
-                  if (s.ended) {
-                    console.log('ג… Reached the end of results: ' + s.count + ' results');
-                    break;
-                  }
-
-                  if (s.loading) {
-                    // ׳¢׳•׳“ ׳‘׳§׳©׳” ׳‘׳×׳”׳׳™׳ ג€” ׳ ׳—׳›׳” ׳§׳¦׳× ׳•׳ ׳‘׳“׳•׳§ ׳©׳•׳‘
-                    await sleep(1500);
-                    continue;
-                  }
-
-                  if (s.hasLoadMore) {
-                    console.log('נ–±ן¸  Clicking "Load more" (' + s.count + ' results so far)');
-                    await page.evaluate(() => {
-                      const btn = document.querySelector('.sdms-load-more') ||
-                        Array.from(document.querySelectorAll('button')).find((b) =>
-                          /load more|show more|more results|׳˜׳¢׳ ׳¢׳•׳“|׳¢׳•׳“ ׳×׳•׳¦׳׳•׳×/i.test(b.textContent || '')
-                        );
-                      if (btn) btn.click();
-                    });
-                    stable = 0;
-                    await sleep(1000);
-                    continue;
-                  }
-
-                  if (s.count === lastCount && s.height === lastHeight) {
-                    stable += 1;
-                    if (stable >= STABLE_TO_STOP) {
-                      console.log('נ›‘ No new results after ' + STABLE_TO_STOP + ' stable rounds (' + s.count + ' results)');
-                      break;
-                    }
-                  } else {
-                    stable = 0;
-                    lastCount = s.count;
-                    lastHeight = s.height;
-                    console.log('נ“ ' + s.count + ' results so far (page height ' + s.height + 'px)');
-                  }
-
-                  await sleep(700);
-                }
-              } else {
-                console.log('נ“„ Generic page ג€” scrolling to the bottom until the page stops growing...');
-                let lastHeight = -1;
-                let stable = 0;
-                for (let i = 0; i < 200; i++) {
-                  await scrollToBottom();
-                  await waitForSettle();
-                  const height = await page.evaluate(() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
-                  if (height === lastHeight) {
-                    stable += 1;
-                    if (stable >= 4) break;
-                  } else {
-                    stable = 0;
-                    lastHeight = height;
-                  }
-                  await sleep(500);
-                }
-              }
-
-              // ---- ׳׳׳׳¦׳™׳ ׳×׳׳•׳ ׳•׳× lazy-load ׳׳”׳™׳˜׳¢׳ ׳›׳“׳™ ׳©׳™׳™׳›׳ ׳¡׳• ׳׳×׳•׳ ׳”-MHTML ----
-              await page.evaluate(() => {
-                const imgs = Array.from(document.querySelectorAll('img'));
-                for (const img of imgs) {
-                  const src = img.dataset.src || img.getAttribute('src');
-                  img.loading = 'eager';
-                  img.decoding = 'async';
-                  if (img.dataset.src) {
-                    img.src = img.dataset.src;
-                  } else if (src) {
-                    img.src = src; // ׳˜׳•׳¢׳ ׳׳—׳“׳© ׳×׳׳•׳ ׳•׳× native-lazy ׳©׳׳—׳•׳¥ ׳-viewport
-                  }
-                }
-                window.scrollTo(0, 0);
-              });
-              try { await page.waitForNetworkIdle({ idleTime: 2000, timeout: 30000 }); } catch (e) {}
-
-              const totalResults = await page.evaluate(() =>
-                document.querySelectorAll('.sdms-video-result, .sdms-image-result, .sdms-audio-result, .sdms-page-result, .sdms-other-result').length
-              );
-              console.log('נ¬ Final result count: ' + totalResults);
-
-              // ---- ׳©׳׳™׳¨׳” ׳›-MHTML ׳“׳¨׳ CDP ----
-              const client = await page.target().createCDPSession();
-              const result = await client.send('Page.captureSnapshot', { format: 'mhtml' });
-              fs.writeFileSync(outputPath, result.data);
-              console.log('ג… MHTML saved: ' + outputPath + ' (' + (result.data.length / 1024 / 1024).toFixed(2) + ' MB)');
-
-            } catch (err) {
-              console.error('ג Error: ' + (err && err.message ? err.message : err));
-              process.exit(1);
-            } finally {
-              await browser.close();
-            }
-          })();
-          const downloadSelectors = [
-            'a.download-link',
-            'a.start-download',
-            'button.download-btn',
-            'button.start-download',
-            '.download-btn',
-            '.btn-download',
-            '[class*="download"][class*="btn"]',
-            'a[href*="download"]',
-            'button[class*="download"]'
+          await page.setRequestInterception(true);
+          page.on('request', (req) => {
+          const reqUrl = req.url();
+          const blockedDomains = [
+          'googletagmanager', 'google-analytics', 'googlesyndication',
+          'facebook.net', 'connect.facebook.net',
+          'taboola', 'outbrain', 'revcontent',
+          'doubleclick', 'googletagservices',
+          'adsafeprotected', 'iasds01', 'moatads',
+          'scorecardresearch', 'quantserve',
+          'adisruptor', 'adnxs', 'rubiconproject',
+          'pubmatic', 'openx', 'criteo',
+          'hotjar', 'fullstory', 'mouseflow',
+          'optimizely', 'vwo', 'abtest',
+          'segment', 'mixpanel', 'amplitude',
+          'intercom', 'drift', 'zendesk',
+          'recaptcha', 'hcaptcha'
           ];
-          const clickDownloadButton = async () => {
-            for (const sel of downloadSelectors) {
-              try {
-                const btn = await page.waitForSelector(sel, { timeout: 8000 });
-                if (btn) {
-                  await btn.click();
-                  console.log('Clicked: ' + sel);
-                  return true;
-                }
-              } catch (e) { continue; }
-            }
-            // Fallback: חיפוש לפי טקסט
-            const found = await page.evaluate(() => {
-              const btns = Array.from(document.querySelectorAll('button, a'));
-              return btns.find(b => /download|הורד|התחל הורדה|start download/i.test(b.textContent || ''));
-            });
-            if (found) {
-              await found.click();
-              console.log('Clicked via text match');
-              return true;
-            }
-            return false;
+          if (blockedDomains.some((d) => reqUrl.includes(d))) {
+          return req.abort('blockedbyclient');
+          }
+          req.continue();
+          });
+
+          console.log('🌐 ניווט ל-' + url);
+          await page.goto(url, { waitUntil: 'networkidle2', timeout: 120000 });
+
+          // ---- חככה שה-Vue app יבצע mount (רלוונטי ל-MediaSearch) ----
+          for (const sel of ['.sdms-search-results__list', '.sdms-video-result', '#sdms-app', 'main', 'body']) {
+          try {
+          await page.waitForSelector(sel, { timeout: 15000 });
+          console.log('✅ Content mounted: ' + sel);
+          break;
+          } catch (e) { /* keep trying the next selector */ }
+          }
+          await sleep(5000);
+
+          // ---- חיפוש והמתנה לכפתור הורדה (חדש: עבור Uptodown ואתרים דומים) ----
+          const downloadSelectors = [
+          'a.download-link',
+          'a.start-download',
+          'button.download-btn',
+          'button.start-download',
+          '.download-btn',
+          '.btn-download',
+          '[class*="download"][class*="btn"]',
+          'a[href*="download"]',
+          'button[class*="download"]'
+          ];
+
+          let downloadBtnFound = false;
+          for (const sel of downloadSelectors) {
+          try {
+          await page.waitForSelector(sel, { timeout: 8000 });
+          console.log('✅ נמצא כפתור הורדה: ' + sel);
+          downloadBtnFound = true;
+          break;
+          } catch (e) {
+          // ממשיך לסלקטור הבא
+          }
+          }
+
+          if (!downloadBtnFound) {
+          console.log('⚠️ לא נמצא כפתור הורדה ייעודי – מנסה לחפש כל כפתור עם טקסט הורדה...');
+          const found = await page.evaluate(() => {
+          const btns = Array.from(document.querySelectorAll('button, a'));
+          const downloadBtn = btns.find(b => /download|הורד|התחל הורדה|start download/i.test(b.textContent || ''));
+          return !!downloadBtn;
+          });
+          if (found) {
+          console.log('✅ נמצא כפתור הורדה לפי טקסט');
+          downloadBtnFound = true;
+          }
+          }
+
+          const scrollToBottom = () => page.evaluate(() => {
+          window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
+          });
+
+          const waitForSettle = async () => {
+          try { await page.waitForNetworkIdle({ idleTime: 1000, timeout: 5000 }); } catch (e) {}
+          await sleep(400);
           };
-          clickDownloadButton();
+
+          const isMediaSearch = await page.evaluate(() => !!document.querySelector('.sdms-search-results__list'));
+
+          if (isMediaSearch) {
+          console.log('🖼️  Detected Wikimedia MediaSearch — scrolling + clicking "Load more" to the end...');
+
+          const resultSelector = '.sdms-video-result, .sdms-image-result, .sdms-audio-result, .sdms-page-result, .sdms-other-result';
+
+          const getState = () => page.evaluate((sel) => {
+          const results = document.querySelectorAll(sel);
+          const loadMoreBtn = document.querySelector('.sdms-load-more');
+          const textLoadMore = Array.from(document.querySelectorAll('button')).find((b) =>
+          /load more|show more|more results|טען עוד|עוד תוצאות/i.test(b.textContent || '')
+          );
+          const endEl = document.querySelector('.sdms-end-of-results');
+          const textEnd = /no more results|end of results|אין עוד תוצאות/i.test(document.body.innerText || '');
+          const pending = document.querySelector('.sdms-search-results__pending');
+          return {
+          count: results.length,
+          height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
+          hasLoadMore: !!loadMoreBtn || !!textLoadMore,
+          ended: !!endEl || textEnd,
+          loading: !!pending
+          };
+          }, resultSelector);
+
+          const MAX_ROUNDS = 400;
+          const STABLE_THRESHOLD = 3;
+          let round = 0;
+          let stableCount = 0;
+          let lastHeight = -1;
+
+          while (round < MAX_ROUNDS) {
+          const state = await getState();
+          console.log(`Round ${round}: ${state.count} results, height=${state.height}, loadMore=${state.hasLoadMore}, ended=${state.ended}, loading=${state.loading}`);
+
+          if (state.ended || !state.hasLoadMore) break;
+
+          if (state.loading) {
+          await sleep(1000);
+          round++;
+          continue;
+          }
+
+          const loadMoreBtn = await page.$('.sdms-load-more');
+          if (loadMoreBtn) {
+          await loadMoreBtn.click();
+          console.log('🔘 Clicked "Load more" button');
+          } else {
+          await scrollToBottom();
+          }
+
+          await waitForSettle();
+          round++;
+
+          if (state.height === lastHeight) {
+          stableCount++;
+          if (stableCount >= STABLE_THRESHOLD) break;
+          } else {
+          stableCount = 0;
+          lastHeight = state.height;
+          }
+          } else {
+          console.log('📄 Generic page — scrolling to the bottom until the page stops growing...');
+
+          let lastHeight = -1;
+          let stable = 0;
+          for (let i = 0; i < 50; i++) {
+          await scrollToBottom();
+          await waitForSettle();
+          const height = await page.evaluate(() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
+          if (height === lastHeight) {
+          stable += 1;
+          if (stable >= 3) break;
+          } else {
+          stable = 0;
+          lastHeight = height;
+          }
+          await sleep(500);
+          }
+          }
+
+          // ---- גלילה חזרה למעלה כדי שהכפתור יהיה נראה בתוך ה-MHTML (חדש) ----
+          await page.evaluate(() => window.scrollTo(0, 0));
+          await sleep(2000);
+
+          // ---- מאלץ תמונות lazy-load להיטען כדי שייכנסו לתוך ה-MHTML ----
+          await page.evaluate(() => {
+          const imgs = Array.from(document.querySelectorAll('img'));
+          for (const img of imgs) {
+          const src = img.dataset.src || img.getAttribute('src');
+          img.loading = 'eager';
+          img.decoding = 'async';
+          if (img.dataset.src) {
+          img.src = img.dataset.src;
+          } else if (src) {
+          img.src = src;
+          }
+          }
+          window.scrollTo(0, 0);
+          });
+          try { await page.waitForNetworkIdle({ idleTime: 2000, timeout: 30000 }); } catch (e) {}
+
+          const totalResults = await page.evaluate(() =>
+          document.querySelectorAll('.sdms-video-result, .sdms-image-result, .sdms-audio-result, .sdms-page-result, .sdms-other-result').length
+          );
+          console.log('🎬 Final result count: ' + totalResults);
+
+          // ---- שמירה כ-MHTML דרך CDP ----
+          const client = await page.target().createCDPSession();
+          const result = await client.send('Page.captureSnapshot', { format: 'mhtml' });
+          fs.writeFileSync(outputPath, result.data);
+          console.log('✅ MHTML saved: ' + outputPath + ' (' + (result.data.length / 1024 / 1024).toFixed(2) + ' MB)');
+
+          } catch (err) {
+          console.error('❌ Error: ' + (err && err.message ? err.message : err));
+          process.exit(1);
+          } finally {
+          await browser.close();
+          }
+          })();
           ENDOFSCRIPT
 
-            # ---- ׳”׳¨׳¦׳” ----
+            # ---- הרצה ----
             node save-mhtml.js "$FILE_URL" "$MHTML_FILE" 2>&1 | tail -40
 
             if [[ ! -s "$MHTML_FILE" ]]; then
-              echo "ג MHTML capture failed ג€“ file is empty or not created"
+              echo "❌ MHTML capture failed – file is empty or not created"
               ls -la "$TMP_DIR/"
               exit 1
             fi
 
-            echo "ג… MHTML captured successfully ($(du -h "$MHTML_FILE" | cut -f1))"
+            echo "✅ MHTML captured successfully ($(du -h "$MHTML_FILE" | cut -f1))"
             INTERNAL_FILE="$MHTML_FILE"
           else
             DOWNLOADED_FILE="${TMP_DIR}/downloaded_file"
-            echo "ג¬‡ן¸ Downloading $FILE_URL ג†’ $DOWNLOADED_FILE"
+            echo "⬇️ Downloading $FILE_URL → $DOWNLOADED_FILE"
             curl -L -s -o "$DOWNLOADED_FILE" "$FILE_URL" --max-time 300 --retry 3 --retry-delay 5
 
             if [[ ! -s "$DOWNLOADED_FILE" ]]; then
-              echo "ג Download failed or file is empty"
+              echo "❌ Download failed or file is empty"
               exit 1
             fi
 
-            echo "ג… Downloaded successfully ($(du -h "$DOWNLOADED_FILE" | cut -f1))"
+            echo "✅ Downloaded successfully ($(du -h "$DOWNLOADED_FILE" | cut -f1))"
             cp "$DOWNLOADED_FILE" "${TMP_DIR}/${ORIGINAL_NAME}"
             INTERNAL_FILE="${TMP_DIR}/${ORIGINAL_NAME}"
           fi
 
-          echo "נ—ן¸ Creating ZIP $TMP_ZIP with internal name '$ORIGINAL_NAME'"
+          echo "🗜️ Creating ZIP $TMP_ZIP with internal name '$ORIGINAL_NAME'"
           (cd "$TMP_DIR" && zip -j -q "$TMP_ZIP" "$ORIGINAL_NAME")
 
           if [[ ! -s "$TMP_ZIP" ]]; then
-            echo "ג Zip creation failed ג€“ file is empty"
+            echo "❌ Zip creation failed – file is empty"
             exit 1
           fi
 
-          echo "ג… ZIP created ($(du -h "$TMP_ZIP" | cut -f1))"
+          echo "✅ ZIP created ($(du -h "$TMP_ZIP" | cut -f1))"
 
-          echo "נ€ Uploading ZIP to Drive: $DEST_PATH"
+          echo "🚀 Uploading ZIP to Drive: $DEST_PATH"
           rclone copy "$TMP_ZIP" "$DEST_PATH" --progress --drive-chunk-size 64M
 
-          echo "ג… Finished ג€“ ZIP uploaded successfully at $(date)"
+          echo "✅ Finished – ZIP uploaded successfully at $(date)"
 
       # --------------------------------------------------------------
-      # 6ן¸גƒ£  ׳©׳׳™׳—׳× ׳׳™׳׳™׳™׳ ׳‘׳׳§׳¨׳” ׳›׳™׳©׳׳•׳
+      # 6️⃣  שליחת אימייל במקרה כישלון
       # --------------------------------------------------------------
       - name: Send email on failure
         if: failure()
@@ -505,11 +467,11 @@ jobs:
           LOG_FILE="$RUNNER_TEMP/process.log"
           LOG_CONTENT=$(cat "$LOG_FILE" 2>/dev/null || echo "Log file not found: $LOG_FILE")
 
-          echo "נ“§ Preparing failure email..."
+          echo "📧 Preparing failure email..."
           echo "Log file: $LOG_FILE"
           echo "Log size: $(wc -c < "$LOG_FILE" 2>/dev/null || echo 0) bytes"
 
-          ERROR_SUMMARY=$(echo "$LOG_CONTENT" | grep -E "(ג|Error|FAILED|exit 1|failed)" -i | head -5 | sed 's/"/\\"/g' || echo "No specific error pattern found")
+          ERROR_SUMMARY=$(echo "$LOG_CONTENT" | grep -E "(❌|Error|FAILED|exit 1|failed)" -i | head -5 | sed 's/"/\\"/g' || echo "No specific error pattern found")
 
           printf "defaults\nauth           on\ntls            on\ntls_trust_file /etc/ssl/certs/ca-certificates.crt\nlogfile        ~/.msmtp.log\n\naccount        gmail\nhost           smtp.gmail.com\nport           587\nfrom           p0556722432@gmail.com\nuser           p0556722432@gmail.com\npassword       %s\n\naccount default : gmail\n" "$EMAIL_PASSWORD" > ~/.msmtprc
           chmod 600 ~/.msmtprc
@@ -517,33 +479,33 @@ jobs:
           {
             echo "From: p0556722432@gmail.com"
             echo "To: p0556722432@gmail.com"
-            echo "Subject: ג GitHub Actions Failed: $WORKFLOW"
+            echo "Subject: ❌ GitHub Actions Failed: $WORKFLOW"
             echo "Content-Type: text/plain; charset=UTF-8"
             echo ""
-            echo "׳©׳׳•׳,"
+            echo "שלום,"
             echo ""
-            echo "׳”׳¨׳™׳¦׳” ׳©׳ ׳”-workflow **$WORKFLOW** ׳ ׳›׳©׳׳”."
+            echo "הריצה של ה-workflow **$WORKFLOW** נכשלה."
             echo ""
-            echo "נ“‹ ׳₪׳¨׳˜׳™ ׳”׳¨׳™׳¦׳”:"
-            echo "- ׳¨׳™׳₪׳•: $REPO"
-            echo "- ׳׳¨׳™׳¥: $ACTOR"
-            echo "- ׳§׳™׳©׳•׳¨ ׳׳¨׳™׳¦׳”: $RUN_URL"
-            echo "- ׳–׳׳: $(date '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "📋 פרטי הריצה:"
+            echo "- ריפו: $REPO"
+            echo "- מריץ: $ACTOR"
+            echo "- קישור לריצה: $RUN_URL"
+            echo "- זמן: $(date '+%Y-%m-%d %H:%M:%S UTC')"
             echo ""
-            echo "נ”— URL ׳©׳¢׳•׳‘׳“:"
+            echo "🔗 URL שעובד:"
             echo "$INPUT_URL"
             echo ""
-            echo "נ“‚ ׳×׳™׳§׳™׳™׳× ׳™׳¢׳“:"
+            echo "📂 תיקיית יעד:"
             echo "$INPUT_FOLDER"
             echo ""
-            echo "ג ן¸ ׳×׳§׳¦׳™׳¨ ׳©׳’׳™׳׳”:"
+            echo "⚠️ תקציר שגיאה:"
             echo "$ERROR_SUMMARY"
             echo ""
-            echo "נ“„ ׳׳•׳’ ׳׳׳ (100 ׳©׳•׳¨׳•׳× ׳׳—׳¨׳•׳ ׳•׳×):"
+            echo "📄 לוג מלא (100 שורות אחרונות):"
             echo "$LOG_CONTENT" | tail -100
             echo ""
             echo "---"
-            echo "׳ ׳©׳׳— ׳׳•׳˜׳•׳׳˜׳™׳× ׳-GitHub Actions"
+            echo "נשלח אוטומטית מ-GitHub Actions"
           } | msmtp --debug -a gmail p0556722432@gmail.com 2>&1
 
-          echo "נ“§ Failure email sent successfully"
+          echo "📧 Failure email sent successfully"
